@@ -1,0 +1,285 @@
+{
+  "schema_version": "reversal-breakout-examples-v1.draft",
+  "status": "PROPOSED_NOT_FROZEN",
+  "assumptions": {
+    "data": "synthetic completed OHLCV only",
+    "contract": {
+      "root": "MGC",
+      "expiry": "2026-12",
+      "provider_contract_id": "SYNTHETIC_MGC_2026_12",
+      "tick_size": "0.10",
+      "multiplier_usd_per_point": "10.00"
+    },
+    "execution_interval_minutes": 15,
+    "zone_interval_minutes": 5,
+    "atr_unit_points": "4.00",
+    "break_multiple": "1.00",
+    "pullback_multiple": "0.50",
+    "breakout_stop_multiple": "0.80",
+    "measured_move_multiple": "1.00",
+    "rounding": "all shown prices already lie on the synthetic tick",
+    "fill_scope": "signals and next-event eligibility only; fees, slippage and ambiguous fills await FT-02"
+  },
+  "cases": [
+    {
+      "id": "long_breakout_levels_and_next_event",
+      "given": {
+        "zone": { "low": "2000.00", "high": "2000.50" },
+        "previous_close": "2004.00",
+        "arm_bar": { "index": 10, "close": "2005.00", "vwap": "1998.00" },
+        "later_retest_bar": { "index": 11, "low": "2002.40" },
+        "next_fill_bar": { "index": 12, "low": "2002.30", "high": "2004.00" }
+      },
+      "calculation": {
+        "break_threshold": "2000.50 + 1.00*4.00 = 2004.50",
+        "beyond_threshold": "2005.00 > 2004.50",
+        "optional_strict_cross_also_true": "2004.00 <= 2004.50 and 2005.00 > 2004.50",
+        "impulse": "2005.00 - 2000.50 = 4.50",
+        "entry": "2000.50 + 0.50*4.00 = 2002.50",
+        "zone_stop": "2000.00 - 0.80*4.00 = 1996.80",
+        "vwap_stop": "1998.00 - 0.80*4.00 = 1994.80",
+        "stop": "min(1996.80, 1994.80) = 1994.80",
+        "target": "2000.50 + 4.50*1.00 = 2005.00"
+      },
+      "expected": [
+        "ARM_LONG at bar 10 close",
+        "ENTRY_INTENT_LONG at bar 11 close because 2002.40 <= 2002.50",
+        "first fill eligibility is bar 12 and its range includes limit 2002.50",
+        "actual fill price/outcome awaits FT-02; no intrabar event order or same-bar fill is inferred"
+      ]
+    },
+    {
+      "id": "short_breakout_levels_and_next_event",
+      "given": {
+        "zone": { "low": "2010.00", "high": "2010.50" },
+        "previous_close": "2007.00",
+        "arm_bar": { "index": 20, "close": "2005.50", "vwap": "2009.00" },
+        "later_retest_bar": { "index": 21, "high": "2008.10" },
+        "next_fill_bar": { "index": 22, "low": "2006.50", "high": "2008.20" }
+      },
+      "calculation": {
+        "break_threshold": "2010.00 - 1.00*4.00 = 2006.00",
+        "beyond_threshold": "2005.50 < 2006.00",
+        "optional_strict_cross_also_true": "2007.00 >= 2006.00 and 2005.50 < 2006.00",
+        "impulse": "2010.00 - 2005.50 = 4.50",
+        "entry": "2010.00 - 0.50*4.00 = 2008.00",
+        "zone_stop": "2010.50 + 0.80*4.00 = 2013.70",
+        "vwap_stop": "2009.00 + 0.80*4.00 = 2012.20",
+        "stop": "max(2013.70, 2012.20) = 2013.70",
+        "target": "2010.00 - 4.50*1.00 = 2005.50"
+      },
+      "expected": [
+        "ARM_SHORT at bar 20 close",
+        "ENTRY_INTENT_SHORT at bar 21 close because 2008.10 >= 2008.00",
+        "first fill eligibility is bar 22 and its range includes limit 2008.00",
+        "actual fill price/outcome awaits FT-02; no intrabar event order or same-bar fill is inferred"
+      ]
+    },
+    {
+      "id": "reversal_rejected_when_not_approaching",
+      "given": {
+        "require_directional_approach": true,
+        "support_zone": { "low": "1999.00", "high": "2000.00" },
+        "resistance_zone": { "low": "2010.00", "high": "2011.00" },
+        "approach_distance": "1.50*4.00 = 6.00",
+        "previous_close": "2003.00",
+        "current_close": "2004.00"
+      },
+      "calculation": {
+        "previous_distance": "2003.00 - 2000.00 = 3.00",
+        "current_distance": "2004.00 - 2000.00 = 4.00",
+        "within_range": "4.00 <= 6.00",
+        "approaching": "4.00 < 3.00 is false"
+      },
+      "expected": [
+        "opt-in variant rejects REVERSAL_LONG with reason NOT_APPROACHING",
+        "base preset leaves the option off and would accept the raw proximity condition"
+      ]
+    },
+    {
+      "id": "breakout_expiration_boundary",
+      "given": {
+        "arm_bar_index": 30,
+        "breakout_expiry_bars": 24,
+        "no_qualifying_retest_through_index": 54,
+        "first_late_retest_index": 55
+      },
+      "calculation": {
+        "last_eligible_index": "30 + 24 = 54",
+        "expiration_check": "55 - 30 > 24"
+      },
+      "expected": [
+        "setup remains armed through bar 54",
+        "EXPIRED is recorded before evaluating bar 55",
+        "bar 55 cannot create an entry from this setup"
+      ]
+    },
+    {
+      "id": "pivot_confirmation_lag",
+      "given": {
+        "pivot_left": 3,
+        "pivot_right": 3,
+        "zone_bar_highs_indices_0_to_6": ["10.00", "11.00", "12.00", "15.00", "14.00", "13.00", "12.00"]
+      },
+      "calculation": {
+        "candidate_index": 3,
+        "left_test": "15.00 >= max(10.00,11.00,12.00)",
+        "right_test": "15.00 > max(14.00,13.00,12.00)",
+        "confirmation_index": "3 + 3 = 6"
+      },
+      "expected": [
+        "no pivot event is available at indices 3, 4 or 5",
+        "PIVOT_HIGH price 15.00 is emitted only after zone bar 6 completes"
+      ]
+    },
+    {
+      "id": "beyond_mode_is_not_strict_cross",
+      "given": {
+        "zone": { "low": "2000.00", "high": "2000.50" },
+        "break_distance": "1.00*4.00 = 4.00",
+        "previous_close": "2005.00",
+        "current_close": "2005.20"
+      },
+      "calculation": {
+        "threshold": "2000.50 + 4.00 = 2004.50",
+        "base_beyond": "2005.20 > 2004.50 is true",
+        "optional_strict_cross": "2005.00 <= 2004.50 is false"
+      },
+      "expected": [
+        "base beyond mode arms a long breakout",
+        "optional strict_cross mode does not arm",
+        "strict_cross remains default off because it changes the source strategy"
+      ]
+    },
+    {
+      "id": "same_bar_break_and_retest_is_not_causal_entry",
+      "given": {
+        "zone": { "low": "2000.00", "high": "2000.50" },
+        "previous_close": "2004.00",
+        "bar": { "index": 70, "low": "2002.00", "high": "2006.00", "close": "2005.00" },
+        "break_threshold": "2004.50",
+        "frozen_pullback_level": "2002.50"
+      },
+      "calculation": {
+        "beyond_threshold": "2005.00 > 2004.50",
+        "optional_strict_cross_also_true": "2004.00 <= 2004.50 and 2005.00 > 2004.50",
+        "intrabar_retest_shape": "2002.00 <= 2002.50",
+        "causal_rule": "retest bar index must be greater than arm bar index"
+      },
+      "expected": [
+        "ARM_LONG at bar 70 close",
+        "no retest and no entry intent at bar 70",
+        "a qualifying retest may first be observed on bar 71"
+      ]
+    },
+    {
+      "id": "opposing_breakout_arms_are_atomic_conflict",
+      "given": {
+        "support_zone": { "low": "1980.00", "high": "1981.00" },
+        "resistance_zone": { "low": "2020.00", "high": "2021.00" },
+        "current_close": "2000.00",
+        "unit": "4.00",
+        "break_multiple": "1.00"
+      },
+      "calculation": {
+        "long_threshold": "1981.00 + 1.00*4.00 = 1985.00; 2000.00 > 1985.00",
+        "short_threshold": "2020.00 - 1.00*4.00 = 2016.00; 2000.00 < 2016.00",
+        "candidate_count": "one long plus one short from the same pre-decision state"
+      },
+      "expected": [
+        "CONFLICT_OPPOSING_ARMS records both candidate snapshots",
+        "breakout state remains IDLE and no entry intent exists",
+        "Pine's sequential short-overwrites-long result is not copied"
+      ]
+    },
+    {
+      "id": "entry_intent_filter_rejection_cancels_arm",
+      "given": {
+        "state_before_bar": "ARMED_LONG",
+        "retest_bar": { "index": 81, "end": "2026-09-12T10:30:00Z", "low": "2002.40" },
+        "frozen_entry": "2002.50",
+        "filter": {
+          "feature": "relative_volume_filter_v1",
+          "feature_version": "fixture-v1",
+          "evaluation_stage": "entry_intent",
+          "value": "0.80",
+          "minimum": "1.20",
+          "source_bar_end": "2026-09-12T10:30:00Z",
+          "known_at": "2026-09-12T10:30:00Z"
+        }
+      },
+      "calculation": {
+        "retest": "2002.40 <= 2002.50 is true",
+        "filter_pass": "0.80 >= 1.20 is false"
+      },
+      "expected": [
+        "FILTER_FAIL is recorded with the frozen evidence fields",
+        "the arm is CANCELLED and no entry intent is submitted",
+        "same-bar re-arming is prohibited"
+      ]
+    },
+    {
+      "id": "decision_atr_reference_missing_and_atr_off",
+      "given": {
+        "execution_bar_end": "2026-09-12T10:15:00Z",
+        "completed_zone_atr": { "bar_end": "2026-09-12T10:15:00Z", "value": "4.20" },
+        "future_zone_atr": { "bar_end": "2026-09-12T10:20:00Z", "value": "4.80" }
+      },
+      "calculation": {
+        "atr_on_available": "latest completed zone bar with bar_end <= 10:15 has ATR 4.20, so unit=4.20",
+        "atr_on_missing": "missing/nonpositive ATR on that selected zone bar gives NOT_READY_ATR without searching backward",
+        "atr_off": "unit=1.00 without reading ATR"
+      },
+      "expected": [
+        "future ATR 4.80 is unavailable to this decision",
+        "ATR-on never falls back to 1.00",
+        "ATR-off remains evaluable with unit 1.00"
+      ]
+    },
+    {
+      "id": "cooldown_and_daily_cap_are_fill_counted",
+      "given": {
+        "last_entry_fill_execution_index": 100,
+        "cooldown_execution_bars": 1,
+        "max_entries_per_trading_day": 23,
+        "filled_entries_before_candidate": 22
+      },
+      "calculation": {
+        "index_101_cooldown": "101 - 100 = 1; 1 > 1 is false",
+        "index_102_cooldown": "102 - 100 = 2; 2 > 1 is true",
+        "before_fill_cap": "22 < 23 is true",
+        "atomic_fill_counter": "22 + 1 = 23",
+        "after_fill_cap": "23 < 23 is false"
+      },
+      "expected": [
+        "zone is blocked at index 101 and eligible at index 102",
+        "an unfilled order does not alter cooldown or the daily counter",
+        "after the twenty-third atomic fill, further entries are blocked for that trading day"
+      ]
+    },
+    {
+      "id": "recent_peak_window_includes_signal_bar",
+      "given": {
+        "side": "long_reversal",
+        "peak_lookback": 3,
+        "completed_execution_lows_indices_90_to_92": ["1998.00", "1997.00", "1999.00"],
+        "signal_bar_index": 92,
+        "support_zone_low": "2000.00",
+        "unit": "4.00",
+        "reversal_stop_multiple": "0.40"
+      },
+      "calculation": {
+        "buffer": "0.40*4.00 = 1.60",
+        "recent_low": "min(1998.00,1997.00,1999.00) = 1997.00",
+        "zone_stop": "2000.00 - 1.60 = 1998.40",
+        "peak_stop": "1997.00 - 1.60 = 1995.40",
+        "frozen_stop": "min(1998.40,1995.40) = 1995.40"
+      },
+      "expected": [
+        "the three-bar window includes signal bar 92 and freezes stop 1995.40",
+        "if any of indices 90, 91 or 92 is missing/invalid, reject NOT_READY_PEAK_WINDOW",
+        "later lows cannot change the frozen order"
+      ]
+    }
+  ]
+}

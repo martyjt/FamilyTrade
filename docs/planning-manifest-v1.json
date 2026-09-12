@@ -1,0 +1,198 @@
+{
+  "schema_version": "ft02-planning-manifest-v1",
+  "candidate": "v1-review-4",
+  "digest_algorithm": "SHA256 of UTF8 concatenation of each file path + TAB + sha256 + TAB + byte length + LF, in listed order",
+  "packet_sha256": "9bb0e22bb72ccc0dc1db56ddcb8ba9106b5260f92710b2597072247c3f5f723d",
+  "excludes": [
+    "manifest self",
+    "ft02-review-v1.md",
+    "ft02-publication-v1.md"
+  ],
+  "files": [
+    {
+      "path": "docs/architecture.md",
+      "sha256": "54eec835835076ff0223ee0b449b938437defe3b7bed4930a3cd02837b2f7d16",
+      "bytes": 12509
+    },
+    {
+      "path": "docs/bootstrap-packet-v1.md",
+      "sha256": "65b34a4fe7fee2725fc64492b127e522418a01f9c650aa6494a25baec6fd8c00",
+      "bytes": 8773
+    },
+    {
+      "path": "docs/contracts-examples-v1.json",
+      "sha256": "c2bd5d31acd8996d0d888ed75e99f320f395b74bc441db0f941201df705c1062",
+      "bytes": 42822
+    },
+    {
+      "path": "docs/contracts-v1.md",
+      "sha256": "7c41ef774905ba116b179fdb88396a20925ec59daab311471fdeb7bb34a50063",
+      "bytes": 74915
+    },
+    {
+      "path": "docs/first-slice.md",
+      "sha256": "972b5f6e162f9dca8951408d28b77641196a68801c4c9821b348d31cb23fd90e",
+      "bytes": 5998
+    },
+    {
+      "path": "docs/ft02-handoff-v1.md",
+      "sha256": "3d5ea493daf3361104e2d9e6db09f97e95de7545c569226af6dd17587348d48a",
+      "bytes": 4518
+    },
+    {
+      "path": "docs/implementation-plan.md",
+      "sha256": "1de19503a04713686409ade9ae5937d858c88638205487ac421dc393f0cfc603",
+      "bytes": 13837
+    },
+    {
+      "path": "docs/issue-recipes-v1.md",
+      "sha256": "68efd37bd2cff345d72ad38c6afded4594eb1d4d48701bba1569c773c15c47ae",
+      "bytes": 22484
+    },
+    {
+      "path": "docs/issues/FT-01.md",
+      "sha256": "cd45154ab8cf3c7dd971d2c2d1af47e80b15ad0c37f53bd39defe2046d33c895",
+      "bytes": 6354
+    },
+    {
+      "path": "docs/issues/FT-02.md",
+      "sha256": "6b7c1f1b819e90c9531e77bbea9b8a5e23e91b5d41e2481de0e2851e296d95dd",
+      "bytes": 5500
+    },
+    {
+      "path": "docs/issues/FT-03.md",
+      "sha256": "b736a30a2d127f0c9337b2b24d56e73e72511089898019d89e4a618d43238ab3",
+      "bytes": 7794
+    },
+    {
+      "path": "docs/issues/FT-04.md",
+      "sha256": "9c44f74650c047e74b784363f53a169397db341e4e99d1a4160b28f051b62f74",
+      "bytes": 6296
+    },
+    {
+      "path": "docs/issues/FT-05.md",
+      "sha256": "ff02c63fa09ad50eb330b3af25e3445ec7789ef7d76e14c41fc54ec8dba904c6",
+      "bytes": 6803
+    },
+    {
+      "path": "docs/issues/FT-06.md",
+      "sha256": "f4e16e2658e2fb0fceb910297cea71e64c00e59d8b14602479376059d2d213e8",
+      "bytes": 10310
+    },
+    {
+      "path": "docs/issues/FT-07.md",
+      "sha256": "4df1d16c36dd8e6479d20f73146a3964170241dbd9038d14c26ed49cce74d1f9",
+      "bytes": 11038
+    },
+    {
+      "path": "docs/issues/FT-08.md",
+      "sha256": "3e8e5a85cf8a997275f242ea4054ba898467735773f5327e3ef8e5bbbaf1b34e",
+      "bytes": 6833
+    },
+    {
+      "path": "docs/issues/FT-09.md",
+      "sha256": "d9015be5037d01cfc0d924d23d015afb4e686185252dad8b48e740732b98333c",
+      "bytes": 6579
+    },
+    {
+      "path": "docs/issues/FT-10.md",
+      "sha256": "3422b15f48c49e48dc29fadc572bfcfeb7c177020e41b8ae2e492e98858eaf85",
+      "bytes": 6566
+    },
+    {
+      "path": "docs/issues/FT-11.md",
+      "sha256": "88ba865764e432b0bf5d6a419c7753505a14311269a64276295b0bb213174acc",
+      "bytes": 9389
+    },
+    {
+      "path": "docs/issues/FT-12.md",
+      "sha256": "e117ad4fe8270dd58d7b09d082a32b1ba2ae5285e7a290c14cb8f8ab325f809e",
+      "bytes": 6634
+    },
+    {
+      "path": "docs/issues/FT-13.md",
+      "sha256": "fa050b5bbe5f6b26d23bbabeff6adf7fea6b526c49b9ed89a8fb4ce5dd7825ee",
+      "bytes": 9866
+    },
+    {
+      "path": "docs/issues/FT-14.md",
+      "sha256": "be29a0e8bee38e1794686a601d700fdc344343ab49b1c542bd233e2950846947",
+      "bytes": 6514
+    },
+    {
+      "path": "docs/issues/FT-15.md",
+      "sha256": "bb10c36d02f7aba2ba0a0b0c4480cedcfb15bf7b8c9af3fe932ed91e5969fa83",
+      "bytes": 8933
+    },
+    {
+      "path": "docs/issues/FT-16.md",
+      "sha256": "7f5b71b750d332fc51f57e924a1cc103e454ca9b853cf7ef7b0336eead5458ec",
+      "bytes": 7960
+    },
+    {
+      "path": "docs/issues/FT-17.md",
+      "sha256": "ad0f17818e16cd10bef5e7c97ef597f2d83c67abde6d6e109f24678e657d3772",
+      "bytes": 8036
+    },
+    {
+      "path": "docs/issues/FT-18.md",
+      "sha256": "9a9bd7a66dbda162c6005c5539160c3d66f85744f6c288a8bea3001055d51ab9",
+      "bytes": 9549
+    },
+    {
+      "path": "docs/issues/PLAN.md",
+      "sha256": "8d202d6dcea9387e5960f9977f00b7dbe792d32ee98755c29886e90b0b977e5f",
+      "bytes": 6625
+    },
+    {
+      "path": "docs/planning-decisions.md",
+      "sha256": "bb15bbb904f8a20ca5cab44a32562bd1a3cd9d1a326fbccace267e426998101d",
+      "bytes": 5997
+    },
+    {
+      "path": "docs/readiness-review.md",
+      "sha256": "33bcdc29c4c77831718ac199a7306ff427fb733103013e8e296e773b2cff875d",
+      "bytes": 2354
+    },
+    {
+      "path": "docs/release-continuity.md",
+      "sha256": "b48ee8884f0e63c3f3479cf23a651138173931d8caae06d784b7a662ecf9d42b",
+      "bytes": 5306
+    },
+    {
+      "path": "docs/session-workflow.md",
+      "sha256": "fa40e887419e9faf1ba0a846174686c07f26664717b6b3582ca51ca3ed99b86b",
+      "bytes": 9137
+    },
+    {
+      "path": "docs/strategies/configurability-review-v1.md",
+      "sha256": "ecfacb59da120c4b15a7233ffc646684aaa22fdbed2cf050fa25a4fc319cc527",
+      "bytes": 801
+    },
+    {
+      "path": "docs/strategies/configurability-v1.md",
+      "sha256": "6420c2792107d61cf9b133f8fefdc75b6f72bd8ac2178e7e8034c8f8ec1d12bd",
+      "bytes": 4146
+    },
+    {
+      "path": "docs/strategies/reversal-breakout-examples-v1.json",
+      "sha256": "fd62857956ffae7eb9b5cd7b07be10054ad4b16b8654e629c8efdaba3aa7ac56",
+      "bytes": 11093
+    },
+    {
+      "path": "docs/strategies/reversal-breakout-review-v1.md",
+      "sha256": "d3aa03fddea9088f0387f6da65f792cea4c468745bb2fb7014af153eb31b924c",
+      "bytes": 3140
+    },
+    {
+      "path": "docs/strategies/reversal-breakout-v1.md",
+      "sha256": "d4eae1e10fefdb3287c7518f301632dcf9c60c3b11d62f3324aadd851e47d3f5",
+      "bytes": 19886
+    },
+    {
+      "path": "README.md",
+      "sha256": "347136c39900c17cfe94c7d1447871337e427a51da16507328b68bb50fffdc30",
+      "bytes": 2325
+    }
+  ]
+}

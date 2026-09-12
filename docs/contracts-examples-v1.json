@@ -1,0 +1,798 @@
+{
+  "schema_version": "contracts-examples-v1",
+  "status": "FT02_FROZEN_CANDIDATE_FOR_INDEPENDENT_REVIEW",
+  "calculation_source": "Hand-calculated from the normative contracts-v1 rules; no src code or prototype generated these expectations.",
+  "synthetic_disclosure": "All users, accounts, provider identifiers, contract metadata, calendars, prices, volume, fees and failures are synthetic. They are not IBKR, CME, exchange or live-performance evidence.",
+  "common": {
+    "fixture_id_note": "Human-readable IDs inside cases are fixture aliases, never wire IDs. Schema tests resolve them through valid UUIDv7 values in fixture_aliases.",
+    "fixture_aliases": {
+      "018-user-a": "0199abcd-0000-7000-8000-000000000001",
+      "018-user-b": "0199abcd-0000-7000-8000-000000000002",
+      "018-lane-a": "0199abcd-0000-7000-8000-000000000003",
+      "018-lane-b": "0199abcd-0000-7000-8000-000000000004",
+      "018-lane-owned-by-user-b": "0199abcd-0000-7000-8000-000000000005",
+      "018-rev-1": "0199abcd-0000-7000-8000-000000000006",
+      "018-rev-2": "0199abcd-0000-7000-8000-000000000007",
+      "018-rev-10": "0199abcd-0000-7000-8000-000000000008",
+      "018-bar-r1": "0199abcd-0000-7000-8000-000000000009",
+      "018-bar-r2": "0199abcd-0000-7000-8000-00000000000a",
+      "018-job-1": "0199abcd-0000-7000-8000-00000000000b",
+      "synthetic-mgc-2026-12": "0199abcd-0000-7000-8000-00000000000c",
+      "strategy-v1": "0199abcd-0000-7000-8000-00000000000d",
+      "strategy-v2": "0199abcd-0000-7000-8000-00000000000e",
+      "deterministic-decision-7": "0199abcd-0000-7000-8000-00000000000f",
+      "deterministic-fill-1": "0199abcd-0000-7000-8000-000000000010",
+      "active-bar-a-r1": "0199abcd-0000-7000-8000-000000000011",
+      "active-bar-a-r2": "0199abcd-0000-7000-8000-000000000012",
+      "active-bar-b-r1": "0199abcd-0000-7000-8000-000000000013",
+      "active-bar-b-r2": "0199abcd-0000-7000-8000-000000000014"
+    },
+    "currency": "USD",
+    "price_basis": "trades",
+    "starting_cash": "25000.00",
+    "tick_size": "0.10",
+    "multiplier": "10.00",
+    "commission_per_contract_per_side": "1.25",
+    "market_slippage_ticks": 1,
+    "stop_slippage_ticks": 1,
+    "limit_slippage_ticks": 0,
+    "quantity": 1,
+    "decision_interval_seconds": 900,
+    "fill_interval_seconds": 60,
+    "both_hit_policy": "stop_first",
+    "entry_bar_exit_policy": "conservative_stop_first",
+    "calendar": "SYNTHETIC_XCHI_V1"
+  },
+  "cases": [
+    {
+      "id": "access_two_user_denial",
+      "covers": ["UserContext", "BrokerAccount", "two-user denial", "UI/MCP parity"],
+      "given": {
+        "authenticated_user": "018-user-a",
+        "scope": "lanes:read",
+        "requested_lane_id": "018-lane-owned-by-user-b",
+        "same_request_from": ["browser", "mcp"]
+      },
+      "expected": {
+        "http_status": 404,
+        "error_code": "NOT_FOUND",
+        "owner_disclosed": false,
+        "audit_actor": "018-user-a",
+        "side_effect_count": 0,
+        "rationale": "Identity comes from authentication; the opaque ID neither grants access nor reveals another user's resource."
+      }
+    },
+    {
+      "id": "same_user_two_lanes_are_accounting_independent",
+      "covers": ["two same-user lanes", "lane ownership", "fees", "cash"],
+      "given": {
+        "owner_user_id": "018-user-a",
+        "lane_a": {"lane_id": "018-lane-a", "starting_cash": "25000.00", "buy_fill": "2000.10", "mark": "2001.00"},
+        "lane_b": {"lane_id": "018-lane-b", "starting_cash": "25000.00", "sell_fill": "2010.00", "mark": "2008.00"}
+      },
+      "calculation": {
+        "lane_a_entry_fee": "1 * 1.25 = 1.25",
+        "lane_a_cash": "25000.00 - 1.25 = 24998.75",
+        "lane_a_unrealized": "(2001.00 - 2000.10) * 10.00 * 1 = 9.00",
+        "lane_a_equity": "24998.75 + 9.00 = 25007.75",
+        "lane_b_entry_fee": "1 * 1.25 = 1.25",
+        "lane_b_cash": "25000.00 - 1.25 = 24998.75",
+        "lane_b_unrealized": "(2010.00 - 2008.00) * 10.00 * 1 = 20.00",
+        "lane_b_equity": "24998.75 + 20.00 = 25018.75"
+      },
+      "expected": {
+        "lane_a": {"cash": "24998.75", "equity": "25007.75", "position": "+1"},
+        "lane_b": {"cash": "24998.75", "equity": "25018.75", "position": "-1"},
+        "shared_cash_or_position_rows": 0,
+        "archive_use": "Both lanes may read the same owned DatasetRevision without copying or sharing lane state."
+      }
+    },
+    {
+      "id": "contract_expiry_close_and_no_roll",
+      "covers": ["expiry", "overnight", "pending close", "no automatic roll"],
+      "given": {
+        "contract_id": "synthetic-mgc-2026-12",
+        "entry_cutoff_at": "2026-12-23T23:00:00Z",
+        "liquidation_start_at": "2026-12-27T23:00:00Z",
+        "last_trade_at": "2026-12-29T18:30:00Z",
+        "position": {"side": "long", "entry": "2000.00", "quantity": 1},
+        "feed_at_liquidation": "stale",
+        "first_later_eligible_bar": {"start_at": "2026-12-28T00:05:00Z", "open": "1998.00"}
+      },
+      "calculation": {
+        "close_base": "1998.00",
+        "adverse_slippage": "1 * 0.10 = 0.10",
+        "close_fill": "1998.00 - 0.10 = 1997.90",
+        "realized_pnl": "(1997.90 - 2000.00) * 10.00 = -21.00",
+        "fees_if_entry_fee_already_paid": "exit fee = 1.25"
+      },
+      "expected": {
+        "at_entry_cutoff": "pending entries cancelled and new entries blocked",
+        "at_liquidation_start": "operator intent CLOSE_AND_STOP; status CLOSING; no stale fill",
+        "later_fill": {"price": "1997.90", "realized_pnl": "-21.00", "exit_commission": "1.25"},
+        "final_status": "STOPPED",
+        "new_contract_position": 0,
+        "automatic_roll": false
+      }
+    },
+    {
+      "id": "pinned_revision_survives_correction",
+      "covers": ["DatasetRevision", "correction", "old pinned revision", "latest read"],
+      "given": {
+        "logical_bar": ["018-user-a", "synthetic", "trades", "synthetic-mgc-2026-12", 60, "2026-09-14T00:00:00Z"],
+        "revision_r1": {"dataset_revision_id": "018-rev-1", "bar_record_id": "018-bar-r1", "source_revision": 1, "close": "2000.00"},
+        "correction_r2": {"dataset_revision_id": "018-rev-2", "bar_record_id": "018-bar-r2", "source_revision": 2, "close": "2000.20", "supersedes": "018-bar-r1"},
+        "completed_run_pinned_to": "018-rev-1"
+      },
+      "expected": {
+        "completed_run_close": "2000.00",
+        "new_latest_read_close": "2000.20",
+        "r1_manifest_changed": false,
+        "r1_object_retained": true,
+        "retroactive_decision_or_fill_count": 0
+      }
+    },
+    {
+      "id": "dst_session_mapping_uses_materialized_utc_calendar",
+      "covers": ["DST", "session mapping", "trading day", "closures"],
+      "given": {
+        "exchange_timezone": "America/Chicago",
+        "fall_session": {"local_open": "2026-11-01T17:00:00-06:00", "utc_open": "2026-11-01T23:00:00Z", "trading_day": "2026-11-02"},
+        "spring_session": {"local_open": "2026-03-08T17:00:00-05:00", "utc_open": "2026-03-08T22:00:00Z", "trading_day": "2026-03-09"},
+        "maintenance_break": ["2026-11-02T22:00:00Z", "2026-11-02T23:00:00Z"]
+      },
+      "expected": {
+        "fall_first_bar": ["2026-11-01T23:00:00Z", "2026-11-01T23:01:00Z"],
+        "spring_first_bar": ["2026-03-08T22:00:00Z", "2026-03-08T22:01:00Z"],
+        "duplicate_utc_bars_from_fold": 0,
+        "invented_break_bars": 0,
+        "session_vwap_reset_at_session_open": true,
+        "position_flattened_at_dst_or_midnight": false
+      }
+    },
+    {
+      "id": "indicator_warmup_equality_and_causal_catalogue",
+      "covers": ["SMA", "EMA", "RSI", "ATR", "relative volume", "VWAP", "warm-up", "crossover equality"],
+      "given": {
+        "sma_ema_closes": ["1.00", "2.00", "3.00", "4.00"],
+        "rsi_closes": ["10.00", "11.00", "11.00", "10.00"],
+        "atr_bars": [
+          {"high": "12.00", "low": "10.00", "close": "11.00"},
+          {"high": "13.00", "low": "10.00", "close": "12.00"},
+          {"high": "14.00", "low": "12.00", "close": "13.00"}
+        ],
+        "relative_volumes_prior_then_current": ["100", "200", "300", "300"],
+        "vwap_bars": [
+          {"typical": "10.00", "volume": "100"},
+          {"typical": "12.00", "volume": "300"}
+        ],
+        "crosses_above": {"previous_lhs": "10.00", "previous_rhs": "10.00", "current_lhs": "11.00", "current_rhs": "10.00"}
+      },
+      "calculation": {
+        "sma3": "(1 + 2 + 3) / 3 = 2.000000000000",
+        "ema3_seed": "SMA3 at bar 3 = 2.000000000000",
+        "ema3_bar4": "alpha 2/(3+1)=0.5; 0.5*4 + 0.5*2 = 3.000000000000",
+        "rsi3": "deltas +1,0,-1; avg_gain=1/3; avg_loss=1/3; RSI=50.000000000000",
+        "atr3": "TR values 2,3,2; mean = 7/3 = 2.333333333333",
+        "relative_volume3": "300 / mean(100,200,300) = 300/200 = 1.500000000000",
+        "session_vwap": "(10*100 + 12*300) / 400 = 11.500000000000",
+        "cross": "10 <= 10 and 11 > 10 is true"
+      },
+      "expected": {
+        "sma3_before_bar3": "UNKNOWN",
+        "sma3_bar3": "2.000000000000",
+        "ema3_before_bar3": "UNKNOWN",
+        "ema3_bar4": "3.000000000000",
+        "rsi3_before_four_closes": "UNKNOWN",
+        "rsi3_bar4": "50.000000000000",
+        "atr3_before_bar3": "UNKNOWN",
+        "atr3_bar3": "2.333333333333",
+        "relative_volume3_before_four_bars": "UNKNOWN",
+        "relative_volume3_bar4": "1.500000000000",
+        "session_vwap_bar2": "11.500000000000",
+        "crosses_above": true,
+        "current_equality_would_cross": false,
+        "gap_breaks_all_consecutive_warmups": true
+      }
+    },
+    {
+      "id": "confirmed_pivot_plateau_and_regime_availability",
+      "covers": ["pivot confirmation", "equality", "future-reference restriction", "market structure"],
+      "given": {
+        "left": 2,
+        "right": 2,
+        "highs_indices_0_to_5": ["10.00", "15.00", "15.00", "14.00", "13.00", "12.00"],
+        "candidate_index": 2,
+        "four_regime_pivots": {"prior_high": "15.00", "latest_high": "16.00", "prior_low": "9.00", "latest_low": "10.00", "last_confirmation_index": 20}
+      },
+      "calculation": {
+        "left_tie": "15 >= max(10,15) is true",
+        "strict_right": "15 > max(14,13) is true",
+        "confirmation_index": "2 + 2 = 4",
+        "regime": "16 > 15 and 10 > 9"
+      },
+      "expected": {
+        "pivot_high_index": 2,
+        "available_before_index4": false,
+        "available_after_index4_completion": true,
+        "regime_before_all_four_confirmations": "unknown",
+        "regime_at_index20": "bullish"
+      }
+    },
+    {
+      "id": "long_entry_then_stop_gap",
+      "covers": ["long", "limit touch", "stop gap", "fees", "cash", "equity", "drawdown"],
+      "given": {
+        "entry_limit": "2002.50",
+        "entry_bar": {"open": "2003.00", "high": "2003.20", "low": "2002.40", "close": "2002.80"},
+        "stop": "1994.80",
+        "target": "2005.00",
+        "exit_bar": {"open": "1994.00", "high": "1994.50", "low": "1993.50", "close": "1994.20"}
+      },
+      "calculation": {
+        "entry": "low <= limit; touched buy limit fills 2002.50",
+        "cash_after_entry": "25000.00 - 1.25 = 24998.75",
+        "entry_mark_equity": "24998.75 + (2002.80-2002.50)*10 = 25001.75",
+        "stop_gap_fill": "base 1994.00 - 0.10 = 1993.90",
+        "realized_pnl": "(1993.90-2002.50)*10 = -86.00",
+        "final_cash": "24998.75 - 86.00 - 1.25 = 24911.50",
+        "drawdown_from_high_water": "25001.75 - 24911.50 = 90.25"
+      },
+      "expected": {"fills": ["2002.50", "1993.90"], "fees": "2.50", "realized_pnl": "-86.00", "cash": "24911.50", "equity": "24911.50", "maximum_drawdown": "90.25"}
+    },
+    {
+      "id": "short_entry_then_stop_gap",
+      "covers": ["short", "limit touch", "stop gap", "fees", "cash", "drawdown"],
+      "given": {
+        "entry_limit": "2008.00",
+        "entry_bar": {"open": "2007.00", "high": "2008.10", "low": "2006.80", "close": "2007.50"},
+        "stop": "2013.70",
+        "target": "2005.50",
+        "exit_bar": {"open": "2014.20", "high": "2014.50", "low": "2014.00", "close": "2014.30"}
+      },
+      "calculation": {
+        "entry": "open below sell limit, then high >= limit; touched sell limit fills 2008.00",
+        "cash_after_entry": "25000.00 - 1.25 = 24998.75",
+        "entry_mark_equity": "24998.75 + (2008.00-2007.50)*10 = 25003.75",
+        "stop_gap_fill": "base 2014.20 + 0.10 = 2014.30",
+        "realized_pnl": "(2008.00-2014.30)*10 = -63.00",
+        "final_cash": "24998.75 - 63.00 - 1.25 = 24934.50",
+        "drawdown_from_high_water": "25003.75 - 24934.50 = 69.25"
+      },
+      "expected": {"fills": ["2008.00", "2014.30"], "fees": "2.50", "realized_pnl": "-63.00", "cash": "24934.50", "equity": "24934.50", "maximum_drawdown": "69.25"}
+    },
+    {
+      "id": "long_target_gap_price_improvement",
+      "covers": ["long target gap", "limit price improvement"],
+      "given": {"entry_fill": "2002.50", "target": "2005.00", "next_bar_open": "2005.50"},
+      "calculation": {"target_fill": "open 2005.50 >= target, so fill 2005.50", "pnl": "(2005.50-2002.50)*10 = 30.00", "cash": "25000 - 1.25 + 30 - 1.25 = 25027.50"},
+      "expected": {"fills": ["2002.50", "2005.50"], "fees": "2.50", "realized_pnl": "30.00", "cash": "25027.50"}
+    },
+    {
+      "id": "short_target_gap_price_improvement",
+      "covers": ["short target gap", "limit price improvement"],
+      "given": {"entry_fill": "2008.00", "target": "2005.50", "next_bar_open": "2005.00"},
+      "calculation": {"target_fill": "open 2005.00 <= target, so fill 2005.00", "pnl": "(2008.00-2005.00)*10 = 30.00", "cash": "25000 - 1.25 + 30 - 1.25 = 25027.50"},
+      "expected": {"fills": ["2008.00", "2005.00"], "fees": "2.50", "realized_pnl": "30.00", "cash": "25027.50"}
+    },
+    {
+      "id": "both_hit_after_open_fill_is_stop_first",
+      "covers": ["both-hit precedence", "entry-bar exits", "market slippage"],
+      "given": {
+        "buy_market_bar": {"open": "2000.00", "high": "2003.00", "low": "1997.00", "close": "2001.00"},
+        "stop": "1998.00",
+        "target": "2002.00"
+      },
+      "calculation": {
+        "entry_fill": "2000.00 + 0.10 = 2000.10",
+        "bracket_timing": "entry at open; bracket active for rest of bar",
+        "both_reachable": "low 1997 <= stop 1998 and high 2003 >= target 2002",
+        "exit_fill": "stop-first; 1998.00 - 0.10 = 1997.90",
+        "pnl": "(1997.90-2000.10)*10 = -22.00",
+        "cash": "25000 - 1.25 - 22 - 1.25 = 24975.50"
+      },
+      "expected": {"filled_exit": "stop", "target_cancelled": true, "fees": "2.50", "realized_pnl": "-22.00", "cash": "24975.50", "maximum_drawdown": "24.50"}
+    },
+    {
+      "id": "intrabar_entry_with_stop_and_target_is_conservative_stop",
+      "covers": ["entry-bar unknown order", "conservative default", "configurable alternative"],
+      "given": {
+        "buy_limit": "2000.00",
+        "bar": {"open": "2001.00", "high": "2003.00", "low": "1997.00", "close": "2002.00"},
+        "stop": "1998.00",
+        "target": "2002.00"
+      },
+      "calculation": {
+        "entry_fill": "low <= 2000; touched limit fills 2000.00",
+        "unknown_order": "bar reaches entry, stop and target but OHLC has no event order",
+        "default_exit": "conservative_stop_first applies stop at 1998.00 - 0.10 = 1997.90",
+        "pnl": "(1997.90-2000.00)*10 = -21.00",
+        "cash": "25000 - 1.25 - 21 - 1.25 = 24976.50"
+      },
+      "expected": {
+        "default": {"filled_exit": "stop", "cash": "24976.50", "fees": "2.50"},
+        "next_bar_only_variant": "position remains open; same-bar target is not granted; RunSpec must name the limitation"
+      }
+    },
+    {
+      "id": "fees_and_open_end_position_marked_not_liquidated",
+      "covers": ["fees", "open end position", "mark", "equity", "drawdown basis", "zero exit fill"],
+      "given": {
+        "entry_market_base": "2000.00",
+        "first_mark": "1999.80",
+        "end_mark": "2001.00",
+        "end_policy": "mark_open"
+      },
+      "calculation": {
+        "entry_fill": "2000.00 + 0.10 = 2000.10",
+        "entry_fee": "1.25",
+        "cash": "25000.00 - 1.25 = 24998.75",
+        "first_unrealized": "(1999.80-2000.10)*10 = -3.00",
+        "first_equity": "24998.75 - 3.00 = 24995.75",
+        "first_drawdown": "25000.00 - 24995.75 = 4.25",
+        "end_unrealized": "(2001.00-2000.10)*10 = 9.00",
+        "end_equity": "24998.75 + 9.00 = 25007.75"
+      },
+      "expected": {"fill_count": 1, "fees": "1.25", "realized_pnl": "0.00", "unrealized_pnl": "9.00", "cash": "24998.75", "equity": "25007.75", "open_quantity": 1, "maximum_drawdown": "4.25", "synthetic_exit": false}
+    },
+    {
+      "id": "daily_loss_with_overnight_carried_position",
+      "covers": ["daily loss basis", "overnight", "inclusive latch"],
+      "given": {
+        "prior_day_last_equity": "24980.00",
+        "new_day_position": {"side": "long", "entry": "2000.00", "quantity": 1},
+        "cash_after_prior_costs": "24980.00",
+        "new_day_mark": "1975.00",
+        "daily_loss_limit": "250.00"
+      },
+      "calculation": {
+        "daily_start_equity": "24980.00",
+        "new_day_equity": "24980.00 + (1975.00-2000.00)*10 = 24730.00",
+        "daily_loss": "max(0,24980.00-24730.00) = 250.00",
+        "inclusive_test": "250.00 >= 250.00"
+      },
+      "expected": {"daily_loss": "250.00", "risk_latched": true, "new_entries_allowed": false, "protective_exits_active": true, "position_flattened_by_day_boundary": false}
+    },
+    {
+      "id": "entry_order_multi_bar_ttl_expiry",
+      "covers": ["pending expiry", "configurable order lifetime", "missing bars"],
+      "given": {
+        "submitted_at": "2026-09-14T10:00:00Z",
+        "decision_interval_seconds": 900,
+        "entry_ttl_execution_bars": 2,
+        "active_window": ["2026-09-14T10:00:00Z", "2026-09-14T10:30:00Z"],
+        "buy_limit": "2000.00",
+        "lowest_valid_bar_low": "2000.10",
+        "missing_minutes": ["2026-09-14T10:07:00Z"],
+        "first_late_touch": {"start_at": "2026-09-14T10:30:00Z", "low": "1999.90"}
+      },
+      "expected": {
+        "fill_count": 0,
+        "expires_at": "2026-09-14T10:30:00Z",
+        "expiry_occurs_before_late_bar": true,
+        "missing_bar_extends_ttl": false,
+        "final_order_status": "EXPIRED",
+        "commission": "0.00"
+      }
+    },
+    {
+      "id": "archive_publication_crash_after_rename",
+      "covers": ["archive crash matrix", "publication", "recovery"],
+      "given": {
+        "staged_row": {"state": "staged", "checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        "final_file_exists": true,
+        "crash": "after atomic rename and fsync, before database publish transaction",
+        "old_latest_revision": "018-rev-10"
+      },
+      "expected": {
+        "reader_revision_before_recovery": "018-rev-10",
+        "new_file_visible_to_reader_before_recovery": false,
+        "reconciler_action": "verify owner, path and checksum then complete the same staged publication",
+        "new_revision_count": 1,
+        "duplicate_bar_count": 0,
+        "fallback_on_checksum_mismatch": false
+      }
+    },
+    {
+      "id": "job_owner_crash_and_stale_fence",
+      "covers": ["job crash", "attempt", "lease", "fencing", "replay"],
+      "given": {
+        "job_id": "018-job-1",
+        "attempt_1": {"fencing_token": 41, "lease_expires_at": "2026-09-14T10:00:45Z", "uncommitted_calculation": "decision-7"},
+        "attempt_2_claimed_at": "2026-09-14T10:00:46Z",
+        "attempt_2_fencing_token": 42,
+        "stale_attempt_1_commit_at": "2026-09-14T10:00:47Z"
+      },
+      "expected": {
+        "attempt_1_state": "LEASE_LOST",
+        "stale_commit_error": "LEASE_LOST",
+        "stale_committed_effects": 0,
+        "attempt_2_can_commit": true,
+        "decision_7_persisted_count": 1,
+        "exactly_once_transport_claim": false
+      }
+    },
+    {
+      "id": "lane_crash_before_and_after_atomic_checkpoint",
+      "covers": ["lane crash", "atomic state-decision-fill checkpoint", "replay", "two boundaries"],
+      "given": {
+        "checkpoint_before": {"cursor": 100, "next_decision_sequence": 7, "cash": "25000.00", "position": 0},
+        "bar_101_expected": {"decision_id": "deterministic-decision-7", "fill_id": "deterministic-fill-1", "cash_after": "24998.75", "position_after": 1}
+      },
+      "timelines": [
+        {
+          "name": "crash_before_commit",
+          "events": ["owner 51 calculates decision/fill", "transaction rolls back", "lease expires", "owner 52 replays bar 101 and commits"]
+        },
+        {
+          "name": "crash_after_commit_before_ack",
+          "events": ["owner 61 atomically commits cursor/state/decision/fill", "process crashes before ack", "owner 62 loads cursor 101", "retry of deterministic IDs returns existing outcome"]
+        }
+      ],
+      "expected": {
+        "each_timeline_final_cursor": 101,
+        "each_timeline_decision_count": 1,
+        "each_timeline_fill_count": 1,
+        "each_timeline_cash": "24998.75",
+        "each_timeline_position": 1,
+        "split_state_possible": false
+      }
+    },
+    {
+      "id": "manual_pause_wins_over_automatic_recovery",
+      "covers": ["lane control", "recovery", "stale feed", "manual intent"],
+      "given": {
+        "operator_intent": "PAUSE_ENTRIES",
+        "runtime_status_before": "WAITING_FRESH_DATA",
+        "feed_repaired": true,
+        "coverage_contiguous": true,
+        "open_position": 1,
+        "protective_bracket": "active"
+      },
+      "expected": {
+        "operator_intent_after": "PAUSE_ENTRIES",
+        "runtime_status_after": "PAUSED",
+        "automatic_entry_resume": false,
+        "protective_exit_management": true,
+        "explicit_resume_required": true
+      }
+    },
+    {
+      "id": "market_entry_gap_rejected_by_fill_time_risk",
+      "covers": ["sizing", "entry risk", "gap", "fee only on fill"],
+      "given": {
+        "long": {"market_open": "2010.00", "projected_fill_with_slippage": "2010.10", "protective_stop": "1997.00", "profit_target": "2020.00"},
+        "short": {"market_open": "1990.00", "projected_fill_with_slippage": "1989.90", "protective_stop": "2003.00", "profit_target": "1980.00"},
+        "per_entry_cap": "125.00"
+      },
+      "calculation": {
+        "long": "slipped stop 1996.90; (2010.10-1996.90)*10 + 2*1.25 = 134.50",
+        "short": "slipped stop 2003.10; (2003.10-1989.90)*10 + 2*1.25 = 134.50",
+        "geometry": "long 1997<2010.10<2020 and short 1980<1989.90<2003 both remain valid",
+        "cap_test": "134.50 > 125.00 on both sides"
+      },
+      "expected": {
+        "long": {"entry_fill_count": 0, "order_status": "CANCELLED", "reason": "RISK_GAP", "commission": "0.00", "cash": "25000.00"},
+        "short": {"entry_fill_count": 0, "order_status": "CANCELLED", "reason": "RISK_GAP", "commission": "0.00", "cash": "25000.00"}
+      }
+    },
+    {
+      "id": "forward_delayed_bar_availability_and_exit_rule",
+      "covers": ["forward effective time", "two-second delivery delay", "non-null exit rule", "causal close activation"],
+      "given": {
+        "open_long": {"entry_fill": "2000.00", "cash_after_entry_fee": "24998.75", "protective_stop": "1995.00", "profit_target": "2005.00"},
+        "execution_bar_end": "2026-09-14T10:15:00Z",
+        "source_bar_received_at": "2026-09-14T10:15:02Z",
+        "exit_root": {"node_id": "long-exit", "result": "PASS"},
+        "decision_recorded_at": "2026-09-14T10:15:02.100000Z",
+        "close_submitted_at": "2026-09-14T10:15:02.200000Z",
+        "bars": [
+          {"start_at": "2026-09-14T10:15:00Z", "open": "2004.00", "high": "2004.50", "low": "2003.50", "close": "2004.20"},
+          {"start_at": "2026-09-14T10:16:00Z", "open": "2004.80", "high": "2005.20", "low": "2004.50", "close": "2005.10"}
+        ],
+        "ordering_subcase_opening_stop_gap": {"bar_open": "1994.00", "stop": "1995.00", "target": "2005.00", "active_market_close": true}
+      },
+      "calculation": {
+        "effective_at": "max(10:15:00 end, 10:15:02 received) = 10:15:02Z",
+        "first_causal_bar": "10:15 bar already began before submission and its complete range stays strictly inside stop/target; round active_from up to 10:16:00Z",
+        "sell_market_fill": "no bracket gap at 2004.80; active close fills 2004.80 - 0.10 = 2004.70 before later high 2005.20 touches target",
+        "realized_pnl": "(2004.70-2000.00)*10 = 47.00",
+        "cash": "24998.75 + 47.00 - 1.25 = 25044.50"
+      },
+      "expected": {
+        "execution_bar_end": "2026-09-14T10:15:00Z",
+        "effective_at": "2026-09-14T10:15:02Z",
+        "active_from": "2026-09-14T10:16:00Z",
+        "bar_1015_fill_count": 0,
+        "exit_fill": "2004.70",
+        "cash": "25044.50",
+        "fees_total_including_entry": "2.50",
+        "later_intrabar_target_fill_count": 0,
+        "bracket_cancelled_by_close": true,
+        "opening_stop_gap_subcase": {"stop_fill": "1993.90", "market_close_fill_count": 0, "target_fill_count": 0, "reason": "opening bracket gap resolves before active market close"}
+      }
+    },
+    {
+      "id": "exit_rule_unknown_does_not_close",
+      "covers": ["non-null exit rule", "UNKNOWN", "protective bracket"],
+      "given": {"position": "long", "long_exit_root": "rsi-exit", "result": "UNKNOWN", "reason": "NOT_READY_RSI", "protective_bracket": "active"},
+      "expected": {"close_intent_count": 0, "fill_count": 0, "protective_bracket": "active", "decision_reason": "NOT_READY_RSI"}
+    },
+    {
+      "id": "forward_active_corrections_before_and_after_cursor",
+      "covers": ["causal_latest", "nullable published base revision", "correction before cursor", "late correction after cursor"],
+      "given": {
+        "published_base_revision_id": null,
+        "bar_a": {"r1": {"bar_record_alias": "active-bar-a-r1", "received_at": "2026-09-14T10:00:01Z"}, "r2": {"bar_record_alias": "active-bar-a-r2", "received_at": "2026-09-14T10:00:03Z"}, "processed_at": "2026-09-14T10:00:05Z"},
+        "bar_b": {"r1": {"bar_record_alias": "active-bar-b-r1", "received_at": "2026-09-14T10:01:01Z"}, "processed_at": "2026-09-14T10:01:02Z", "r2": {"bar_record_alias": "active-bar-b-r2", "received_at": "2026-09-14T10:01:05Z"}}
+      },
+      "expected": {
+        "bar_a_source_record": "active-bar-a-r2",
+        "bar_a_correction": {"applied": true, "reason": "BEFORE_CURSOR_APPLIED"},
+        "bar_b_source_record": "active-bar-b-r1",
+        "bar_b_correction": {"event_type": "CORRECTION_OBSERVED", "applied": false, "reason": "LATE_AFTER_CURSOR"},
+        "decision_dataset_revision_id": null,
+        "retroactive_decisions_or_fills": 0
+      }
+    },
+    {
+      "id": "next_zone_targets_long_short_and_missing",
+      "covers": ["next_zone target", "long", "short", "causal selection", "no-target rejection"],
+      "given": {
+        "long": {"entry": "2000.00", "stop": "1995.00", "known_zones": [{"id": "L-old-far", "low": "2005.00", "high": "2006.00", "creation": 10}, {"id": "L-old-near", "low": "2003.00", "high": "2004.00", "creation": 8}], "later_unknown_zone": {"low": "2002.00"}},
+        "short": {"entry": "2010.00", "stop": "2015.00", "known_zones": [{"id": "S-far", "low": "2006.00", "high": "2007.00", "creation": 10}, {"id": "S-near", "low": "2007.50", "high": "2008.00", "creation": 8}]},
+        "no_target_long": {"entry": "2020.00", "known_zone_highs": ["2019.00"]}
+      },
+      "calculation": {
+        "long": "distances 5 and 3; choose known zone low 2003.00; later zone is unavailable",
+        "short": "distances to highs 3 and 2; choose known zone high 2008.00",
+        "rounding": "2003.00 long sell target floors to 2003.00; 2008.00 short buy target ceilings to 2008.00"
+      },
+      "expected": {"long_target": "2003.00", "short_target": "2008.00", "later_zone_changes_target": false, "no_target_reason": "NO_TARGET_ZONE", "no_target_order_count": 0}
+    },
+    {
+      "id": "r_multiple_targets_long_short",
+      "covers": ["r_multiple target", "long", "short", "tick rounding"],
+      "given": {
+        "long": {"entry": "2000.00", "stop": "1997.30", "r_multiple": "2.50"},
+        "short": {"entry": "2010.00", "stop": "2012.40", "r_multiple": "3.00"}
+      },
+      "calculation": {
+        "long": "R=abs(2000.00-1997.30)=2.70; raw target=2000+2.70*2.50=2006.75; sell target floors to 2006.70",
+        "short": "R=abs(2010.00-2012.40)=2.40; raw target=2010-2.40*3=2002.80; buy target ceilings to 2002.80"
+      },
+      "expected": {"long_target": "2006.70", "short_target": "2002.80", "fees_in_R": false, "gap_slippage_in_R": false}
+    },
+    {
+      "id": "favorable_limit_gaps_revalidate_bracket_both_sides",
+      "covers": ["entry geometry", "favorable limit gap", "long", "short", "fee only on fill"],
+      "given": {
+        "long": {"buy_limit": "2000.00", "open": "1997.00", "prospective_fill": "1997.00", "stop": "1998.00", "target": "2002.00"},
+        "short": {"sell_limit": "2010.00", "open": "2013.00", "prospective_fill": "2013.00", "stop": "2012.00", "target": "2008.00"}
+      },
+      "calculation": {
+        "long": "required 1998 < 1997 < 2002 is false",
+        "short": "required 2008 < 2013 < 2012 is false"
+      },
+      "expected": {
+        "long": {"reason": "ENTRY_GEOMETRY_GAP", "fill_count": 0, "commission": "0.00"},
+        "short": {"reason": "ENTRY_GEOMETRY_GAP", "fill_count": 0, "commission": "0.00"}
+      }
+    },
+    {
+      "id": "schedule_occurrence_crash_overlap_misfire_and_dst",
+      "covers": ["Schedule", "occurrence identity", "transactional enqueue", "overlap", "misfire", "DST gap", "DST fold"],
+      "timelines": [
+        {"name": "crash_before_fire_commit", "given": {"scheduled_for": "2026-09-14T10:00:00Z", "crash": "after job insert but before transaction commit"}, "expected": {"occurrence_count_after_crash": 0, "job_count_after_crash": 0, "next_fire_advanced_after_crash": false, "retry_occurrence_count": 1, "retry_job_count": 1}},
+        {"name": "overlap", "given": {"scheduled_for": "2026-09-14T10:15:00Z", "prior_job_state": "RUNNING"}, "expected": {"occurrence_state": "OVERLAP_SKIPPED", "new_job_count": 0, "next_fire_advanced": true}},
+        {"name": "misfire_within_grace", "given": {"scheduled_for": "2026-09-14T10:00:00Z", "recovered_at": "2026-09-14T10:10:00Z", "grace_seconds": 900}, "expected": {"occurrence_state": "ENQUEUED", "job_count": 1, "backlog_fanout": 0}},
+        {"name": "dst_spring_gap", "given": {"timezone": "America/Chicago", "local_rule_time": "2026-03-08T02:30:00", "first_valid_instant": "2026-03-08T08:00:00Z"}, "expected": {"occurrence_state": "DST_GAP_SKIPPED", "scheduled_for_identity": "2026-03-08T08:00:00Z", "job_count": 0}},
+        {"name": "dst_fall_fold", "given": {"timezone": "America/Chicago", "local_rule_time": "2026-11-01T01:30:00", "earlier_utc": "2026-11-01T06:30:00Z", "later_utc": "2026-11-01T07:30:00Z"}, "expected": {"occurrence_state": "DST_FOLD_FIRST_ONLY", "scheduled_for": "2026-11-01T06:30:00Z", "occurrence_count": 1, "job_count": 1, "later_utc_fired": false}}
+      ],
+      "expected": {"duplicate_occurrences": 0, "duplicate_jobs": 0, "occurrence_key": "(schedule_id, scheduled_for)"}
+    },
+    {
+      "id": "worker_checkpoint_rollback_compatibility",
+      "covers": ["worker release", "checkpoint format", "rollback", "fencing"],
+      "given": {
+        "release_manifest": {"previous_format": 1, "current_format": 2, "readable_formats": [1, 2], "write_format_during_rollback_window": 1},
+        "old_checkpoint": {"format_version": 1, "cursor": 100, "cash": "24998.75", "position": 1, "next_decision_sequence": 8},
+        "candidate_write": {"format_version": 1, "cursor": 101, "cash": "24998.75", "position": 1, "next_decision_sequence": 9},
+        "rollback_owner_fencing_token": 72
+      },
+      "expected": {
+        "candidate_reads_old": true,
+        "old_worker_reads_candidate_write": true,
+        "rollback_cursor": 101,
+        "rollback_next_decision_sequence": 9,
+        "cash_or_position_changed_by_conversion": false,
+        "duplicate_effects": 0,
+        "candidate_writes_unreadable_v2_during_window": false,
+        "if_reverse_compatibility_probe_fails": "REJECT_INCOMPATIBLE_ROUTINE_WORKER_RELEASE"
+      }
+    },
+    {
+      "id": "generic_market_entry_resolves_relative_bracket",
+      "covers": ["market entry", "fixed-tick stop", "risk-multiple target", "causal bracket freeze"],
+      "given": {
+        "signal_time": "2026-09-14T10:00:00Z",
+        "frozen_exit_policy": {"stop": {"kind": "fixed_ticks", "ticks": 20}, "target": {"kind": "risk_multiple", "multiple": "2.00"}},
+        "tick_size": "0.10",
+        "eligible_bar": {"open": "2000.00", "high": "2001.00", "low": "1999.00", "close": "2000.50"},
+        "side": "long",
+        "limit_companion": {"buy_limit": "2000.00", "signal_resolved_stop": "1998.00", "signal_resolved_target": "2004.00", "favorable_gap_open": "1999.00"}
+      },
+      "calculation": {
+        "prospective_entry": "buy market 2000.00 + one adverse tick = 2000.10",
+        "stop_distance": "20 * 0.10 = 2.00",
+        "raw_and_rounded_stop": "2000.10 - 2.00 = 1998.10; long sell stop ceiling remains 1998.10",
+        "price_R": "2000.10 - 1998.10 = 2.00",
+        "raw_and_rounded_target": "2000.10 + 2.00*2.00 = 2004.10; long sell target floor remains 2004.10",
+        "modeled_stop_risk": "slipped stop fill 1998.00; (2000.10-1998.00)*10 + 2*1.25 = 23.50",
+        "cash_after_entry": "25000.00 - 1.25 = 24998.75",
+        "bar_close_equity": "24998.75 + (2000.50-2000.10)*10 = 25002.75",
+        "limit_companion": "at signal R=2000-1998=2 and target=2000+2*2=2004; favorable fill 1999 does not move stop 1998 or target 2004; geometry 1998<1999<2004"
+      },
+      "expected": {
+        "entry_fill": "2000.10",
+        "resolved_stop": "1998.10",
+        "resolved_target": "2004.10",
+        "geometry_valid": true,
+        "entry_fill_count": 1,
+        "unprotected_committed_position_possible": false,
+        "cash": "24998.75",
+        "equity": "25002.75",
+        "limit_companion": {"entry_fill": "1999.00", "frozen_stop": "1998.00", "frozen_target": "2004.00", "bracket_moved_at_fill": false, "geometry_valid": true}
+      }
+    },
+    {
+      "id": "fully_serialized_rule_definition_crossover",
+      "covers": ["StrategyVersion definition", "bounded rule builder", "non-preset strategy", "entry and exit rule shape"],
+      "given": {
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": {
+          "kind": "rule_strategy_v1",
+          "name": "SMA crossover fixture",
+          "side_policy": "long",
+          "features": [
+            {"feature_id": "fast", "kind": "indicator", "name": "sma_v1", "output_type": "price", "unit": "contract_price", "interval_seconds": 900, "parameters": {"n": 3, "input": "close"}},
+            {"feature_id": "slow", "kind": "indicator", "name": "sma_v1", "output_type": "price", "unit": "contract_price", "interval_seconds": 900, "parameters": {"n": 5, "input": "close"}},
+            {"feature_id": "bar-volume", "kind": "input", "name": "volume", "output_type": "volume", "unit": "contract_volume", "interval_seconds": 900, "parameters": {}}
+          ],
+          "nodes": [
+            {"kind": "feature", "node_id": "fast-now", "feature_id": "fast", "offset": 0},
+            {"kind": "feature", "node_id": "slow-now", "feature_id": "slow", "offset": 0},
+            {"kind": "temporal_compare", "node_id": "cross-up", "op": "crosses_above", "left_feature": "fast-now", "right_feature": "slow-now"},
+            {"kind": "group", "node_id": "long-entry", "op": "all", "children": ["cross-up"]},
+            {"kind": "feature", "node_id": "volume-now", "feature_id": "bar-volume", "offset": 0},
+            {"kind": "compare", "node_id": "fast-below-slow", "op": "lt", "left": "fast-now", "right": "slow-now", "tolerance": null},
+            {"kind": "group", "node_id": "long-exit", "op": "all", "children": ["fast-below-slow"]}
+          ],
+          "entry_rules": {"long_root": "long-entry", "short_root": null},
+          "exit_rules": {"long_root": "long-exit", "short_root": null},
+          "entry_combination": "rules_only",
+          "exit_policy": {"kind": "bracket_exit_v1", "stop": {"kind": "fixed_ticks", "ticks": 20}, "target": {"kind": "risk_multiple", "multiple": "2"}},
+          "setup_modules": [{"kind": "one_position_v1"}],
+          "order_policy": {"entry_type": "market", "limit_price_source": null, "entry_ttl_execution_bars": 1, "both_hit_policy": "stop_first", "entry_bar_exit_policy": "conservative_stop_first"},
+          "constraints": {"max_entries_per_trading_day": 3, "entry_windows": []}
+        }
+      },
+      "expected": {
+        "valid": true,
+        "arbitrary_code_fields": 0,
+        "required_warmup_execution_bars": 6,
+        "entry_semantics": "After five-bar feature warm-up, a long market intent occurs only when prior fast <= prior slow and current fast > current slow; it fills no earlier than the next causally eligible minute bar.",
+        "non_preset_supported": true
+      }
+    },
+    {
+      "id": "invalid_rule_definition_has_typed_errors",
+      "covers": ["invalid StrategyVersion", "future reference", "limit price source", "unit checking"],
+      "given": {
+        "mutations_from_valid_fixture": [
+          {"path": "/nodes/0/offset", "value": -1},
+          {"path": "/order_policy/entry_type", "value": "limit"},
+          {"path": "/order_policy/limit_price_source", "value": null},
+          {"path": "/nodes/-", "value": {"kind": "arithmetic", "node_id": "bad-add", "op": "add", "args": ["fast-now", "volume-now"], "result_type": "price", "unit": "contract_price"}}
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "errors": [
+          {"path": "/nodes/0/offset", "code": "OUT_OF_RANGE"},
+          {"path": "/order_policy/limit_price_source", "code": "REQUIRED_FOR_LIMIT"},
+          {"path": "/nodes/7/args", "code": "UNIT_MISMATCH"}
+        ],
+        "strategy_version_created": false
+      }
+    },
+    {
+      "id": "strategy_edit_creates_version_and_running_lane_stays_pinned",
+      "covers": ["StrategyVersion", "version pinning", "separate TTL settings"],
+      "given": {
+        "strategy_v1": {"alias": "strategy-v1", "setup_expiry_execution_bars": 24, "entry_ttl_execution_bars": 1},
+        "running_lane": {"alias": "lane-a", "strategy_version": "strategy-v1", "entry_order_expires_at": "2026-09-14T10:15:00Z"},
+        "edited_draft": {"setup_expiry_execution_bars": 12, "entry_ttl_execution_bars": 3},
+        "validated_new_version": "strategy-v2"
+      },
+      "expected": {
+        "strategy_v1_changed": false,
+        "lane_strategy_after_edit": "strategy-v1",
+        "lane_existing_order_expiry_after_edit": "2026-09-14T10:15:00Z",
+        "new_lane_may_pin": "strategy-v2",
+        "setup_and_order_ttl_coupled": false
+      }
+    },
+    {
+      "id": "zero_trade_metrics_are_defined",
+      "covers": ["metrics", "zero trades", "null semantics"],
+      "given": {"starting_cash": "25000.00", "fills": [], "eligible_run_seconds": 3600},
+      "expected": {
+        "end_equity": "25000.00",
+        "net_pnl": "0.00",
+        "return": "0",
+        "fees": "0.00",
+        "realized_pnl": "0.00",
+        "exposure": "0",
+        "maximum_drawdown": "0.00",
+        "closed_trade_count": 0,
+        "win_rate": null,
+        "average_trade": null,
+        "profit_factor": null,
+        "null_reason": "NO_CLOSED_TRADES"
+      }
+    },
+    {
+      "id": "release_worker_handoff_with_open_overnight_lane",
+      "covers": ["release budget", "worker fencing", "open overnight", "processing gap"],
+      "given": {
+        "old_owner_token": 70,
+        "drain_started_at": "2026-09-14T10:00:00Z",
+        "old_checkpoint_at": "2026-09-14T10:00:20Z",
+        "new_owner_token": 71,
+        "new_processing_at": "2026-09-14T10:01:10Z",
+        "position": 1,
+        "operator_intent": "RUNNING"
+      },
+      "calculation": {
+        "graceful_checkpoint": "20 seconds <= 30-second drain budget",
+        "processing_gap": "10:01:10 - 10:00:20 = 50 seconds",
+        "gap_budget": "50 seconds <= 90 seconds"
+      },
+      "expected": {
+        "drain_budget_pass": true,
+        "processing_gap_budget_pass": true,
+        "ownership_overlap": 0,
+        "duplicate_decisions_or_fills": 0,
+        "position_after": 1,
+        "operator_intent_after": "RUNNING"
+      }
+    }
+  ],
+  "coverage_index": {
+    "two_user_denial": ["access_two_user_denial"],
+    "two_same_user_lanes": ["same_user_two_lanes_are_accounting_independent"],
+    "expiry": ["contract_expiry_close_and_no_roll"],
+    "old_pinned_revision_after_correction": ["pinned_revision_survives_correction"],
+    "dst_session_mapping": ["dst_session_mapping_uses_materialized_utc_calendar"],
+    "indicator_warmup_equality": ["indicator_warmup_equality_and_causal_catalogue", "confirmed_pivot_plateau_and_regime_availability"],
+    "long_short_stop_target_gaps": ["long_entry_then_stop_gap", "short_entry_then_stop_gap", "long_target_gap_price_improvement", "short_target_gap_price_improvement"],
+    "both_hit_precedence": ["both_hit_after_open_fill_is_stop_first", "intrabar_entry_with_stop_and_target_is_conservative_stop"],
+    "fees_open_end_positions": ["fees_and_open_end_position_marked_not_liquidated"],
+    "job_lane_crash_replay": ["job_owner_crash_and_stale_fence", "lane_crash_before_and_after_atomic_checkpoint"],
+    "risk_overnight": ["daily_loss_with_overnight_carried_position", "market_entry_gap_rejected_by_fill_time_risk"],
+    "order_expiry": ["entry_order_multi_bar_ttl_expiry"],
+    "archive_crash": ["archive_publication_crash_after_rename"],
+    "lane_recovery_control": ["manual_pause_wins_over_automatic_recovery"],
+    "release_fencing": ["release_worker_handoff_with_open_overnight_lane"],
+    "rule_definition_and_versioning": ["fully_serialized_rule_definition_crossover", "invalid_rule_definition_has_typed_errors", "strategy_edit_creates_version_and_running_lane_stays_pinned"],
+    "zero_trade_metrics": ["zero_trade_metrics_are_defined"],
+    "forward_causality_and_exit_rules": ["forward_delayed_bar_availability_and_exit_rule", "exit_rule_unknown_does_not_close"],
+    "forward_active_corrections": ["forward_active_corrections_before_and_after_cursor"],
+    "configurable_target_modes": ["next_zone_targets_long_short_and_missing", "r_multiple_targets_long_short"],
+    "entry_geometry_at_fill": ["favorable_limit_gaps_revalidate_bracket_both_sides", "market_entry_gap_rejected_by_fill_time_risk"],
+    "schedule_state_and_occurrences": ["schedule_occurrence_crash_overlap_misfire_and_dst"],
+    "worker_rollback_compatibility": ["worker_checkpoint_rollback_compatibility"],
+    "generic_market_relative_bracket": ["generic_market_entry_resolves_relative_bracket"]
+  }
+}
