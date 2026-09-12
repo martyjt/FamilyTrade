@@ -57,7 +57,12 @@ def make_service(engine: Engine, cipher: EnvelopeCipher | None = None) -> Access
 def logged_in(service: AccessService, name: str, scope: str = "lanes:read") -> Any:
     service.invite_user(name, f"test-password-{name}!", {scope})
     login = service.login(name, f"test-password-{name}!")
-    return service.authenticate_browser(login.session_token, request_id=f"request-{name}")
+    return service.authorize_browser_write(
+        login.session_token,
+        csrf_token=login.csrf_token,
+        origin="https://familytrade.test",
+        request_id=f"request-{name}",
+    )
 
 
 def account_payload(reference: str, secret: bytes) -> dict[str, object]:

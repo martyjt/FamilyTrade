@@ -108,7 +108,12 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
 
     clock.value = datetime(2026, 9, 13, 2, 0, tzinfo=UTC)
     revoked_login = service.login("alice", "test-password-A!")
-    revoked_context = service.authenticate_browser(revoked_login.session_token, request_id="logout")
+    revoked_context = service.authorize_browser_write(
+        revoked_login.session_token,
+        csrf_token=revoked_login.csrf_token,
+        origin="https://familytrade.test",
+        request_id="logout",
+    )
     service.logout(revoked_context)
     with pytest.raises(AccessError):
         service.authenticate_browser(revoked_login.session_token, request_id="revoked")
@@ -116,7 +121,12 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
         service.list_broker_accounts(revoked_context)
 
     changed_login = service.login("alice", "test-password-A!")
-    changed_context = service.authenticate_browser(changed_login.session_token, request_id="change")
+    changed_context = service.authorize_browser_write(
+        changed_login.session_token,
+        csrf_token=changed_login.csrf_token,
+        origin="https://familytrade.test",
+        request_id="change",
+    )
     service.change_password(changed_context, "replacement-pass-A!")
     with pytest.raises(AccessError):
         service.authenticate_browser(changed_login.session_token, request_id="rotated")
@@ -139,6 +149,11 @@ def test_scope_csrf_token_binding_and_exact_origin(postgres_engine: Engine) -> N
         )
     assert scope_error.value.code is ErrorCode.INSUFFICIENT_SCOPE
     assert scope_error.value.http_status == 403
+
+    read_context = service.authenticate_browser(alice.session_token, request_id="read-only")
+    with pytest.raises(AccessError) as unguarded_write:
+        service.change_password(read_context, "must-not-be-accepted!")
+    assert unguarded_write.value.code is ErrorCode.INVALID_CSRF
 
     authorized = service.authorize_browser_write(
         alice.session_token,

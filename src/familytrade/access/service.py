@@ -16,6 +16,7 @@ from familytrade.access.models import (
     AccessError,
     BrokerAccountCreate,
     BrokerAccountView,
+    BrowserWriteContext,
     CookieSettings,
     ErrorCode,
     LoginResult,
@@ -163,7 +164,7 @@ class AccessService:
         origin: str | None,
         request_id: str,
         required_scope: str | None = None,
-    ) -> UserContext:
+    ) -> BrowserWriteContext:
         context = self._authenticate_browser(
             session_token,
             request_id=request_id,
@@ -177,19 +178,31 @@ class AccessService:
         supplied_csrf_hash = _token_hash(csrf_token)
         if not secrets.compare_digest(supplied_csrf_hash, cast(bytes, session["csrf_hash"])):
             raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation failed.", 403)
-        self._repository.touch_session(context.auth_session_id, self._now(), context.expires_at)
-        return context
+        validated_at = self._now()
+        self._repository.touch_session(context.auth_session_id, validated_at, context.expires_at)
+        return BrowserWriteContext(
+            schema_version=context.schema_version,
+            user_id=context.user_id,
+            auth_session_id=context.auth_session_id,
+            auth_method=context.auth_method,
+            scopes=context.scopes,
+            authenticated_at=context.authenticated_at,
+            expires_at=context.expires_at,
+            request_id=context.request_id,
+            credential_version=context.credential_version,
+            csrf_validated_at=validated_at,
+        )
 
-    def logout(self, context: UserContext) -> None:
-        self._require_current_context(context)
+    def logout(self, context: BrowserWriteContext) -> None:
+        self._require_browser_write_context(context)
         self._repository.revoke_session(context.auth_session_id, self._now())
 
     def disable_user(self, user_id: str) -> None:
         """Administrator-only operation; disabling rotates credentials and sessions."""
         self._repository.disable_user(user_id, self._now())
 
-    def change_password(self, context: UserContext, new_password: str) -> None:
-        self._require_current_context(context)
+    def change_password(self, context: BrowserWriteContext, new_password: str) -> None:
+        self._require_browser_write_context(context)
         _validate_password(new_password)
         self._repository.change_password(
             context.user_id, self._password_hash.hash(new_password), self._now()
@@ -197,12 +210,12 @@ class AccessService:
 
     def create_broker_account(
         self,
-        context: UserContext,
+        context: BrowserWriteContext,
         payload: BrokerAccountCreate | Mapping[str, object],
         *,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_current_context(context)
+        self._require_browser_write_context(context)
         create = (
             payload
             if isinstance(payload, BrokerAccountCreate)
@@ -226,14 +239,14 @@ class AccessService:
 
     def replace_credential(
         self,
-        context: UserContext,
+        context: BrowserWriteContext,
         account_id: str,
         new_secret: bytes,
         *,
         expected_version: int,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_current_context(context)
+        self._require_browser_write_context(context)
         try:
             return self._repository.replace_credential(
                 context,
@@ -250,13 +263,13 @@ class AccessService:
 
     def revoke_credential(
         self,
-        context: UserContext,
+        context: BrowserWriteContext,
         account_id: str,
         *,
         expected_version: int,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_current_context(context)
+        self._require_browser_write_context(context)
         try:
             return self._repository.revoke_credential(
                 context, account_id, expected_version, idempotency_key, self._now()
@@ -272,6 +285,11 @@ class AccessService:
     def _require_current_context(self, context: UserContext) -> None:
         if not self._repository.context_is_current(context, self._now()):
             raise unauthenticated()
+
+    def _require_browser_write_context(self, context: BrowserWriteContext) -> None:
+        if not isinstance(context, BrowserWriteContext):
+            raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation is required.", 403)
+        self._require_current_context(context)
 
     def _now(self) -> datetime:
         now = self._clock()

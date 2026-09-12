@@ -95,6 +95,13 @@ class UserContext:
 
 
 @dataclass(frozen=True, slots=True)
+class BrowserWriteContext(UserContext):
+    """A current browser identity after bound CSRF and Origin validation."""
+
+    csrf_validated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class LoginResult:
     session_token: str = field(repr=False)
     csrf_token: str = field(repr=False)
