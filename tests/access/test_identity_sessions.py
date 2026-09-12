@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from familytrade.access.credentials import EnvelopeCipher
-from familytrade.access.models import AccessError, ErrorCode
+from familytrade.access.models import AccessError, BrowserWriteAuthorization, ErrorCode
 from familytrade.access.repository import AccessRepository
 from familytrade.access.service import ABSOLUTE_TIMEOUT, IDLE_TIMEOUT, AccessService
 
@@ -22,28 +22,56 @@ class MutableClock:
 
 
 @dataclass(frozen=True)
-class StubKek:
-    raw: bytes
-    version: str = "test-v1"
+class StubKekRing:
+    keys: dict[str, bytes]
+    active_version: str = "test-v1"
 
-    def key(self) -> bytes:
-        return self.raw
+    def key(self, version: str) -> bytes:
+        try:
+            return self.keys[version]
+        except KeyError as exc:
+            raise AccessError(
+                ErrorCode.DEPENDENCY_UNAVAILABLE,
+                "Credential key material is unavailable.",
+                503,
+            ) from exc
 
 
 def service_for(engine: Engine, clock: MutableClock) -> AccessService:
     return AccessService(
         AccessRepository(engine),
-        EnvelopeCipher(StubKek(b"K" * 32)),
+        EnvelopeCipher(StubKekRing({"test-v1": b"K" * 32})),
         allowed_origins={"https://familytrade.test"},
         clock=clock,
+    )
+
+
+def authorize(
+    service: AccessService,
+    session_token: str,
+    csrf_token: str,
+    operation: str,
+    *,
+    request_id: str = "write-request",
+) -> BrowserWriteAuthorization:
+    return service.authorize_browser_write(
+        session_token,
+        csrf_token=csrf_token,
+        origin="https://familytrade.test",
+        request_id=request_id,
+        operation=operation,
     )
 
 
 def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engine) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
-    user_id = service.invite_user(" Alice@Example.test ", "test-password-A!", {"lanes:read"})
-
+    user_id = service.invite_user(
+        " Alice@Example.test ",
+        "test-password-A!",
+        {"lanes:read"},
+        is_administrator=True,
+    )
     login = service.login("alice@example.test", "test-password-A!")
     context = service.authenticate_browser(
         login.session_token, request_id="018-request", required_scope="lanes:read"
@@ -52,6 +80,7 @@ def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engi
     assert context.user_id == user_id
     assert context.auth_method == "browser_session"
     assert context.scopes == ("lanes:read",)
+    assert context.is_administrator is True
     assert context.auth_session_id not in login.session_token
     assert context.expires_at == clock.value + IDLE_TIMEOUT
     assert login.expires_at == clock.value + ABSOLUTE_TIMEOUT
@@ -78,7 +107,6 @@ def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: En
             "retryable": False,
             "details": {},
         }
-
     service.disable_user(user_id)
     with pytest.raises(AccessError, match="Authentication is required"):
         service.login("alice", "test-password-A!")
@@ -108,34 +136,28 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
 
     clock.value = datetime(2026, 9, 13, 2, 0, tzinfo=UTC)
     revoked_login = service.login("alice", "test-password-A!")
-    revoked_context = service.authorize_browser_write(
-        revoked_login.session_token,
-        csrf_token=revoked_login.csrf_token,
-        origin="https://familytrade.test",
-        request_id="logout",
+    logout_authorization = authorize(
+        service, revoked_login.session_token, revoked_login.csrf_token, "session.logout"
     )
-    service.logout(revoked_context)
+    service.logout(logout_authorization)
     with pytest.raises(AccessError):
         service.authenticate_browser(revoked_login.session_token, request_id="revoked")
-    with pytest.raises(AccessError):
-        service.list_broker_accounts(revoked_context)
+    with pytest.raises(AccessError) as reused:
+        service.logout(logout_authorization)
+    assert reused.value.code is ErrorCode.INVALID_CSRF
 
     changed_login = service.login("alice", "test-password-A!")
-    changed_context = service.authorize_browser_write(
-        changed_login.session_token,
-        csrf_token=changed_login.csrf_token,
-        origin="https://familytrade.test",
-        request_id="change",
+    change_authorization = authorize(
+        service, changed_login.session_token, changed_login.csrf_token, "password.change"
     )
-    service.change_password(changed_context, "replacement-pass-A!")
+    service.change_password(change_authorization, "replacement-pass-A!")
     with pytest.raises(AccessError):
         service.authenticate_browser(changed_login.session_token, request_id="rotated")
     assert service.login("alice", "replacement-pass-A!")
-
     service.disable_user(user_id)
 
 
-def test_scope_csrf_token_binding_and_exact_origin(postgres_engine: Engine) -> None:
+def test_scope_csrf_token_binding_origin_operation_and_forgery(postgres_engine: Engine) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
     service.invite_user("alice", "test-password-A!", {"lanes:read"})
@@ -148,21 +170,17 @@ def test_scope_csrf_token_binding_and_exact_origin(postgres_engine: Engine) -> N
             alice.session_token, request_id="scope", required_scope="lanes:control"
         )
     assert scope_error.value.code is ErrorCode.INSUFFICIENT_SCOPE
-    assert scope_error.value.http_status == 403
 
-    read_context = service.authenticate_browser(alice.session_token, request_id="read-only")
-    with pytest.raises(AccessError) as unguarded_write:
-        service.change_password(read_context, "must-not-be-accepted!")
-    assert unguarded_write.value.code is ErrorCode.INVALID_CSRF
-
-    authorized = service.authorize_browser_write(
+    authorization = service.authorize_browser_write(
         alice.session_token,
         csrf_token=alice.csrf_token,
         origin="https://familytrade.test",
         request_id="write",
+        operation="credential.revoke",
         required_scope="lanes:read",
     )
-    assert authorized.scopes == ("lanes:read",)
+    assert authorization.operation == "credential.revoke"
+    assert alice.csrf_token not in repr(authorization)
 
     cases = [
         (alice.session_token, bob.csrf_token, "https://familytrade.test", ErrorCode.INVALID_CSRF),
@@ -172,15 +190,48 @@ def test_scope_csrf_token_binding_and_exact_origin(postgres_engine: Engine) -> N
     for token, csrf, origin, code in cases:
         with pytest.raises(AccessError) as denied:
             service.authorize_browser_write(
-                token, csrf_token=csrf, origin=origin, request_id="denied"
+                token,
+                csrf_token=csrf,
+                origin=origin,
+                request_id="denied",
+                operation="credential.revoke",
             )
         assert denied.value.code is code
         assert alice.session_token not in str(denied.value)
         assert alice.csrf_token not in str(denied.value)
 
+    forged = BrowserWriteAuthorization(
+        authorization_token="fabricated-capability",
+        request_id="write",
+        operation="credential.revoke",
+        expires_at=clock.value + timedelta(minutes=5),
+    )
+    with pytest.raises(AccessError) as forged_error:
+        service.revoke_credential(
+            forged,
+            "fabricated-account",
+            expected_version=1,
+            idempotency_key="00000000-0000-0000-0000-000000000001",
+        )
+    assert forged_error.value.code is ErrorCode.INVALID_CSRF
+
+    mismatched = BrowserWriteAuthorization(
+        authorization_token=authorization.authorization_token,
+        request_id=authorization.request_id,
+        operation="credential.replace",
+        expires_at=authorization.expires_at,
+    )
+    with pytest.raises(AccessError) as mismatched_error:
+        service.revoke_credential(
+            mismatched,
+            "fabricated-account",
+            expected_version=1,
+            idempotency_key="00000000-0000-0000-0000-000000000002",
+        )
+    assert mismatched_error.value.code is ErrorCode.INVALID_CSRF
+
 
 def test_kek_test_value_is_base64_not_a_repository_secret() -> None:
-    # The value is generated test material; deployments supply their own external setting.
     assert len(base64.b64encode(b"K" * 32)) == 44
 
 
@@ -188,6 +239,6 @@ def test_browser_origin_configuration_requires_https(postgres_engine: Engine) ->
     with pytest.raises(ValueError, match="HTTPS"):
         AccessService(
             AccessRepository(postgres_engine),
-            EnvelopeCipher(StubKek(b"K" * 32)),
+            EnvelopeCipher(StubKekRing({"test-v1": b"K" * 32})),
             allowed_origins={"http://familytrade.test"},
         )

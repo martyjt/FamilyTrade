@@ -6,10 +6,8 @@ from collections.abc import Iterator
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-
-from familytrade.access.repository import access_metadata
 
 
 @pytest.fixture(scope="session")
@@ -36,5 +34,10 @@ def postgres_engine() -> Iterator[Engine]:
 def clean_database(postgres_engine: Engine) -> Iterator[None]:
     yield
     with postgres_engine.begin() as connection:
-        for table in reversed(access_metadata.sorted_tables):
-            connection.execute(table.delete())
+        connection.execute(
+            text(
+                "TRUNCATE access_write_authorizations, access_idempotency_records, "
+                "access_audit_events, access_broker_accounts, access_credential_envelopes, "
+                "access_sessions, access_users CASCADE"
+            )
+        )

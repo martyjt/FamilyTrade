@@ -17,13 +17,14 @@ from familytrade.access.models import AccessError, ErrorCode
 
 KEK_ENVIRONMENT_VARIABLE = "FAMILYTRADE_CREDENTIAL_KEK_V1"
 KEK_VERSION_ENVIRONMENT_VARIABLE = "FAMILYTRADE_CREDENTIAL_KEK_VERSION"
+KEK_RING_ENVIRONMENT_VARIABLE = "FAMILYTRADE_CREDENTIAL_KEKS"
 
 
 class KekProvider(Protocol):
     @property
-    def version(self) -> str: ...
+    def active_version(self) -> str: ...
 
-    def key(self) -> bytes: ...
+    def key(self, version: str) -> bytes: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +34,23 @@ class EnvironmentKekProvider:
     environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
 
     @property
-    def version(self) -> str:
+    def active_version(self) -> str:
         return self.environ.get(KEK_VERSION_ENVIRONMENT_VARIABLE, "v1")
 
-    def key(self) -> bytes:
-        encoded = self.environ.get(KEK_ENVIRONMENT_VARIABLE)
+    def key(self, version: str) -> bytes:
+        encoded: str | None = None
+        serialized_ring = self.environ.get(KEK_RING_ENVIRONMENT_VARIABLE)
+        if serialized_ring is not None:
+            try:
+                parsed = json.loads(serialized_ring)
+                if isinstance(parsed, dict):
+                    candidate = parsed.get(version)
+                    if isinstance(candidate, str):
+                        encoded = candidate
+            except json.JSONDecodeError, TypeError:
+                encoded = None
+        elif version == self.active_version:
+            encoded = self.environ.get(KEK_ENVIRONMENT_VARIABLE)
         if encoded is None:
             raise _key_unavailable()
         try:
@@ -94,14 +107,15 @@ class EnvelopeCipher:
         dek = AESGCM.generate_key(bit_length=256)
         nonce = secrets.token_bytes(12)
         wrap_nonce = secrets.token_bytes(12)
+        active_version = self._kek_provider.active_version
         ciphertext = AESGCM(dek).encrypt(nonce, secret, aad)
-        wrapped_dek = AESGCM(self._kek_provider.key()).encrypt(wrap_nonce, dek, aad)
+        wrapped_dek = AESGCM(self._kek_provider.key(active_version)).encrypt(wrap_nonce, dek, aad)
         return CredentialEnvelope(
             ciphertext=ciphertext,
             nonce=nonce,
             wrapped_dek=wrapped_dek,
             wrap_nonce=wrap_nonce,
-            key_version=self._kek_provider.version,
+            key_version=active_version,
         )
 
     def _decrypt(
@@ -113,11 +127,9 @@ class EnvelopeCipher:
         provider: str,
         purpose: str,
     ) -> bytes:
-        if envelope.key_version != self._kek_provider.version:
-            raise _key_unavailable()
         aad = self.associated_data(owner_user_id, account_id, provider, purpose)
         try:
-            dek = AESGCM(self._kek_provider.key()).decrypt(
+            dek = AESGCM(self._kek_provider.key(envelope.key_version)).decrypt(
                 envelope.wrap_nonce, envelope.wrapped_dek, aad
             )
             return AESGCM(dek).decrypt(envelope.nonce, envelope.ciphertext, aad)
@@ -133,6 +145,33 @@ class EnvelopeCipher:
         """Prove decryptability without exposing plaintext to a caller."""
         decrypted = self._decrypt(envelope, **binding)
         del decrypted
+
+    def rewrap(self, envelope: CredentialEnvelope, **binding: str) -> CredentialEnvelope:
+        """Re-encrypt only the DEK under the active KEK; secret ciphertext is unchanged."""
+        aad = self.associated_data(
+            binding["owner_user_id"],
+            binding["account_id"],
+            binding["provider"],
+            binding["purpose"],
+        )
+        try:
+            dek = AESGCM(self._kek_provider.key(envelope.key_version)).decrypt(
+                envelope.wrap_nonce, envelope.wrapped_dek, aad
+            )
+            active_version = self._kek_provider.active_version
+            wrap_nonce = secrets.token_bytes(12)
+            wrapped_dek = AESGCM(self._kek_provider.key(active_version)).encrypt(
+                wrap_nonce, dek, aad
+            )
+        except (InvalidTag, ValueError) as exc:
+            raise _key_unavailable() from exc
+        return CredentialEnvelope(
+            ciphertext=envelope.ciphertext,
+            nonce=envelope.nonce,
+            wrapped_dek=wrapped_dek,
+            wrap_nonce=wrap_nonce,
+            key_version=active_version,
+        )
 
 
 def mask_reference(value: str) -> str:

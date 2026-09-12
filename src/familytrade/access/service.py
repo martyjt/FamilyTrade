@@ -14,9 +14,8 @@ from pwdlib import PasswordHash
 from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import (
     AccessError,
-    BrokerAccountCreate,
     BrokerAccountView,
-    BrowserWriteContext,
+    BrowserWriteAuthorization,
     CookieSettings,
     ErrorCode,
     LoginResult,
@@ -27,6 +26,17 @@ from familytrade.access.repository import AccessRepository
 
 IDLE_TIMEOUT = timedelta(hours=12)
 ABSOLUTE_TIMEOUT = timedelta(days=7)
+WRITE_AUTHORIZATION_TIMEOUT = timedelta(minutes=5)
+BROWSER_WRITE_OPERATIONS = frozenset(
+    {
+        "broker_account.create",
+        "credential.replace",
+        "credential.revoke",
+        "credential.rewrap",
+        "password.change",
+        "session.logout",
+    }
+)
 SUPPORTED_SCOPES = frozenset(
     {
         "data:read",
@@ -63,7 +73,14 @@ class AccessService:
         self._password_hash = password_hash or PasswordHash.recommended()
         self._dummy_password_hash = self._password_hash.hash(secrets.token_bytes(32))
 
-    def invite_user(self, username: str, initial_password: str, scopes: Collection[str]) -> str:
+    def invite_user(
+        self,
+        username: str,
+        initial_password: str,
+        scopes: Collection[str],
+        *,
+        is_administrator: bool = False,
+    ) -> str:
         """Administrator-only bootstrap operation; it is deliberately not a public route."""
         normalized = _normalize_username(username)
         _validate_password(initial_password)
@@ -72,6 +89,7 @@ class AccessService:
             normalized,
             self._password_hash.hash(initial_password),
             normalized_scopes,
+            is_administrator,
             self._now(),
         )
 
@@ -93,6 +111,7 @@ class AccessService:
             token_hash=_token_hash(session_token),
             csrf_hash=_token_hash(csrf_token),
             scopes=cast(list[str], user["scopes"]),
+            is_administrator=cast(bool, user["is_administrator"]),
             credential_version=cast(int, user["credential_version"]),
             authenticated_at=now,
             idle_expires_at=now + IDLE_TIMEOUT,
@@ -129,6 +148,7 @@ class AccessService:
             or now >= cast(datetime, session["idle_expires_at"])
             or now >= cast(datetime, session["absolute_expires_at"])
             or session["credential_version"] != session["current_credential_version"]
+            or session["is_administrator"] != session["current_is_administrator"]
         )
         if invalid:
             raise unauthenticated()
@@ -154,6 +174,7 @@ class AccessService:
             expires_at=next_idle_expiry,
             request_id=request_id,
             credential_version=cast(int, session["credential_version"]),
+            is_administrator=cast(bool, session["is_administrator"]),
         )
 
     def authorize_browser_write(
@@ -163,8 +184,11 @@ class AccessService:
         csrf_token: str,
         origin: str | None,
         request_id: str,
+        operation: str,
         required_scope: str | None = None,
-    ) -> BrowserWriteContext:
+    ) -> BrowserWriteAuthorization:
+        if operation not in BROWSER_WRITE_OPERATIONS:
+            raise AccessError(ErrorCode.VALIDATION_ERROR, "Invalid browser write operation.", 422)
         context = self._authenticate_browser(
             session_token,
             request_id=request_id,
@@ -179,54 +203,50 @@ class AccessService:
         if not secrets.compare_digest(supplied_csrf_hash, cast(bytes, session["csrf_hash"])):
             raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation failed.", 403)
         validated_at = self._now()
-        self._repository.touch_session(context.auth_session_id, validated_at, context.expires_at)
-        return BrowserWriteContext(
-            schema_version=context.schema_version,
-            user_id=context.user_id,
-            auth_session_id=context.auth_session_id,
-            auth_method=context.auth_method,
-            scopes=context.scopes,
-            authenticated_at=context.authenticated_at,
-            expires_at=context.expires_at,
-            request_id=context.request_id,
-            credential_version=context.credential_version,
-            csrf_validated_at=validated_at,
+        authorization_token = secrets.token_urlsafe(32)
+        expires_at = min(validated_at + WRITE_AUTHORIZATION_TIMEOUT, context.expires_at)
+        self._repository.create_write_authorization(
+            context,
+            authorization_token,
+            request_id,
+            operation,
+            expires_at,
+            validated_at,
+        )
+        return BrowserWriteAuthorization(
+            authorization_token=authorization_token,
+            request_id=request_id,
+            operation=operation,
+            expires_at=expires_at,
         )
 
-    def logout(self, context: BrowserWriteContext) -> None:
-        self._require_browser_write_context(context)
-        self._repository.revoke_session(context.auth_session_id, self._now())
+    def logout(self, authorization: BrowserWriteAuthorization) -> None:
+        self._repository.revoke_authorized_session(authorization, self._now())
 
     def disable_user(self, user_id: str) -> None:
         """Administrator-only operation; disabling rotates credentials and sessions."""
         self._repository.disable_user(user_id, self._now())
 
-    def change_password(self, context: BrowserWriteContext, new_password: str) -> None:
-        self._require_browser_write_context(context)
+    def change_password(self, authorization: BrowserWriteAuthorization, new_password: str) -> None:
         _validate_password(new_password)
-        self._repository.change_password(
-            context.user_id, self._password_hash.hash(new_password), self._now()
+        self._repository.change_authorized_password(
+            authorization, self._password_hash.hash(new_password), self._now()
         )
 
     def create_broker_account(
         self,
-        context: BrowserWriteContext,
-        payload: BrokerAccountCreate | Mapping[str, object],
+        authorization: BrowserWriteAuthorization,
+        payload: Mapping[str, object],
         *,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_browser_write_context(context)
-        create = (
-            payload
-            if isinstance(payload, BrokerAccountCreate)
-            else BrokerAccountCreate.model_validate(payload)
-        )
         return self._repository.create_broker_account(
-            context, create, idempotency_key, self._cipher, self._now()
+            authorization, payload, idempotency_key, self._cipher, self._now()
         )
 
     def get_broker_account(self, context: UserContext, account_id: str) -> BrokerAccountView:
         self._require_current_context(context)
+        self._require_administrator(context)
         try:
             return self._repository.get_broker_account(context, account_id)
         except AccessError as exc:
@@ -235,21 +255,21 @@ class AccessService:
 
     def list_broker_accounts(self, context: UserContext) -> tuple[BrokerAccountView, ...]:
         self._require_current_context(context)
+        self._require_administrator(context)
         return self._repository.list_broker_accounts(context)
 
     def replace_credential(
         self,
-        context: BrowserWriteContext,
+        authorization: BrowserWriteAuthorization,
         account_id: str,
         new_secret: bytes,
         *,
         expected_version: int,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_browser_write_context(context)
         try:
             return self._repository.replace_credential(
-                context,
+                authorization,
                 account_id,
                 new_secret,
                 expected_version,
@@ -257,39 +277,69 @@ class AccessService:
                 self._cipher,
                 self._now(),
             )
-        except AccessError as exc:
-            self._audit_opaque_denial(context, exc)
+        except AccessError as error:
+            self._audit_write_denial(authorization, error)
             raise
 
     def revoke_credential(
         self,
-        context: BrowserWriteContext,
+        authorization: BrowserWriteAuthorization,
         account_id: str,
         *,
         expected_version: int,
         idempotency_key: str,
     ) -> BrokerAccountView:
-        self._require_browser_write_context(context)
         try:
             return self._repository.revoke_credential(
-                context, account_id, expected_version, idempotency_key, self._now()
+                authorization, account_id, expected_version, idempotency_key, self._now()
             )
-        except AccessError as exc:
-            self._audit_opaque_denial(context, exc)
+        except AccessError as error:
+            self._audit_write_denial(authorization, error)
+            raise
+
+    def rewrap_credentials(
+        self,
+        authorization: BrowserWriteAuthorization,
+        account_id: str,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> BrokerAccountView:
+        try:
+            return self._repository.rewrap_credentials(
+                authorization,
+                account_id,
+                expected_version,
+                idempotency_key,
+                self._cipher,
+                self._now(),
+            )
+        except AccessError as error:
+            self._audit_write_denial(authorization, error)
             raise
 
     def _audit_opaque_denial(self, context: UserContext, error: AccessError) -> None:
         if error.code is ErrorCode.NOT_FOUND:
             self._repository.audit_not_found(context, self._now())
 
+    def _audit_write_denial(
+        self, authorization: BrowserWriteAuthorization, error: AccessError
+    ) -> None:
+        if error.code is ErrorCode.NOT_FOUND:
+            self._repository.audit_authorized_not_found(authorization, self._now())
+
     def _require_current_context(self, context: UserContext) -> None:
         if not self._repository.context_is_current(context, self._now()):
             raise unauthenticated()
 
-    def _require_browser_write_context(self, context: BrowserWriteContext) -> None:
-        if not isinstance(context, BrowserWriteContext):
-            raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation is required.", 403)
-        self._require_current_context(context)
+    @staticmethod
+    def _require_administrator(context: UserContext) -> None:
+        if not context.is_administrator:
+            raise AccessError(
+                ErrorCode.INSUFFICIENT_SCOPE,
+                "Administrator authorization is required.",
+                403,
+            )
 
     def _now(self) -> datetime:
         now = self._clock()

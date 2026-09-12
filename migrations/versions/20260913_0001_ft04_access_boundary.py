@@ -23,6 +23,7 @@ def upgrade() -> None:
         sa.Column("username_normalized", sa.String(254), nullable=False, unique=True),
         sa.Column("password_hash", sa.Text(), nullable=False),
         sa.Column("scopes", postgresql.ARRAY(sa.Text()), nullable=False),
+        sa.Column("is_administrator", sa.Boolean(), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False),
         sa.Column("credential_version", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -42,6 +43,7 @@ def upgrade() -> None:
         sa.Column("token_hash", sa.LargeBinary(), nullable=False, unique=True),
         sa.Column("csrf_hash", sa.LargeBinary(), nullable=False),
         sa.Column("scopes", postgresql.ARRAY(sa.Text()), nullable=False),
+        sa.Column("is_administrator", sa.Boolean(), nullable=False),
         sa.Column("credential_version", sa.Integer(), nullable=False),
         sa.Column("authenticated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
@@ -79,6 +81,14 @@ def upgrade() -> None:
             name="ck_access_credential_purpose",
         ),
         sa.CheckConstraint("status IN ('active', 'revoked')", name="ck_access_credential_status"),
+        sa.UniqueConstraint(
+            "credential_envelope_id",
+            "owner_user_id",
+            "broker_account_id",
+            "provider",
+            "purpose",
+            name="uq_access_envelope_identity_binding",
+        ),
     )
     op.create_table(
         "access_broker_accounts",
@@ -93,11 +103,13 @@ def upgrade() -> None:
         ),
         sa.Column("provider", sa.String(100), nullable=False),
         sa.Column("provider_account_ref_ciphertext_id", sa.String(100), nullable=False),
+        sa.Column("provider_account_ref_purpose", sa.String(100), nullable=False),
         sa.Column("provider_account_ref_last_four", sa.String(100), nullable=False),
         sa.Column("environment", sa.String(100), nullable=False),
         sa.Column("status", sa.String(100), nullable=False),
         sa.Column("capabilities", postgresql.ARRAY(sa.Text()), nullable=False),
         sa.Column("credential_envelope_id", sa.String(100), nullable=False),
+        sa.Column("credential_purpose", sa.String(100), nullable=False),
         sa.Column("verified_at", sa.DateTime(timezone=True)),
         sa.Column("last_reconciled_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -109,6 +121,74 @@ def upgrade() -> None:
             name="ck_access_broker_status",
         ),
         sa.CheckConstraint("record_version >= 1", name="ck_access_broker_record_version"),
+        sa.CheckConstraint(
+            "provider_account_ref_purpose = 'provider_account_ref'",
+            name="ck_access_broker_ref_purpose",
+        ),
+        sa.CheckConstraint(
+            "credential_purpose = 'provider_credential'",
+            name="ck_access_broker_credential_purpose",
+        ),
+        sa.UniqueConstraint(
+            "broker_account_id",
+            "owner_user_id",
+            "provider",
+            name="uq_access_broker_owner_provider",
+        ),
+        sa.ForeignKeyConstraint(
+            [
+                "provider_account_ref_ciphertext_id",
+                "owner_user_id",
+                "broker_account_id",
+                "provider",
+                "provider_account_ref_purpose",
+            ],
+            [
+                "access_credential_envelopes.credential_envelope_id",
+                "access_credential_envelopes.owner_user_id",
+                "access_credential_envelopes.broker_account_id",
+                "access_credential_envelopes.provider",
+                "access_credential_envelopes.purpose",
+            ],
+            name="fk_access_broker_reference_envelope",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        sa.ForeignKeyConstraint(
+            [
+                "credential_envelope_id",
+                "owner_user_id",
+                "broker_account_id",
+                "provider",
+                "credential_purpose",
+            ],
+            [
+                "access_credential_envelopes.credential_envelope_id",
+                "access_credential_envelopes.owner_user_id",
+                "access_credential_envelopes.broker_account_id",
+                "access_credential_envelopes.provider",
+                "access_credential_envelopes.purpose",
+            ],
+            name="fk_access_broker_credential_envelope",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+    op.create_foreign_key(
+        "fk_access_envelope_account_owner_provider",
+        "access_credential_envelopes",
+        "access_broker_accounts",
+        ["broker_account_id", "owner_user_id", "provider"],
+        ["broker_account_id", "owner_user_id", "provider"],
+        deferrable=True,
+        initially="DEFERRED",
+    )
+    op.create_index(
+        "uq_access_active_envelope_per_purpose",
+        "access_credential_envelopes",
+        ["owner_user_id", "broker_account_id", "purpose"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
     )
     op.create_table(
         "access_audit_events",
@@ -137,11 +217,33 @@ def upgrade() -> None:
         sa.Column("result", postgresql.JSONB(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
+    op.create_table(
+        "access_write_authorizations",
+        sa.Column("authorization_hash", sa.LargeBinary(), primary_key=True),
+        sa.Column(
+            "auth_session_id",
+            sa.String(100),
+            sa.ForeignKey("access_sessions.auth_session_id"),
+            nullable=False,
+            index=True,
+        ),
+        sa.Column("request_id", sa.String(100), nullable=False),
+        sa.Column("operation", sa.String(100), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("consumed_at", sa.DateTime(timezone=True)),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("access_write_authorizations")
     op.drop_table("access_idempotency_records")
     op.drop_table("access_audit_events")
+    op.drop_constraint(
+        "fk_access_envelope_account_owner_provider",
+        "access_credential_envelopes",
+        type_="foreignkey",
+    )
     op.drop_table("access_broker_accounts")
     op.drop_table("access_credential_envelopes")
     op.drop_table("access_sessions")

@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 SCHEMA_VERSION = "v1"
 
@@ -69,16 +69,23 @@ class BrokerAccountStatus(StrEnum):
     DISABLED = "disabled"
 
 
-class BrokerAccountCreate(BaseModel):
-    """Strict public input: ownership and persistence fields are server-only."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
+class _BrokerAccountFields(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
     provider: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     provider_account_reference: str = Field(min_length=1, max_length=500)
     environment: BrokerEnvironment
     capabilities: tuple[str, ...] = ()
-    credential: bytes = Field(min_length=1, max_length=65536, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerAccountCreate:
+    """Secret-safe strict input with no caller-supplied ownership fields."""
+
+    provider: str
+    provider_account_reference: str
+    environment: BrokerEnvironment
+    capabilities: tuple[str, ...]
+    credential: bytes = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,13 +99,17 @@ class UserContext:
     expires_at: datetime
     request_id: str
     credential_version: int
+    is_administrator: bool
 
 
 @dataclass(frozen=True, slots=True)
-class BrowserWriteContext(UserContext):
-    """A current browser identity after bound CSRF and Origin validation."""
+class BrowserWriteAuthorization:
+    """Opaque, single-use database-backed authorization for one browser mutation."""
 
-    csrf_validated_at: datetime
+    authorization_token: str = field(repr=False)
+    request_id: str
+    operation: str
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,3 +161,51 @@ def stale_version(expected: int, current: int) -> AccessError:
         409,
         details={"expected_version": expected, "current_version": current},
     )
+
+
+def parse_broker_account_create(payload: dict[str, object]) -> BrokerAccountCreate:
+    allowed_fields = {
+        "provider",
+        "provider_account_reference",
+        "environment",
+        "capabilities",
+        "credential",
+    }
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise AccessError(
+            ErrorCode.VALIDATION_ERROR,
+            "Invalid broker account input.",
+            422,
+            details={"paths": [f"/{field}" for field in unknown_fields]},
+        )
+    credential = payload.get("credential")
+    validate_secret_bytes(credential, path="/credential")
+    public_fields = {key: value for key, value in payload.items() if key != "credential"}
+    try:
+        parsed = _BrokerAccountFields.model_validate(public_fields)
+    except ValidationError as exc:
+        paths = sorted("/" + "/".join(str(part) for part in error["loc"]) for error in exc.errors())
+        raise AccessError(
+            ErrorCode.VALIDATION_ERROR,
+            "Invalid broker account input.",
+            422,
+            details={"paths": paths},
+        ) from None
+    return BrokerAccountCreate(
+        provider=parsed.provider,
+        provider_account_reference=parsed.provider_account_reference,
+        environment=parsed.environment,
+        capabilities=parsed.capabilities,
+        credential=cast(bytes, credential),
+    )
+
+
+def validate_secret_bytes(value: object, *, path: str) -> None:
+    if not isinstance(value, bytes) or not 1 <= len(value) <= 65536:
+        raise AccessError(
+            ErrorCode.VALIDATION_ERROR,
+            "Invalid credential input.",
+            422,
+            details={"paths": [path]},
+        )
