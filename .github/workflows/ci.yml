@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.13"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.3"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.14.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: uv sync --frozen --all-groups
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest tests/bootstrap
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run lint
+      - run: npm --prefix frontend run typecheck
+      - run: npm --prefix frontend test -- --run
+      - run: npm --prefix frontend run build
+      - run: docker compose config --quiet
+      - run: docker compose up --build --detach
+        if: matrix.os == 'ubuntu-latest'
+      - run: curl --fail --retry 20 --retry-delay 3 --retry-all-errors --connect-timeout 5 --max-time 180 http://localhost:8000/health
+        if: matrix.os == 'ubuntu-latest'
+      - run: curl --fail --retry 20 --retry-delay 3 --retry-all-errors --connect-timeout 5 --max-time 180 http://localhost:5173
+        if: matrix.os == 'ubuntu-latest'
+      - run: docker build -t familytrade-bootstrap-check .
+        if: matrix.os == 'ubuntu-latest'
+      - run: docker compose down --volumes --remove-orphans
+        if: always() && matrix.os == 'ubuntu-latest'

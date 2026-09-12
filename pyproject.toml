@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "familytrade"
+version = "0.1.0"
+description = "FamilyTrade paper-research bootstrap"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic==1.20.0",
+    "authlib==1.8.0",
+    "fastapi==0.141.1",
+    "mcp==2.2.0",
+    "psycopg[binary]==3.3.5",
+    "pydantic==2.13.5",
+    "pwdlib[argon2]==0.3.0",
+    "sqlalchemy==2.0.52",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "ruff==0.16.7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/bootstrap"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["src"]
