@@ -19,6 +19,8 @@ from familytrade.access.models import (
     CookieSettings,
     ErrorCode,
     LoginResult,
+    PasswordChangeResult,
+    SessionLogoutResult,
     UserContext,
     UserDisableResult,
     unauthenticated,
@@ -182,8 +184,10 @@ class AccessService:
             expires_at=expires_at,
         )
 
-    def logout(self, authorization: BrowserWriteAuthorization) -> None:
-        self._repository.revoke_authorized_session(authorization)
+    def logout(
+        self, authorization: BrowserWriteAuthorization, *, idempotency_key: str
+    ) -> SessionLogoutResult:
+        return self._repository.revoke_authorized_session(authorization, idempotency_key)
 
     def disable_user(
         self,
@@ -202,10 +206,21 @@ class AccessService:
             self._audit_write_denial(authorization, error)
             raise
 
-    def change_password(self, authorization: BrowserWriteAuthorization, new_password: str) -> None:
+    def change_password(
+        self,
+        authorization: BrowserWriteAuthorization,
+        new_password: str,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> PasswordChangeResult:
         _validate_password(new_password)
-        self._repository.change_authorized_password(
-            authorization, self._password_hash.hash(new_password)
+        return self._repository.change_authorized_password(
+            authorization,
+            self._password_hash.hash(new_password),
+            hashlib.sha256(new_password.encode("utf-8")).hexdigest(),
+            expected_version,
+            idempotency_key,
         )
 
     def create_broker_account(

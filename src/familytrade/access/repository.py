@@ -46,6 +46,8 @@ from familytrade.access.models import (
     BrokerEnvironment,
     BrowserWriteAuthorization,
     ErrorCode,
+    PasswordChangeResult,
+    SessionLogoutResult,
     UserContext,
     UserDisableResult,
     not_found,
@@ -521,10 +523,54 @@ class AccessRepository:
                 .values(revoked_at=now)
             )
 
-    def revoke_authorized_session(self, authorization: BrowserWriteAuthorization) -> None:
+    def revoke_authorized_session(
+        self, authorization: BrowserWriteAuthorization, idempotency_key: str
+    ) -> SessionLogoutResult:
         with self._engine.begin() as connection:
+            try:
+                context, now = self._consume_write_authorization(
+                    connection, authorization, "session.logout", require_administrator=False
+                )
+            except AccessError:
+                replay_session_id = self._bound_authorization_session_id(
+                    connection, authorization, "session.logout"
+                )
+                if replay_session_id is None:
+                    raise
+                request_sha256 = _request_hash({"auth_session_id": replay_session_id})
+                replay = self._replay_bound_session_mutation(
+                    connection,
+                    authorization,
+                    "session.logout",
+                    idempotency_key,
+                    request_sha256,
+                )
+                if replay is None:
+                    raise
+                if isinstance(replay, AccessError):
+                    raise replay
+                return SessionLogoutResult(schema_version="v1", revoked=True)
+            request_sha256 = _request_hash({"auth_session_id": context.auth_session_id})
+            replay = self._begin_simple_idempotent(
+                connection, context, "session.logout", idempotency_key, request_sha256, now
+            )
             context, now = self._consume_write_authorization(
                 connection, authorization, "session.logout", require_administrator=False
+            )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
+            if replay is not None:
+                self._finish_write_authorization(connection, authorization, now)
+                return SessionLogoutResult(schema_version="v1", revoked=True)
+            result = SessionLogoutResult(schema_version="v1", revoked=True)
+            self._finish_simple_idempotent(
+                connection,
+                context,
+                "session.logout",
+                idempotency_key,
+                {"schema_version": result.schema_version, "revoked": result.revoked},
             )
             self._finish_write_authorization(connection, authorization, now)
             connection.execute(
@@ -536,19 +582,71 @@ class AccessRepository:
                 )
                 .values(revoked_at=now)
             )
+            return result
 
     def change_authorized_password(
         self,
         authorization: BrowserWriteAuthorization,
         password_hash: str,
-    ) -> None:
+        password_sha256: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> PasswordChangeResult:
         with self._engine.begin() as connection:
+            request_sha256 = _request_hash(
+                {"password_sha256": password_sha256, "expected_version": expected_version}
+            )
+            try:
+                context, now = self._consume_write_authorization(
+                    connection,
+                    authorization,
+                    "password.change",
+                    require_administrator=False,
+                )
+            except AccessError:
+                replay = self._replay_bound_session_mutation(
+                    connection,
+                    authorization,
+                    "password.change",
+                    idempotency_key,
+                    request_sha256,
+                )
+                if replay is None:
+                    raise
+                if isinstance(replay, AccessError):
+                    raise replay
+                return PasswordChangeResult(
+                    schema_version="v1", record_version=cast(int, replay["record_version"])
+                )
+            replay = self._begin_simple_idempotent(
+                connection, context, "password.change", idempotency_key, request_sha256, now
+            )
             context, now = self._consume_write_authorization(
                 connection,
                 authorization,
                 "password.change",
                 require_administrator=False,
             )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
+            if replay is not None:
+                self._finish_write_authorization(connection, authorization, now)
+                return PasswordChangeResult(
+                    schema_version="v1", record_version=cast(int, replay["record_version"])
+                )
+            current_version = connection.scalar(
+                select(users.c.record_version).where(users.c.user_id == context.user_id)
+            )
+            if current_version != expected_version:
+                error = stale_version(expected_version, cast(int, current_version))
+                self._finish_simple_idempotent_error(
+                    connection, context, "password.change", idempotency_key, error
+                )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise error
             connection.execute(
                 update(users)
                 .where(users.c.user_id == context.user_id, users.c.enabled.is_(True))
@@ -559,12 +657,24 @@ class AccessRepository:
                     updated_at=now,
                 )
             )
+            changed = PasswordChangeResult(schema_version="v1", record_version=expected_version + 1)
+            self._finish_simple_idempotent(
+                connection,
+                context,
+                "password.change",
+                idempotency_key,
+                {
+                    "schema_version": changed.schema_version,
+                    "record_version": changed.record_version,
+                },
+            )
             self._finish_write_authorization(connection, authorization, now)
             connection.execute(
                 update(sessions)
                 .where(sessions.c.user_id == context.user_id, sessions.c.revoked_at.is_(None))
                 .values(revoked_at=now)
             )
+            return changed
 
     def disable_authorized_user(
         self,
@@ -607,6 +717,13 @@ class AccessRepository:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
             try:
+                if target_user_id == context.user_id:
+                    raise AccessError(
+                        ErrorCode.VALIDATION_ERROR,
+                        "An administrator cannot disable their own user.",
+                        422,
+                        details={"path": "/target_user_id"},
+                    )
                 if target is None or not cast(bool, target["enabled"]):
                     raise not_found()
                 current_version = cast(int, target["record_version"])
@@ -1398,6 +1515,185 @@ class AccessRepository:
         )
 
     @staticmethod
+    def _begin_simple_idempotent(
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        idempotency_key: str,
+        request_sha256: bytes,
+        now: datetime,
+    ) -> dict[str, Any] | AccessError | None:
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        connection.execute(
+            pg_insert(idempotency_records)
+            .values(
+                owner_user_id=context.user_id,
+                operation=operation,
+                idempotency_key=normalized_key,
+                request_sha256=request_sha256,
+                result=None,
+                created_at=now,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    idempotency_records.c.owner_user_id,
+                    idempotency_records.c.operation,
+                    idempotency_records.c.idempotency_key,
+                ]
+            )
+        )
+        record = (
+            connection.execute(
+                select(idempotency_records)
+                .where(
+                    idempotency_records.c.owner_user_id == context.user_id,
+                    idempotency_records.c.operation == operation,
+                    idempotency_records.c.idempotency_key == normalized_key,
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one()
+        )
+        return _decode_simple_idempotent(record, request_sha256)
+
+    @staticmethod
+    def _finish_simple_idempotent(
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        idempotency_key: str,
+        value: dict[str, Any],
+    ) -> None:
+        connection.execute(
+            update(idempotency_records)
+            .where(
+                idempotency_records.c.owner_user_id == context.user_id,
+                idempotency_records.c.operation == operation,
+                idempotency_records.c.idempotency_key
+                == _normalize_idempotency_key(idempotency_key),
+            )
+            .values(
+                result={
+                    "outcome": "success",
+                    "auth_session_id": context.auth_session_id,
+                    "value": value,
+                }
+            )
+        )
+
+    @staticmethod
+    def _finish_simple_idempotent_error(
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        idempotency_key: str,
+        error: AccessError,
+    ) -> None:
+        safe_detail_keys = {"expected_version", "current_version", "path", "paths"}
+        safe_details = {
+            key: value for key, value in error.details.items() if key in safe_detail_keys
+        }
+        connection.execute(
+            update(idempotency_records)
+            .where(
+                idempotency_records.c.owner_user_id == context.user_id,
+                idempotency_records.c.operation == operation,
+                idempotency_records.c.idempotency_key
+                == _normalize_idempotency_key(idempotency_key),
+            )
+            .values(
+                result={
+                    "outcome": "error",
+                    "auth_session_id": context.auth_session_id,
+                    "error": {
+                        "code": error.code.value,
+                        "message": error.message,
+                        "http_status": error.http_status,
+                        "retryable": error.retryable,
+                        "details": safe_details,
+                    },
+                }
+            )
+        )
+
+    @staticmethod
+    def _bound_authorization_session_id(
+        connection: Connection,
+        authorization: BrowserWriteAuthorization,
+        operation: str,
+    ) -> str | None:
+        if authorization.operation != operation:
+            return None
+        return cast(
+            str | None,
+            connection.scalar(
+                select(write_authorizations.c.auth_session_id).where(
+                    write_authorizations.c.authorization_hash
+                    == _token_hash(authorization.authorization_token),
+                    write_authorizations.c.request_id == authorization.request_id,
+                    write_authorizations.c.operation == operation,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _replay_bound_session_mutation(
+        connection: Connection,
+        authorization: BrowserWriteAuthorization,
+        operation: str,
+        idempotency_key: str,
+        request_sha256: bytes,
+    ) -> dict[str, Any] | AccessError | None:
+        if authorization.operation != operation:
+            return None
+        authorization_row = (
+            connection.execute(
+                select(
+                    sessions.c.user_id,
+                    sessions.c.auth_session_id,
+                    sessions.c.revoked_at,
+                    write_authorizations.c.consumed_at,
+                )
+                .join(
+                    sessions,
+                    write_authorizations.c.auth_session_id == sessions.c.auth_session_id,
+                )
+                .where(
+                    write_authorizations.c.authorization_hash
+                    == _token_hash(authorization.authorization_token),
+                    write_authorizations.c.request_id == authorization.request_id,
+                    write_authorizations.c.operation == operation,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if authorization_row is None or (
+            authorization_row["consumed_at"] is None and authorization_row["revoked_at"] is None
+        ):
+            return None
+        record = (
+            connection.execute(
+                select(idempotency_records).where(
+                    idempotency_records.c.owner_user_id == authorization_row["user_id"],
+                    idempotency_records.c.operation == operation,
+                    idempotency_records.c.idempotency_key
+                    == _normalize_idempotency_key(idempotency_key),
+                    idempotency_records.c.result.is_not(None),
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if record is None:
+            return None
+        stored_result = cast(dict[str, Any], record["result"])
+        if stored_result.get("auth_session_id") != authorization_row["auth_session_id"]:
+            return None
+        return _decode_simple_idempotent(record, request_sha256)
+
+    @staticmethod
     def _begin_user_disable_idempotent(
         connection: Connection,
         context: UserContext,
@@ -1621,6 +1917,30 @@ def _normalize_canonical_json(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_normalize_canonical_json(item) for item in value]
     return value
+
+
+def _decode_simple_idempotent(
+    record: RowMapping, request_sha256: bytes
+) -> dict[str, Any] | AccessError | None:
+    if not hmac.compare_digest(cast(bytes, record["request_sha256"]), request_sha256):
+        raise AccessError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "The idempotency key was reused with a different request.",
+            409,
+        )
+    stored_result = cast(dict[str, Any] | None, record["result"])
+    if stored_result is None:
+        return None
+    if stored_result.get("outcome") == "error":
+        stored_error = cast(dict[str, Any], stored_result["error"])
+        return AccessError(
+            ErrorCode(cast(str, stored_error["code"])),
+            cast(str, stored_error["message"]),
+            cast(int, stored_error["http_status"]),
+            retryable=cast(bool, stored_error["retryable"]),
+            details=cast(dict[str, Any], stored_error["details"]),
+        )
+    return cast(dict[str, Any], stored_result["value"])
 
 
 def _token_hash(value: str) -> bytes:

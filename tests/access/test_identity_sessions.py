@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import base64
+import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid7
 
 import pytest
-from sqlalchemy import func, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import Engine
 
 from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, BrowserWriteAuthorization, ErrorCode
-from familytrade.access.repository import AccessRepository, sessions
+from familytrade.access.repository import AccessRepository, idempotency_records, sessions, users
 from familytrade.access.service import ABSOLUTE_TIMEOUT, IDLE_TIMEOUT, AccessService
 
 
@@ -102,9 +104,8 @@ def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engi
 def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: Engine) -> None:
     clock = MutableClock(datetime(2000, 1, 1, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
-    user_id = service.invite_user(
-        "alice", "test-password-A!", {"lanes:read"}, is_administrator=True
-    )
+    user_id = service.invite_user("alice", "test-password-A!", {"lanes:read"})
+    service.invite_user("admin", "test-password-admin!", {"lanes:read"}, is_administrator=True)
 
     for username, password in (("missing", "wrong-password!"), ("alice", "wrong-password!")):
         with pytest.raises(AccessError) as captured:
@@ -115,7 +116,7 @@ def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: En
             "retryable": False,
             "details": {},
         }
-    admin_login = service.login("alice", "test-password-A!")
+    admin_login = service.login("admin", "test-password-admin!")
     disable_authorization = authorize(
         service, admin_login.session_token, admin_login.csrf_token, "user.disable"
     )
@@ -134,9 +135,8 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
 ) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
-    user_id = service.invite_user(
-        "alice", "test-password-A!", {"lanes:read"}, is_administrator=True
-    )
+    user_id = service.invite_user("alice", "test-password-A!", {"lanes:read"})
+    service.invite_user("admin", "test-password-admin!", {"lanes:read"}, is_administrator=True)
 
     idle_login = service.login("alice", "test-password-A!")
     idle_context = service.authenticate_browser(idle_login.session_token, request_id="initial-idle")
@@ -173,21 +173,37 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
     logout_authorization = authorize(
         service, revoked_login.session_token, revoked_login.csrf_token, "session.logout"
     )
-    service.logout(logout_authorization)
+    logout_key = str(uuid7())
+    logout_result = service.logout(logout_authorization, idempotency_key=logout_key)
+    assert logout_result.revoked is True
     with pytest.raises(AccessError):
         service.authenticate_browser(revoked_login.session_token, request_id="revoked")
-    with pytest.raises(AccessError) as reused:
-        service.logout(logout_authorization)
-    assert reused.value.code is ErrorCode.INVALID_CSRF
+    assert service.logout(logout_authorization, idempotency_key=logout_key) == logout_result
 
     changed_login = service.login("alice", "test-password-A!")
     change_authorization = authorize(
         service, changed_login.session_token, changed_login.csrf_token, "password.change"
     )
-    service.change_password(change_authorization, "replacement-pass-A!")
+    change_key = str(uuid7())
+    change_result = service.change_password(
+        change_authorization,
+        "replacement-pass-A!",
+        expected_version=1,
+        idempotency_key=change_key,
+    )
+    assert change_result.record_version == 2
+    assert (
+        service.change_password(
+            change_authorization,
+            "replacement-pass-A!",
+            expected_version=1,
+            idempotency_key=change_key,
+        )
+        == change_result
+    )
     with pytest.raises(AccessError):
         service.authenticate_browser(changed_login.session_token, request_id="rotated")
-    replacement_login = service.login("alice", "replacement-pass-A!")
+    replacement_login = service.login("admin", "test-password-admin!")
     disable_authorization = authorize(
         service,
         replacement_login.session_token,
@@ -304,6 +320,40 @@ def test_disable_user_requires_current_administrator_and_keeps_targets_opaque(
     admin = service.login("admin", "test-password-admin!")
     reader = service.login("reader", "test-password-reader!")
 
+    self_key = str(uuid7())
+    self_authorization = authorize(service, admin.session_token, admin.csrf_token, "user.disable")
+    with pytest.raises(AccessError) as self_disable:
+        service.disable_user(
+            self_authorization,
+            service.authenticate_browser(admin.session_token, request_id="self").user_id,
+            expected_version=1,
+            idempotency_key=self_key,
+        )
+    assert self_disable.value.code is ErrorCode.VALIDATION_ERROR
+    replay_self_authorization = authorize(
+        service, admin.session_token, admin.csrf_token, "user.disable"
+    )
+    with pytest.raises(AccessError) as self_replay:
+        service.disable_user(
+            replay_self_authorization,
+            service.authenticate_browser(admin.session_token, request_id="self-replay").user_id,
+            expected_version=1,
+            idempotency_key=self_key,
+        )
+    assert self_replay.value.envelope("replay") == self_disable.value.envelope("replay")
+    assert service.authenticate_browser(admin.session_token, request_id="still-enabled")
+    self_conflict_authorization = authorize(
+        service, admin.session_token, admin.csrf_token, "user.disable"
+    )
+    with pytest.raises(AccessError) as self_conflict:
+        service.disable_user(
+            self_conflict_authorization,
+            service.authenticate_browser(admin.session_token, request_id="self-conflict").user_id,
+            expected_version=2,
+            idempotency_key=self_key,
+        )
+    assert self_conflict.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
     reader_authorization = authorize(
         service, reader.session_token, reader.csrf_token, "user.disable"
     )
@@ -378,6 +428,136 @@ def test_disable_user_requires_current_administrator_and_keeps_targets_opaque(
             idempotency_key=str(uuid7()),
         )
     assert repeated.value.code is ErrorCode.NOT_FOUND
+
+
+def test_logout_and_password_change_are_idempotent_fenced_and_secret_safe(
+    postgres_engine: Engine,
+) -> None:
+    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    service = service_for(postgres_engine, clock)
+    user_id = service.invite_user("alice", "test-password-A!", {"lanes:read"})
+
+    logout_login = service.login("alice", "test-password-A!")
+    logout_authorizations = [
+        authorize(service, logout_login.session_token, logout_login.csrf_token, "session.logout")
+        for _ in range(2)
+    ]
+    logout_authorization = logout_authorizations[0]
+    logout_key = str(uuid7())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        logout_results = list(
+            executor.map(
+                lambda authorization: service.logout(authorization, idempotency_key=logout_key),
+                logout_authorizations,
+            )
+        )
+    assert logout_results[0] == logout_results[1]
+    first_logout = logout_results[0]
+    assert service.logout(logout_authorization, idempotency_key=logout_key) == first_logout
+    with pytest.raises(AccessError) as logout_new_key:
+        service.logout(logout_authorization, idempotency_key=str(uuid7()))
+    assert logout_new_key.value.code is ErrorCode.INVALID_CSRF
+    other_logout_login = service.login("alice", "test-password-A!")
+    other_logout_authorization = authorize(
+        service,
+        other_logout_login.session_token,
+        other_logout_login.csrf_token,
+        "session.logout",
+    )
+    with pytest.raises(AccessError) as cross_session_logout_replay:
+        service.logout(other_logout_authorization, idempotency_key=logout_key)
+    assert cross_session_logout_replay.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    assert service.authenticate_browser(
+        other_logout_login.session_token, request_id="cross-session-remains-active"
+    )
+    forged_logout = BrowserWriteAuthorization(
+        authorization_token=logout_authorization.authorization_token,
+        request_id=logout_authorization.request_id,
+        operation="password.change",
+        expires_at=logout_authorization.expires_at,
+    )
+    with pytest.raises(AccessError) as logout_mismatch:
+        service.logout(forged_logout, idempotency_key=logout_key)
+    assert logout_mismatch.value.code is ErrorCode.INVALID_CSRF
+
+    stale_login = service.login("alice", "test-password-A!")
+    stale_authorization = authorize(
+        service, stale_login.session_token, stale_login.csrf_token, "password.change"
+    )
+    stale_key = str(uuid7())
+    stale_secret = "stale-password-secret!"
+    with pytest.raises(AccessError) as stale:
+        service.change_password(
+            stale_authorization,
+            stale_secret,
+            expected_version=99,
+            idempotency_key=stale_key,
+        )
+    assert stale.value.code is ErrorCode.STALE_VERSION
+    with pytest.raises(AccessError) as stale_replay:
+        service.change_password(
+            stale_authorization,
+            stale_secret,
+            expected_version=99,
+            idempotency_key=stale_key,
+        )
+    assert stale_replay.value.envelope("replay") == stale.value.envelope("replay")
+    with pytest.raises(AccessError) as stale_mismatch:
+        service.change_password(
+            stale_authorization,
+            "different-password-secret!",
+            expected_version=99,
+            idempotency_key=stale_key,
+        )
+    assert stale_mismatch.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+    change_login = service.login("alice", "test-password-A!")
+    authorizations = [
+        authorize(service, change_login.session_token, change_login.csrf_token, "password.change")
+        for _ in range(2)
+    ]
+    change_key = str(uuid7())
+    replacement_secret = "replacement-password-secret!"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda authorization: service.change_password(
+                    authorization,
+                    replacement_secret,
+                    expected_version=1,
+                    idempotency_key=change_key,
+                ),
+                authorizations,
+            )
+        )
+    assert results[0] == results[1]
+    assert results[0].record_version == 2
+    with pytest.raises(AccessError) as changed_mismatch:
+        service.change_password(
+            authorizations[0],
+            "another-password-secret!",
+            expected_version=1,
+            idempotency_key=change_key,
+        )
+    assert changed_mismatch.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    with postgres_engine.connect() as connection:
+        assert (
+            connection.scalar(select(users.c.record_version).where(users.c.user_id == user_id)) == 2
+        )
+        stored_results = connection.scalars(
+            select(idempotency_records.c.result).where(
+                idempotency_records.c.owner_user_id == user_id,
+                idempotency_records.c.operation.in_(("session.logout", "password.change")),
+            )
+        ).all()
+    serialized_results = json.dumps(stored_results)
+    assert stale_secret not in serialized_results
+    assert replacement_secret not in serialized_results
+    assert logout_login.session_token not in serialized_results
+    assert logout_login.csrf_token not in serialized_results
+    assert logout_authorization.authorization_token not in serialized_results
+    assert stale_authorization.authorization_token not in serialized_results
+    assert service.login("alice", replacement_secret)
 
 
 def test_kek_test_value_is_base64_not_a_repository_secret() -> None:

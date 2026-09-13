@@ -128,6 +128,18 @@ class UserDisableResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionLogoutResult:
+    schema_version: Literal["v1"]
+    revoked: Literal[True]
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordChangeResult:
+    schema_version: Literal["v1"]
+    record_version: int
+
+
+@dataclass(frozen=True, slots=True)
 class CookieSettings:
     secure: Literal[True] = True
     httponly: Literal[True] = True
