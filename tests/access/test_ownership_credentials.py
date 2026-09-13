@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
+from threading import Event
 from uuid import uuid7
 
 import pytest
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import event, func, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -31,6 +34,7 @@ from familytrade.access.repository import (
     credential_envelopes,
     sessions,
     users,
+    write_authorizations,
 )
 from familytrade.access.service import AccessService
 
@@ -51,6 +55,14 @@ class StubKekRing:
             ) from exc
 
 
+@dataclass
+class MutableClock:
+    value: datetime
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
 @dataclass(frozen=True)
 class AdminActor(UserContext):
     session_token: str
@@ -65,12 +77,16 @@ class FailingVerificationCipher(EnvelopeCipher):
         )
 
 
-def make_service(engine: Engine, cipher: EnvelopeCipher | None = None) -> AccessService:
+def make_service(
+    engine: Engine,
+    cipher: EnvelopeCipher | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> AccessService:
     return AccessService(
         AccessRepository(engine),
         cipher or EnvelopeCipher(StubKekRing({"test-v1": b"K" * 32})),
         allowed_origins={"https://familytrade.test"},
-        clock=lambda: datetime(2026, 9, 13, 1, 0, tzinfo=UTC),
+        clock=clock or (lambda: datetime(2026, 9, 13, 1, 0, tzinfo=UTC)),
     )
 
 
@@ -237,6 +253,7 @@ def test_secret_is_encrypted_redacted_and_never_returned_or_logged(postgres_engi
     assert secret.decode() not in repr(rows)
     parsed_payload = parse_broker_account_create(payload)
     assert secret.decode() not in repr(parsed_payload)
+    assert "PRIVATE-REFERENCE-9876" not in repr(parsed_payload)
 
     with postgres_engine.connect() as connection:
         stored_ref = connection.scalar(
@@ -248,6 +265,17 @@ def test_secret_is_encrypted_redacted_and_never_returned_or_logged(postgres_engi
 
 
 def test_missing_wrong_and_binding_mismatched_kek_are_safe(postgres_engine: Engine) -> None:
+    environment_secret = "unrelated-environment-test-secret"
+    encoded_kek = "S0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0s="
+    provider = EnvironmentKekProvider(
+        {
+            "FAMILYTRADE_CREDENTIAL_KEK_V1": encoded_kek,
+            "UNRELATED_SECRET": environment_secret,
+        }
+    )
+    assert encoded_kek not in repr(provider)
+    assert environment_secret not in repr(provider)
+
     with pytest.raises(AccessError) as missing:
         EnvelopeCipher(EnvironmentKekProvider({})).encrypt(
             b"test-secret",
@@ -433,6 +461,32 @@ def test_mutations_are_idempotent_and_key_reuse_with_different_bytes_conflicts(
     assert replayed_replace == replaced
     assert replayed_replace.record_version == 2
 
+    revoked = service.revoke_credential(
+        authorize(service, alice, "credential.revoke"),
+        created.broker_account_id,
+        expected_version=2,
+        idempotency_key=str(uuid7()),
+    )
+    assert revoked.status.value == "disabled"
+    replayed_after_revoke = service.replace_credential(
+        authorize(service, alice, "credential.replace"),
+        created.broker_account_id,
+        b"new-test-secret",
+        expected_version=1,
+        idempotency_key=replace_key,
+    )
+    assert replayed_after_revoke == replaced
+    bob = logged_in(service, "bob")
+    with pytest.raises(AccessError) as cross_owner:
+        service.replace_credential(
+            authorize(service, bob, "credential.replace"),
+            created.broker_account_id,
+            b"new-test-secret",
+            expected_version=1,
+            idempotency_key=replace_key,
+        )
+    assert cross_owner.value.code is ErrorCode.NOT_FOUND
+
     with pytest.raises(AccessError) as invalid:
         service.revoke_credential(
             authorize(service, alice, "credential.revoke"),
@@ -464,6 +518,105 @@ def test_concurrent_create_retry_commits_one_account(postgres_engine: Engine) ->
 
     assert results[0] == results[1]
     assert len(service.list_broker_accounts(alice)) == 1
+
+
+def test_idempotency_hash_normalizes_unicode_but_not_secret_bytes(postgres_engine: Engine) -> None:
+    service = make_service(postgres_engine)
+    alice = logged_in(service, "alice")
+    key = str(uuid7())
+    composed = "CAF\u00c9-1111"
+    decomposed = "CAFE\u0301-1111"
+    created = service.create_broker_account(
+        authorize(service, alice, "broker_account.create"),
+        account_payload(composed, b"same-secret-bytes"),
+        idempotency_key=key,
+    )
+    replayed = service.create_broker_account(
+        authorize(service, alice, "broker_account.create"),
+        account_payload(decomposed, b"same-secret-bytes"),
+        idempotency_key=key,
+    )
+    assert replayed == created
+    with pytest.raises(AccessError) as different_normalized_value:
+        service.create_broker_account(
+            authorize(service, alice, "broker_account.create"),
+            account_payload("CAFE\u0301-2222", b"same-secret-bytes"),
+            idempotency_key=key,
+        )
+    assert different_normalized_value.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    with pytest.raises(AccessError) as different_bytes:
+        service.create_broker_account(
+            authorize(service, alice, "broker_account.create"),
+            account_payload(decomposed, "same-secret-bytes".encode("utf-16")),
+            idempotency_key=key,
+        )
+    assert different_bytes.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+
+@pytest.mark.parametrize(
+    ("expiry_kind", "expected_code"),
+    [
+        ("authorization", ErrorCode.INVALID_CSRF),
+        ("session", ErrorCode.UNAUTHENTICATED),
+    ],
+)
+def test_expiry_while_waiting_for_mutation_locks_cannot_commit(
+    postgres_engine: Engine,
+    expiry_kind: str,
+    expected_code: ErrorCode,
+) -> None:
+    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    service = make_service(postgres_engine, clock=clock)
+    alice = logged_in(service, "alice")
+    authorization = authorize(service, alice, "broker_account.create")
+    query_entered = Event()
+
+    def mutation_query_started(*args: object) -> None:
+        statement = str(args[2])
+        if "access_write_authorizations" in statement and "FOR UPDATE" in statement:
+            query_entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with postgres_engine.begin() as blocker:
+            if expiry_kind == "authorization":
+                blocker.execute(
+                    select(write_authorizations)
+                    .where(
+                        write_authorizations.c.authorization_hash
+                        == sha256(authorization.authorization_token.encode()).digest()
+                    )
+                    .with_for_update()
+                )
+            else:
+                blocker.execute(
+                    select(users).where(users.c.user_id == alice.user_id).with_for_update()
+                )
+                blocker.execute(
+                    update(sessions)
+                    .where(sessions.c.auth_session_id == alice.auth_session_id)
+                    .values(idle_expires_at=clock.value + timedelta(minutes=1))
+                )
+            event.listen(postgres_engine, "before_cursor_execute", mutation_query_started)
+            try:
+                future = executor.submit(
+                    service.create_broker_account,
+                    authorization,
+                    account_payload("ACCOUNT-1111", b"must-expire-before-commit"),
+                    idempotency_key=str(uuid7()),
+                )
+                assert query_entered.wait(timeout=5)
+                clock.value = (
+                    authorization.expires_at
+                    if expiry_kind == "authorization"
+                    else clock.value + timedelta(minutes=2)
+                )
+            finally:
+                event.remove(postgres_engine, "before_cursor_execute", mutation_query_started)
+        with pytest.raises(AccessError) as expired:
+            future.result(timeout=10)
+    assert expired.value.code is expected_code
+    with postgres_engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(broker_accounts)) == 0
 
 
 def test_malformed_and_oversized_secrets_never_escape_in_errors_or_repr(

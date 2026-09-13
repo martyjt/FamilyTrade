@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import Mapping, Sequence
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, cast
 from uuid import UUID, uuid7
@@ -416,11 +417,11 @@ class AccessRepository:
             )
 
     def revoke_authorized_session(
-        self, authorization: BrowserWriteAuthorization, now: datetime
+        self, authorization: BrowserWriteAuthorization, clock: Callable[[], datetime]
     ) -> None:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "session.logout", now, require_administrator=False
+            context, now = self._consume_write_authorization(
+                connection, authorization, "session.logout", clock, require_administrator=False
             )
             self._finish_write_authorization(connection, authorization, now)
             connection.execute(
@@ -437,11 +438,15 @@ class AccessRepository:
         self,
         authorization: BrowserWriteAuthorization,
         password_hash: str,
-        now: datetime,
+        clock: Callable[[], datetime],
     ) -> None:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "password.change", now, require_administrator=False
+            context, now = self._consume_write_authorization(
+                connection,
+                authorization,
+                "password.change",
+                clock,
+                require_administrator=False,
             )
             connection.execute(
                 update(users)
@@ -511,11 +516,11 @@ class AccessRepository:
         payload: Mapping[str, object],
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        now: datetime,
+        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "broker_account.create", now
+            context, now = self._consume_write_authorization(
+                connection, authorization, "broker_account.create", clock
             )
             create = parse_broker_account_create(dict(payload))
             request_sha256 = _request_hash(
@@ -665,19 +670,13 @@ class AccessRepository:
         expected_version: int,
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        now: datetime,
+        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "credential.replace", now
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.replace", clock
             )
             account = self._owned_account_for_update(connection, context, account_id)
-            if account["status"] == BrokerAccountStatus.DISABLED.value:
-                raise AccessError(
-                    ErrorCode.DEPENDENCY_UNAVAILABLE,
-                    "Broker account is disabled.",
-                    503,
-                )
             validate_secret_bytes(new_secret, path="/credential")
             request_sha256 = _request_hash(
                 {
@@ -697,6 +696,12 @@ class AccessRepository:
             if replay is not None:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
+            if account["status"] == BrokerAccountStatus.DISABLED.value:
+                raise AccessError(
+                    ErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "Broker account is disabled.",
+                    503,
+                )
             current_version = cast(int, account["record_version"])
             if current_version != expected_version:
                 raise stale_version(expected_version, current_version)
@@ -763,11 +768,11 @@ class AccessRepository:
         account_id: str,
         expected_version: int,
         idempotency_key: str,
-        now: datetime,
+        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "credential.revoke", now
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.revoke", clock
             )
             account = self._owned_account_for_update(connection, context, account_id)
             request_sha256 = _request_hash(
@@ -823,11 +828,11 @@ class AccessRepository:
         expected_version: int,
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        now: datetime,
+        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
-            context = self._consume_write_authorization(
-                connection, authorization, "credential.rewrap", now
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.rewrap", clock
             )
             account = self._owned_account_for_update(connection, context, account_id)
             request_sha256 = _request_hash(
@@ -956,10 +961,10 @@ class AccessRepository:
         connection: Connection,
         authorization: BrowserWriteAuthorization,
         expected_operation: str,
-        now: datetime,
+        clock: Callable[[], datetime],
         *,
         require_administrator: bool = True,
-    ) -> UserContext:
+    ) -> tuple[UserContext, datetime]:
         statement = (
             select(
                 write_authorizations,
@@ -989,6 +994,7 @@ class AccessRepository:
             .with_for_update(of=[write_authorizations, sessions, users])
         )
         row = connection.execute(statement).mappings().one_or_none()
+        now = clock()
         if (
             row is None
             or authorization.operation != expected_operation
@@ -1030,7 +1036,7 @@ class AccessRepository:
             request_id=authorization.request_id,
             credential_version=cast(int, row["credential_version"]),
             is_administrator=is_administrator,
-        )
+        ), now
 
     @staticmethod
     def _finish_write_authorization(
@@ -1229,8 +1235,26 @@ def _normalize_idempotency_key(value: str) -> str:
 
 
 def _request_hash(value: dict[str, Any]) -> bytes:
-    canonical = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    canonical = json.dumps(
+        _normalize_canonical_json(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).digest()
+
+
+def _normalize_canonical_json(value: Any) -> Any:
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, dict):
+        return {
+            unicodedata.normalize("NFC", key): _normalize_canonical_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_canonical_json(item) for item in value]
+    return value
 
 
 def _token_hash(value: str) -> bytes:

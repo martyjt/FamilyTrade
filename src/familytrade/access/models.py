@@ -72,7 +72,7 @@ class BrokerAccountStatus(StrEnum):
 class _BrokerAccountFields(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
     provider: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    provider_account_reference: str = Field(min_length=1, max_length=500)
+    provider_account_reference: str = Field(min_length=1, max_length=500, repr=False)
     environment: BrokerEnvironment
     capabilities: tuple[str, ...] = ()
 
@@ -82,7 +82,7 @@ class BrokerAccountCreate:
     """Secret-safe strict input with no caller-supplied ownership fields."""
 
     provider: str
-    provider_account_reference: str
+    provider_account_reference: str = field(repr=False)
     environment: BrokerEnvironment
     capabilities: tuple[str, ...]
     credential: bytes = field(repr=False)

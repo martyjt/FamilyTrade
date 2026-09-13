@@ -221,7 +221,7 @@ class AccessService:
         )
 
     def logout(self, authorization: BrowserWriteAuthorization) -> None:
-        self._repository.revoke_authorized_session(authorization, self._now())
+        self._repository.revoke_authorized_session(authorization, self._now)
 
     def disable_user(self, user_id: str) -> None:
         """Administrator-only operation; disabling rotates credentials and sessions."""
@@ -230,7 +230,7 @@ class AccessService:
     def change_password(self, authorization: BrowserWriteAuthorization, new_password: str) -> None:
         _validate_password(new_password)
         self._repository.change_authorized_password(
-            authorization, self._password_hash.hash(new_password), self._now()
+            authorization, self._password_hash.hash(new_password), self._now
         )
 
     def create_broker_account(
@@ -241,7 +241,7 @@ class AccessService:
         idempotency_key: str,
     ) -> BrokerAccountView:
         return self._repository.create_broker_account(
-            authorization, payload, idempotency_key, self._cipher, self._now()
+            authorization, payload, idempotency_key, self._cipher, self._now
         )
 
     def get_broker_account(self, context: UserContext, account_id: str) -> BrokerAccountView:
@@ -275,7 +275,7 @@ class AccessService:
                 expected_version,
                 idempotency_key,
                 self._cipher,
-                self._now(),
+                self._now,
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
@@ -291,7 +291,7 @@ class AccessService:
     ) -> BrokerAccountView:
         try:
             return self._repository.revoke_credential(
-                authorization, account_id, expected_version, idempotency_key, self._now()
+                authorization, account_id, expected_version, idempotency_key, self._now
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
@@ -312,7 +312,7 @@ class AccessService:
                 expected_version,
                 idempotency_key,
                 self._cipher,
-                self._now(),
+                self._now,
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)

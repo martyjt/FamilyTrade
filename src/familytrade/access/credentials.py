@@ -31,7 +31,7 @@ class KekProvider(Protocol):
 class EnvironmentKekProvider:
     """Load the deployment KEK from process configuration, never persistence."""
 
-    environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
+    environ: Mapping[str, str] = field(default_factory=lambda: os.environ, repr=False)
 
     @property
     def active_version(self) -> str:
