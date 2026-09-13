@@ -430,7 +430,7 @@ ReadPolicy = Annotated[PinnedRead | LatestRead | CausalLatestRead, Field(discrim
 
 class ReadCursor(FrozenModel):
     snapshot_id: str
-    after_ordinal: Annotated[int, Field(ge=0)]
+    after_ordinal: Annotated[int, Field(ge=-1)]
     canonical_request_sha256: str
 
 

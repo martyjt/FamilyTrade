@@ -27,13 +27,21 @@ def test_alembic_env_combines_access_and_market_data_metadata_without_duplicate_
 def test_market_data_user_foreign_keys_target_integrated_access_repository_users_column_object() -> (
     None
 ):
-    targets = [
-        fk.column
+    owner_tables = {
+        table.name: table
         for table in market_data_metadata.tables.values()
-        for fk in table.foreign_keys
-        if fk.column.table is users
-    ]
-    assert targets and all(target is users.c.user_id for target in targets)
+        if "owner_user_id" in table.c
+    }
+    assert len(owner_tables) == 27
+    for name, table in owner_tables.items():
+        direct_owner_fks = [
+            constraint
+            for constraint in table.foreign_key_constraints
+            if len(constraint.elements) == 1
+            and constraint.elements[0].parent is table.c.owner_user_id
+        ]
+        assert len(direct_owner_fks) == 1, name
+        assert direct_owner_fks[0].elements[0].column is users.c.user_id, name
 
 
 def test_alembic_metadata_constraints_and_ft04_rows_survive_upgrade_downgrade(

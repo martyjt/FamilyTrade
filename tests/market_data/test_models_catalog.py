@@ -18,14 +18,17 @@ from familytrade.market_data.catalog import (
     archive_objects,
     bar_conflicts,
     bar_versions,
+    calendar_versions,
     contract_versions,
     contracts,
     dataset_revisions,
+    idempotency,
     publications,
     quality_observations,
     revision_bars,
     revision_partitions,
     series,
+    series_fences,
 )
 from familytrade.market_data.models import (
     AggregatedFullBar,
@@ -264,11 +267,75 @@ def test_direct_sql_constraints_reject_invalid_ohlc_tick_volume_duration_and_own
     catalog, contexts
 ) -> None:
     _, contract = seed(catalog, contexts[0])
-    bad = bar_input(contract.contract_id).model_copy(update={"close": Decimal("2000.15")})
-    with pytest.raises(MarketDataError):
-        catalog.record_completed_batch(
-            contexts[0], RecordBatchInput(bars=(bad,)), idempotency_key=str(uuid7())
+    recorded = catalog.record_completed_batch(
+        contexts[0],
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
+    )
+    bar_record_id = recorded.inserted_bar_record_ids[0]
+    invalid_updates = (
+        {"high": Decimal("1999.8")},
+        {"close": Decimal("2000.15")},
+        {"volume": Decimal("1.5")},
+        {"end_at": bar_input(contract.contract_id).end_at + timedelta(minutes=1)},
+        {"owner_user_id": str(uuid7())},
+    )
+    for values in invalid_updates:
+        with pytest.raises(DBAPIError), catalog.engine.begin() as connection:
+            connection.execute(
+                update(active_bars)
+                .where(active_bars.c.bar_record_id == bar_record_id)
+                .values(**values)
+            )
+    with catalog.engine.begin() as connection:
+        persisted = (
+            connection.execute(
+                select(active_bars).where(active_bars.c.bar_record_id == bar_record_id)
+            )
+            .mappings()
+            .one()
         )
+    assert persisted["owner_user_id"] == contexts[0].user_id
+    assert persisted["close"] == Decimal("2000.1")
+    assert persisted["volume"] == Decimal(12)
+    empty_calendar_id = str(uuid7())
+    now = datetime.now(UTC)
+    with pytest.raises(DBAPIError), catalog.engine.begin() as connection:
+        connection.execute(
+            insert(calendar_versions).values(
+                owner_user_id=contexts[0].user_id,
+                calendar_id=empty_calendar_id,
+                calendar_version=1,
+                schema_version="v1",
+                exchange_timezone="UTC",
+                coverage_start=now,
+                coverage_end=now + timedelta(minutes=1),
+                metadata_as_of=now,
+                provenance_ref="direct-sql-empty-calendar",
+                payload_sha256="a" * 64,
+                created_at=now,
+                record_version=1,
+            )
+        )
+    with catalog.engine.begin() as connection:
+        registry = dict(
+            connection.execute(
+                select(bar_versions).where(bar_versions.c.bar_record_id == bar_record_id)
+            )
+            .mappings()
+            .one()
+        )
+    registry.update(
+        bar_record_id=str(uuid7()),
+        source_revision=2,
+        supersedes_bar_record_id=bar_record_id,
+        correction_reason="SOURCE_CORRECTION",
+        version_fingerprint_sha256="f" * 64,
+        received_at=registry["received_at"] + timedelta(microseconds=1),
+        created_at=registry["received_at"] + timedelta(microseconds=1),
+    )
+    with pytest.raises(DBAPIError), catalog.engine.begin() as connection:
+        connection.execute(insert(bar_versions).values(**registry))
 
 
 def test_material_contract_update_after_series_exists_is_conflict(catalog, contexts) -> None:
@@ -401,11 +468,95 @@ def test_staging_forces_constraints_immediate_and_rejects_missing_or_cross_owner
 
 
 def test_staging_deferred_final_candidate_fk_resolves_after_revision_insert(
-    catalog, contexts
+    catalog, contexts, archive_store
 ) -> None:
-    test_staging_forces_constraints_immediate_and_rejects_missing_or_cross_owner_candidate(
-        catalog, contexts
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    bar = bar_input(contract.contract_id)
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(bar,)), idempotency_key=str(uuid7())
     )
+    published = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())).publish(
+        context,
+        PublicationRequest(
+            series_key=SeriesKey(
+                source="synthetic",
+                price_basis="trades",
+                contract_id=contract.contract_id,
+                interval_seconds=60,
+            ),
+            coverage_start=bar.start_at,
+            coverage_end=bar.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    candidate_id, publication_id = str(uuid7()), str(uuid7())
+    with catalog.engine.begin() as connection:
+        original = (
+            connection.execute(
+                select(dataset_revisions).where(
+                    dataset_revisions.c.dataset_revision_id
+                    == published.dataset_revision.dataset_revision_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+        current_fence = connection.execute(
+            select(series_fences.c.fencing_token).where(
+                and_(
+                    series_fences.c.owner_user_id == context.user_id,
+                    series_fences.c.series_id == original["series_id"],
+                )
+            )
+        ).scalar_one()
+        connection.execute(
+            insert(publications).values(
+                owner_user_id=context.user_id,
+                publication_id=publication_id,
+                series_id=original["series_id"],
+                idempotency_key=str(uuid7()),
+                operation="publish",
+                parent_revision_id=None,
+                final_candidate_revision_id=candidate_id,
+                snapshot_sha256="a" * 64,
+                fencing_token=current_fence,
+                state="staged",
+                created_at=catalog._now(),
+                updated_at=catalog._now(),
+            )
+        )
+        projection = dict(original["projection"])
+        projection.update(
+            dataset_revision_id=candidate_id,
+            manifest_uri=f"ft-archive://manifest/{candidate_id}",
+        )
+        values = dict(original)
+        values.update(
+            dataset_revision_id=candidate_id,
+            projection=projection,
+            parent_revision_id=None,
+            manifest_uri=f"ft-archive://manifest/{candidate_id}",
+            manifest_sha256="b" * 64,
+            manifest_byte_length=1,
+            parent_depth=0,
+            restore_closure_revision_count=1,
+            restore_closure_row_count=0,
+            restore_closure_bytes=0,
+            status="building",
+            published_at=None,
+            record_version=1,
+        )
+        connection.execute(insert(dataset_revisions).values(**values))
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(publications.c.final_candidate_revision_id).where(
+                    publications.c.publication_id == publication_id
+                )
+            ).scalar_one()
+            == candidate_id
+        )
 
 
 def test_archive_object_catalog_origin_constraint_requires_publication_fk_or_retained_manifest_shape(
@@ -512,20 +663,42 @@ def test_invalid_observation_consumes_no_revision_and_later_valid_same_revision_
     catalog, contexts
 ) -> None:
     context = contexts[0]
-    _, contract = seed(catalog, context)
+    _, contract = seed(catalog, context, full_hour=True)
     valid = bar_input(contract.contract_id)
+    primer = valid.model_copy(
+        update={
+            "start_at": valid.start_at + timedelta(minutes=1),
+            "end_at": valid.end_at + timedelta(minutes=1),
+            "completed_at": valid.completed_at + timedelta(minutes=1),
+        }
+    )
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(primer,)), idempotency_key=str(uuid7())
+    )
     invalid = valid.model_copy(update={"low": Decimal("2001.0")})
+    invalid_key = str(uuid7())
     with pytest.raises(MarketDataError) as caught:
         catalog.record_completed_batch(
             context,
             RecordBatchInput(bars=(invalid,)),
-            idempotency_key=str(uuid7()),
+            idempotency_key=invalid_key,
         )
     assert caught.value.code == MarketDataCode.VALIDATION_ERROR
+    with pytest.raises(MarketDataError) as replayed:
+        catalog.record_completed_batch(
+            context, RecordBatchInput(bars=(invalid,)), idempotency_key=invalid_key
+        )
+    assert replayed.value.code == caught.value.code
     with catalog.engine.begin() as c:
         observation = c.execute(select(quality_observations)).mappings().one()
         assert observation["reason"] == "OHLC"
-        assert c.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 0
+        assert c.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 1
+        failed_root = (
+            c.execute(select(idempotency).where(idempotency.c.idempotency_key == invalid_key))
+            .mappings()
+            .one()
+        )
+        assert failed_root["state"] == "failed"
     inserted = catalog.record_completed_batch(
         context,
         RecordBatchInput(bars=(valid,)),
@@ -1354,27 +1527,71 @@ def test_coverage_valid_invalid_missing_and_conflict_precedence_uses_expected_sl
         "valid": 1,
         "invalid": 1,
         "missing": 1,
-        "duplicate_conflict": 0,
+        "duplicate_conflict": 1,
     }
 
 
 def test_material_contract_update_after_series_exists_is_conflict_and_cannot_create_second_logical_series(
     catalog, contexts
 ) -> None:
-    test_material_contract_update_after_series_exists_is_conflict(catalog, contexts)
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
+    )
+    mutation = contract_input(contract.calendar_id).model_copy(
+        update={
+            "contract_id": contract.contract_id,
+            "expected_version": 1,
+            "multiplier": Decimal(20),
+        }
+    )
+    with pytest.raises(MarketDataError) as caught:
+        catalog.register_contract(context, mutation, idempotency_key=str(uuid7()))
+    assert caught.value.code is MarketDataCode.CONFLICT
     with catalog.engine.begin() as c:
         assert c.execute(select(func.count()).select_from(series)).scalar_one() == 1
+        assert c.execute(select(func.count()).select_from(contract_versions)).scalar_one() == 1
 
 
 def test_semantically_invalid_candidate_commits_safe_observation_but_no_batch_bars(
     catalog, contexts
 ) -> None:
-    test_invalid_observation_consumes_no_revision_and_later_valid_same_revision_inserts(
-        catalog, contexts
+    context = contexts[0]
+    _, contract = seed(catalog, context, full_hour=True)
+    valid = bar_input(contract.contract_id)
+    primer = valid.model_copy(
+        update={
+            "start_at": valid.start_at + timedelta(minutes=1),
+            "end_at": valid.end_at + timedelta(minutes=1),
+            "completed_at": valid.completed_at + timedelta(minutes=1),
+        }
     )
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(primer,)), idempotency_key=str(uuid7())
+    )
+    invalid = valid.model_copy(update={"end_at": valid.end_at + timedelta(seconds=1)})
+    key = str(uuid7())
+    with pytest.raises(MarketDataError) as failed:
+        catalog.record_completed_batch(
+            context, RecordBatchInput(bars=(invalid,)), idempotency_key=key
+        )
+    with pytest.raises(MarketDataError) as replay:
+        catalog.record_completed_batch(
+            context, RecordBatchInput(bars=(invalid,)), idempotency_key=key
+        )
+    assert failed.value.code == replay.value.code == MarketDataCode.VALIDATION_ERROR
     with catalog.engine.begin() as c:
         assert c.execute(select(func.count()).select_from(quality_observations)).scalar_one() == 1
         assert c.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 1
+        assert (
+            c.execute(
+                select(idempotency.c.state).where(idempotency.c.idempotency_key == key)
+            ).scalar_one()
+            == "failed"
+        )
 
 
 def test_payload_hash_projection_and_version_fingerprint_are_canonical_and_restart_stable(

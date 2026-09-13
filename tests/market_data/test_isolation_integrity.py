@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -44,6 +45,40 @@ def test_absolute_parent_traversal_separator_symlink_reparse_and_hardlink_escape
     os.link(outside, target)
     with pytest.raises(MarketDataError):
         archive_store.read_verified(owner, object_uri, "a" * 64, len(b"secret"))
+
+    outside_directory = tmp_path / "outside-directory"
+    outside_directory.mkdir()
+    symlink_owner = str(uuid7())
+    symlink_path = archive_store._root / symlink_owner
+    try:
+        os.symlink(outside_directory, symlink_path, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt" or error.winerror != 1314:
+            raise
+    else:
+        with pytest.raises(MarketDataError):
+            archive_store._owner_root(symlink_owner)
+
+        intermediate_owner = str(uuid7())
+        intermediate_root = archive_store._owner_root(intermediate_owner)
+        intermediate = intermediate_root / "objects"
+        intermediate.rmdir()
+        os.symlink(outside_directory, intermediate, target_is_directory=True)
+        with pytest.raises(MarketDataError):
+            archive_store.resolve(intermediate_owner, f"ft-archive://object/{uuid7()}")
+
+    if os.name == "nt":
+        junction_owner = str(uuid7())
+        junction_path = archive_store._root / junction_owner
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction_path), str(outside_directory)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert created.returncode == 0, created.stderr
+        with pytest.raises(MarketDataError):
+            archive_store._owner_root(junction_owner)
 
 
 def test_two_users_identical_series_have_distinct_rows_roots_objects_and_manifests(

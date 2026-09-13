@@ -8,7 +8,9 @@ from typing import Any, Literal, cast
 from uuid import UUID, uuid7
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     Date,
@@ -79,7 +81,7 @@ calendar_versions = Table(
     Column("coverage_end", DateTime(timezone=True), nullable=False),
     Column("metadata_as_of", DateTime(timezone=True), nullable=False),
     Column("provenance_ref", Text, nullable=False),
-    Column("payload_sha256", String(64), nullable=False),
+    Column("payload_sha256", CHAR(64), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("record_version", Integer, nullable=False),
     ForeignKeyConstraint(["owner_user_id"], [users.c.user_id]),
@@ -128,6 +130,10 @@ contracts = Table(
     UniqueConstraint(
         "owner_user_id", "provider", "provider_contract_id", name="uq_md_contract_provider"
     ),
+    CheckConstraint(
+        "current_contract_version >= 1 AND (series_binding_version IS NULL OR series_binding_version >= 1)",
+        name="ck_md_contract_head_versions",
+    ),
 )
 contract_versions = Table(
     "market_data_contract_versions",
@@ -153,7 +159,7 @@ contract_versions = Table(
     Column("liquidation_start_at", DateTime(timezone=True), nullable=False),
     Column("metadata_as_of", DateTime(timezone=True), nullable=False),
     Column("provenance_ref", Text, nullable=False),
-    Column("projection_sha256", String(64), nullable=False),
+    Column("projection_sha256", CHAR(64), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("record_version", Integer, nullable=False),
     ForeignKeyConstraint(
@@ -177,7 +183,9 @@ contract_versions = Table(
         name="uq_md_contract_tick_ref",
     ),
     CheckConstraint(
-        "schema_version='v1' AND tick_size > 0 AND multiplier > 0 AND record_version=contract_version",
+        "schema_version='v1' AND tick_size > 0 AND multiplier > 0 AND record_version=contract_version "
+        "AND projection_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND (first_trade_at IS NULL OR first_trade_at < last_trade_at)",
         name="ck_md_contract_core",
     ),
     CheckConstraint(
@@ -232,7 +240,8 @@ series = Table(
         name="uq_md_series_key",
     ),
     CheckConstraint(
-        "price_basis='trades' AND interval_seconds IN (60,300,900,1800,3600)",
+        "price_basis='trades' AND interval_seconds IN (60,300,900,1800,3600) "
+        "AND record_version >= 1",
         name="ck_md_series_contract",
     ),
 )
@@ -245,11 +254,11 @@ bar_versions = Table(
     _id("series_id"),
     Column("start_at", DateTime(timezone=True), nullable=False),
     Column("source_revision", Integer, nullable=False),
-    Column("payload_hash", String(64), nullable=False),
+    Column("payload_hash", CHAR(64), nullable=False),
     Column("supersedes_bar_record_id", String(36)),
     Column("correction_reason", String(40)),
-    Column("aggregate_lineage_sha256", String(64)),
-    Column("version_fingerprint_sha256", String(64), nullable=False),
+    Column("aggregate_lineage_sha256", CHAR(64)),
+    Column("version_fingerprint_sha256", CHAR(64), nullable=False),
     Column("received_at", DateTime(timezone=True), nullable=False),
     Column("quality", String(24), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -265,6 +274,15 @@ bar_versions = Table(
     ),
     UniqueConstraint(
         "owner_user_id", "series_id", "start_at", "source_revision", name="uq_md_bar_revision"
+    ),
+    CheckConstraint(
+        "source_revision > 0 AND quality='valid' AND schema_version='v1' AND record_version=1",
+        name="ck_md_bar_registry_core",
+    ),
+    CheckConstraint(
+        "payload_hash ~ '^[0-9a-f]{64}$' AND version_fingerprint_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND (aggregate_lineage_sha256 IS NULL OR aggregate_lineage_sha256 ~ '^[0-9a-f]{64}$')",
+        name="ck_md_bar_registry_hashes",
     ),
     CheckConstraint(
         "schema_version='v1' AND quality='valid' AND source_revision > 0 AND created_at=received_at AND record_version=1",
@@ -301,7 +319,7 @@ active_bars = Table(
     Column("completed_at", DateTime(timezone=True), nullable=False),
     Column("quality", String(24), nullable=False),
     Column("supersedes_bar_record_id", String(36)),
-    Column("payload_hash", String(64), nullable=False),
+    Column("payload_hash", CHAR(64), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("record_version", Integer, nullable=False),
     Column("tick_size", Numeric, nullable=False),
@@ -347,7 +365,7 @@ dataset_revisions = Table(
     Column("projection", JSONB, nullable=False),
     Column("parent_revision_id", String(36)),
     Column("manifest_uri", String(100), nullable=False),
-    Column("manifest_sha256", String(64), nullable=False),
+    Column("manifest_sha256", CHAR(64), nullable=False),
     Column("manifest_byte_length", BigInteger, nullable=False),
     Column("coverage_start", DateTime(timezone=True), nullable=False),
     Column("coverage_end", DateTime(timezone=True), nullable=False),
@@ -362,10 +380,10 @@ dataset_revisions = Table(
     Column("restore_closure_bytes", BigInteger, nullable=False),
     Column("rollover_from_revision_id", String(36)),
     Column("rollover_from_manifest_uri", String(100)),
-    Column("rollover_from_manifest_sha256", String(64)),
+    Column("rollover_from_manifest_sha256", CHAR(64)),
     Column("recovery_from_quarantined_revision_id", String(36)),
     Column("recovery_from_manifest_uri", String(100)),
-    Column("recovery_from_manifest_sha256", String(64)),
+    Column("recovery_from_manifest_sha256", CHAR(64)),
     Column("record_version", Integer, nullable=False),
     ForeignKeyConstraint(
         ["owner_user_id", "series_id"], [series.c.owner_user_id, series.c.series_id]
@@ -396,6 +414,13 @@ dataset_revisions = Table(
         name="ck_md_revision_core",
     ),
     CheckConstraint(
+        "manifest_sha256 ~ '^[0-9a-f]{64}$' AND manifest_byte_length > 0 AND "
+        "((status='building' AND record_version=1 AND published_at IS NULL) OR "
+        "(status='published' AND record_version=2 AND published_at IS NOT NULL) OR "
+        "(status='quarantined' AND record_version IN (2,3)))",
+        name="ck_md_revision_lifecycle_projection",
+    ),
+    CheckConstraint(
         "(rollover_from_revision_id IS NULL AND rollover_from_manifest_uri IS NULL AND rollover_from_manifest_sha256 IS NULL) OR "
         "(rollover_from_revision_id IS NOT NULL AND rollover_from_manifest_uri IS NOT NULL AND rollover_from_manifest_sha256 IS NOT NULL)",
         name="ck_md_revision_rollover_shape",
@@ -404,6 +429,10 @@ dataset_revisions = Table(
         "(recovery_from_quarantined_revision_id IS NULL AND recovery_from_manifest_uri IS NULL AND recovery_from_manifest_sha256 IS NULL) OR "
         "(recovery_from_quarantined_revision_id IS NOT NULL AND recovery_from_manifest_uri IS NOT NULL AND recovery_from_manifest_sha256 IS NOT NULL)",
         name="ck_md_revision_recovery_shape",
+    ),
+    CheckConstraint(
+        "NOT (rollover_from_revision_id IS NOT NULL AND recovery_from_quarantined_revision_id IS NOT NULL)",
+        name="ck_md_revision_provenance_exclusive",
     ),
 )
 revision_bars = Table(
@@ -414,7 +443,9 @@ revision_bars = Table(
     Column("ordinal", Integer, primary_key=True),
     _id("series_id"),
     Column("start_at", DateTime(timezone=True), nullable=False),
+    Column("source_revision", Integer, nullable=False),
     _id("bar_record_id"),
+    _id("object_id"),
     ForeignKeyConstraint(
         ["owner_user_id", "dataset_revision_id"],
         [dataset_revisions.c.owner_user_id, dataset_revisions.c.dataset_revision_id],
@@ -424,8 +455,18 @@ revision_bars = Table(
         ["owner_user_id", "bar_record_id"],
         [bar_versions.c.owner_user_id, bar_versions.c.bar_record_id],
     ),
+    ForeignKeyConstraint(
+        ["owner_user_id", "object_id"],
+        ["market_data_archive_objects.owner_user_id", "market_data_archive_objects.object_id"],
+    ),
     UniqueConstraint(
         "owner_user_id", "dataset_revision_id", "start_at", name="uq_md_revision_logical_bar"
+    ),
+    UniqueConstraint(
+        "owner_user_id",
+        "dataset_revision_id",
+        "bar_record_id",
+        name="uq_md_revision_selected_bar",
     ),
 )
 archive_objects = Table(
@@ -435,7 +476,7 @@ archive_objects = Table(
     _id("object_id", True),
     _id("series_id"),
     Column("uri", String(100), nullable=False),
-    Column("sha256", String(64), nullable=False),
+    Column("sha256", CHAR(64), nullable=False),
     Column("byte_length", BigInteger, nullable=False),
     Column("row_count", Integer, nullable=False),
     Column("min_start_at", DateTime(timezone=True), nullable=False),
@@ -514,7 +555,7 @@ idempotency = Table(
     _id("owner_user_id", True),
     Column("operation", String(80), primary_key=True),
     _id("idempotency_key", True),
-    Column("request_sha256", String(64), nullable=False),
+    Column("request_sha256", CHAR(64), nullable=False),
     Column("state", String(16), nullable=False),
     Column("result", JSONB),
     Column("error", JSONB),
@@ -539,7 +580,7 @@ read_snapshots = Table(
     _id("owner_user_id", True),
     _id("read_snapshot_id", True),
     _id("series_id"),
-    Column("canonical_request_sha256", String(64), nullable=False),
+    Column("canonical_request_sha256", CHAR(64), nullable=False),
     Column("policy", JSONB, nullable=False),
     Column("published_base_revision_id", String(36)),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -560,8 +601,14 @@ read_snapshot_bars = Table(
     _id("owner_user_id", True),
     _id("read_snapshot_id", True),
     Column("ordinal", Integer, primary_key=True),
-    Column("bar", JSONB, nullable=False),
+    _id("series_id"),
+    Column("start_at", DateTime(timezone=True), nullable=False),
+    _id("bar_record_id"),
     Column("origin_kind", String(24), nullable=False),
+    Column("dataset_revision_id", String(36)),
+    Column("object_id", String(36)),
+    Column("source_ordinal", Integer),
+    Column("active_marker", Boolean, nullable=False, default=False),
     Column("availability_at", DateTime(timezone=True), nullable=False),
     Column("correction_observations", JSONB, nullable=False),
     ForeignKeyConstraint(
@@ -569,9 +616,36 @@ read_snapshot_bars = Table(
         [read_snapshots.c.owner_user_id, read_snapshots.c.read_snapshot_id],
         ondelete="CASCADE",
     ),
+    ForeignKeyConstraint(
+        ["owner_user_id", "series_id"], [series.c.owner_user_id, series.c.series_id]
+    ),
+    ForeignKeyConstraint(
+        ["owner_user_id", "bar_record_id"],
+        [bar_versions.c.owner_user_id, bar_versions.c.bar_record_id],
+    ),
+    ForeignKeyConstraint(
+        ["owner_user_id", "dataset_revision_id"],
+        [dataset_revisions.c.owner_user_id, dataset_revisions.c.dataset_revision_id],
+    ),
+    ForeignKeyConstraint(
+        ["owner_user_id", "object_id"],
+        [archive_objects.c.owner_user_id, archive_objects.c.object_id],
+    ),
+    UniqueConstraint(
+        "owner_user_id",
+        "read_snapshot_id",
+        "start_at",
+        name="uq_md_snapshot_logical_start",
+    ),
     CheckConstraint(
         "origin_kind IN ('archive_object','archive_chain','active')",
         name="ck_md_snapshot_bar_origin",
+    ),
+    CheckConstraint(
+        "(origin_kind='active' AND active_marker AND dataset_revision_id IS NULL AND object_id IS NULL AND source_ordinal IS NULL) OR "
+        "(origin_kind='archive_object' AND NOT active_marker AND dataset_revision_id IS NOT NULL AND object_id IS NOT NULL AND source_ordinal IS NOT NULL) OR "
+        "(origin_kind='archive_chain' AND NOT active_marker AND dataset_revision_id IS NOT NULL AND object_id IS NULL AND source_ordinal IS NOT NULL)",
+        name="ck_md_snapshot_bar_reference_shape",
     ),
 )
 bar_conflicts = Table(
@@ -582,8 +656,8 @@ bar_conflicts = Table(
     _id("series_id"),
     Column("start_at", DateTime(timezone=True), nullable=False),
     Column("source_revision", Integer, nullable=False),
-    Column("existing_fingerprint", String(64), nullable=False),
-    Column("attempted_fingerprint", String(64), nullable=False),
+    Column("existing_fingerprint", CHAR(64), nullable=False),
+    Column("attempted_fingerprint", CHAR(64), nullable=False),
     Column("observed_at", DateTime(timezone=True), nullable=False),
     ForeignKeyConstraint(
         ["owner_user_id", "series_id"], [series.c.owner_user_id, series.c.series_id]
@@ -606,7 +680,7 @@ quality_observations = Table(
     _id("series_id"),
     Column("start_at", DateTime(timezone=True), nullable=False),
     Column("source_revision", Integer, nullable=False),
-    Column("attempted_payload_hash", String(64), nullable=False),
+    Column("attempted_payload_hash", CHAR(64), nullable=False),
     Column("quality", String(16), nullable=False),
     Column("reason", String(32), nullable=False),
     Column("observed_at", DateTime(timezone=True), nullable=False),
@@ -726,7 +800,7 @@ publications = Table(
     Column("quarantined_source_revision_id", String(36)),
     Column("parent_revision_id", String(36)),
     Column("final_candidate_revision_id", String(36)),
-    Column("snapshot_sha256", String(64), nullable=False),
+    Column("snapshot_sha256", CHAR(64), nullable=False),
     Column("fencing_token", BigInteger, nullable=False),
     Column("state", String(16), nullable=False),
     Column("safe_reason", String(80)),
@@ -791,7 +865,7 @@ publication_files = Table(
     Column("file_kind", String(16), nullable=False),
     Column("temp_name", String(100), nullable=False),
     Column("final_uri", String(100), nullable=False),
-    Column("sha256", String(64), nullable=False),
+    Column("sha256", CHAR(64), nullable=False),
     Column("byte_length", BigInteger, nullable=False),
     Column("state", String(16), nullable=False),
     ForeignKeyConstraint(
@@ -848,6 +922,28 @@ archive_objects.append_constraint(
         initially="DEFERRED",
     )
 )
+
+# Every owner-bearing market-data table independently proves that its owner exists.
+# Composite ownership FKs are still required for relationship integrity, but cannot
+# substitute for this tenant-root constraint: a later relationship refactor must not
+# accidentally detach any table from the integrated access repository.
+for _owner_table in market_data_metadata.tables.values():
+    if "owner_user_id" not in _owner_table.c:
+        continue
+    if any(
+        len(constraint.elements) == 1
+        and constraint.elements[0].parent is _owner_table.c.owner_user_id
+        and constraint.elements[0].target_fullname == "access_users.user_id"
+        for constraint in _owner_table.foreign_key_constraints
+    ):
+        continue
+    _owner_table.append_constraint(
+        ForeignKeyConstraint(
+            [_owner_table.c.owner_user_id],
+            [users.c.user_id],
+            name=f"fk_{_owner_table.name}_owner_user",
+        )
+    )
 
 
 def _aligned_open_start(
@@ -1417,28 +1513,11 @@ class MarketDataCatalog:
         self, context: UserContext, value: RecordBatchInput, *, idempotency_key: str
     ) -> RecordBatchResult:
         self._context(context)
-        with self.engine.connect() as precedence:
-            prior_root = (
-                precedence.execute(
-                    select(idempotency).where(
-                        and_(
-                            idempotency.c.owner_user_id == context.user_id,
-                            idempotency.c.operation == "bars.record",
-                            idempotency.c.idempotency_key == idempotency_key,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
-        if prior_root and prior_root["request_sha256"] != canonical_sha256(value):
-            raise MarketDataError(
-                MarketDataCode.IDEMPOTENCY_CONFLICT,
-                "Idempotency key was reused with different input.",
-                409,
-            )
         preflight_error: MarketDataError | None = None
         with self.engine.begin() as audit:
+            replay = self._idempotent(audit, context, "bars.record", idempotency_key, value)
+            if replay:
+                return RecordBatchResult.model_validate(replay)
             for bar in sorted(
                 value.bars,
                 key=lambda item: (
@@ -1455,14 +1534,51 @@ class MarketDataCatalog:
                     contract_id=bar.contract_id,
                     interval_seconds=bar.interval_seconds,
                 )
-                sr = self._series_for(audit, context.user_id, key, create=True)
+                sr = (
+                    audit.execute(
+                        select(series)
+                        .where(
+                            and_(
+                                series.c.owner_user_id == context.user_id,
+                                series.c.source == key.source,
+                                series.c.price_basis == key.price_basis,
+                                series.c.contract_id == key.contract_id,
+                                series.c.interval_seconds == key.interval_seconds,
+                            )
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .first()
+                )
+                head = (
+                    audit.execute(
+                        select(contracts)
+                        .where(
+                            and_(
+                                contracts.c.owner_user_id == context.user_id,
+                                contracts.c.contract_id == bar.contract_id,
+                            )
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .first()
+                )
+                if head is None:
+                    raise not_found()
+                binding_version = (
+                    sr["contract_version"]
+                    if sr is not None
+                    else head["series_binding_version"] or head["current_contract_version"]
+                )
                 cv = (
                     audit.execute(
                         select(contract_versions).where(
                             and_(
                                 contract_versions.c.owner_user_id == context.user_id,
                                 contract_versions.c.contract_id == bar.contract_id,
-                                contract_versions.c.contract_version == sr["contract_version"],
+                                contract_versions.c.contract_version == binding_version,
                             )
                         )
                     )
@@ -1470,7 +1586,10 @@ class MarketDataCatalog:
                     .one()
                 )
                 cal = self._calendar(
-                    audit, context.user_id, sr["calendar_id"], sr["calendar_version"]
+                    audit,
+                    context.user_id,
+                    cv["calendar_id"] if sr is None else sr["calendar_id"],
+                    cv["calendar_version"] if sr is None else sr["calendar_version"],
                 )
                 payload = {
                     name: item
@@ -1486,20 +1605,25 @@ class MarketDataCatalog:
                     }
                 )
                 same = (
-                    audit.execute(
-                        select(bar_versions).where(
-                            and_(
-                                bar_versions.c.owner_user_id == context.user_id,
-                                bar_versions.c.series_id == sr["series_id"],
-                                bar_versions.c.start_at == bar.start_at,
-                                bar_versions.c.source_revision == bar.source_revision,
+                    None
+                    if sr is None
+                    else (
+                        audit.execute(
+                            select(bar_versions).where(
+                                and_(
+                                    bar_versions.c.owner_user_id == context.user_id,
+                                    bar_versions.c.series_id == sr["series_id"],
+                                    bar_versions.c.start_at == bar.start_at,
+                                    bar_versions.c.source_revision == bar.source_revision,
+                                )
                             )
                         )
+                        .mappings()
+                        .first()
                     )
-                    .mappings()
-                    .first()
                 )
                 if same and same["version_fingerprint_sha256"] != fingerprint:
+                    assert sr is not None
                     audit.execute(
                         pg_insert(bar_conflicts)
                         .values(
@@ -1554,25 +1678,47 @@ class MarketDataCatalog:
                     ) or bar.end_at > cv["last_trade_at"]:
                         reason = "CONTRACT_LIFETIME"
                 if reason is not None:
-                    audit.execute(
-                        pg_insert(quality_observations)
-                        .values(
-                            owner_user_id=context.user_id,
-                            observation_id=str(uuid7()),
-                            series_id=sr["series_id"],
-                            start_at=bar.start_at,
-                            source_revision=bar.source_revision,
-                            attempted_payload_hash=payload_hash,
-                            quality="invalid",
-                            reason=reason,
-                            observed_at=self._now(),
+                    if sr is not None:
+                        audit.execute(
+                            pg_insert(quality_observations)
+                            .values(
+                                owner_user_id=context.user_id,
+                                observation_id=str(uuid7()),
+                                series_id=sr["series_id"],
+                                start_at=bar.start_at,
+                                source_revision=bar.source_revision,
+                                attempted_payload_hash=payload_hash,
+                                quality="invalid",
+                                reason=reason,
+                                observed_at=self._now(),
+                            )
+                            .on_conflict_do_nothing()
                         )
-                        .on_conflict_do_nothing()
-                    )
                     if preflight_error is None:
                         preflight_error = MarketDataError(
                             MarketDataCode.VALIDATION_ERROR, "Invalid completed bar.", 422
                         )
+            if preflight_error is not None:
+                audit.execute(
+                    update(idempotency)
+                    .where(
+                        and_(
+                            idempotency.c.owner_user_id == context.user_id,
+                            idempotency.c.operation == "bars.record",
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    .values(
+                        state="failed",
+                        error={
+                            "code": preflight_error.code.value,
+                            "message": preflight_error.message,
+                            "http_status": preflight_error.http_status,
+                            "retryable": preflight_error.retryable,
+                        },
+                        updated_at=self._now(),
+                    )
+                )
         if preflight_error is not None:
             raise preflight_error
         with self.engine.begin() as c:

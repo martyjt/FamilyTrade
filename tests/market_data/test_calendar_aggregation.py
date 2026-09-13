@@ -287,8 +287,47 @@ def test_aggregation_requires_source_strictly_smaller_than_target() -> None:
 def test_aggregation_anchors_each_open_segment_and_never_crosses_break_or_trading_day_label() -> (
     None
 ):
-    test_adjacent_open_segments_with_different_trading_day_labels_remain_distinct_anchors()
-    test_maintenance_holiday_early_close_and_overnight_session_are_not_missing()
+    base = calendar(4)
+    start = base.coverage_start
+    split = base.model_copy(
+        update={
+            "coverage_end": start + timedelta(minutes=4),
+            "windows": (
+                CalendarWindow(
+                    ordinal=0,
+                    kind="open",
+                    start_at=start,
+                    end_at=start + timedelta(minutes=2),
+                    trading_day=date(2026, 11, 2),
+                    reason=None,
+                ),
+                CalendarWindow(
+                    ordinal=1,
+                    kind="open",
+                    start_at=start + timedelta(minutes=2),
+                    end_at=start + timedelta(minutes=4),
+                    trading_day=date(2026, 11, 3),
+                    reason=None,
+                ),
+            ),
+        }
+    )
+    result = aggregate_completed_bars(
+        AggregateRequest(
+            source_bars=bars(split),
+            calendar=split,
+            target_interval_seconds=300,
+            partial_policy="scheduled_partial",
+        )
+    )
+    assert tuple(item.start_at for item in result.scheduled_partial_bars) == (
+        start,
+        start + timedelta(minutes=2),
+    )
+    assert all(
+        item.end_at <= split.windows[0].end_at or item.start_at >= split.windows[1].start_at
+        for item in result.scheduled_partial_bars
+    )
 
 
 def test_causal_committed_selection_bounds_owner_time_uniqueness_and_observation_order() -> None:

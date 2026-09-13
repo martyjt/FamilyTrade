@@ -7,6 +7,9 @@ import io
 import json
 import os
 import re
+import stat
+import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,8 +17,9 @@ from typing import Any, Literal, cast
 from uuid import uuid7
 
 import polars as pl
-from sqlalchemy import and_, delete, func, insert, select, update
+from sqlalchemy import and_, case, delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import OperationalError
 
 from familytrade.access.models import (
     AccessError,
@@ -31,6 +35,7 @@ from familytrade.market_data.catalog import (
     active_bars,
     aggregate_components,
     archive_objects,
+    bar_conflicts,
     bar_retention_refs,
     bar_versions,
     calendar_versions,
@@ -97,8 +102,61 @@ _URI = re.compile(r"^ft-archive://(object|manifest)/([0-9a-f-]{36})$")
 
 class ArchiveStore:
     def __init__(self, root: Path) -> None:
-        self._root = root.resolve()
-        self._root.mkdir(parents=True, exist_ok=True)
+        configured = root.absolute()
+        configured.mkdir(parents=True, exist_ok=True)
+        self._reject_link_or_reparse(configured)
+        self._root = configured.resolve(strict=True)
+
+    @staticmethod
+    def _reject_link_or_reparse(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise MarketDataError(
+                MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500
+            ) from None
+        is_reparse = bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+        is_junction = bool(getattr(path, "is_junction", lambda: False)())
+        if path.is_symlink() or is_reparse or is_junction:
+            raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500)
+
+    def _assert_beneath_owner(self, owner_root: Path, path: Path) -> Path:
+        current = owner_root
+        self._reject_link_or_reparse(current)
+        try:
+            relative = path.relative_to(owner_root)
+        except ValueError:
+            raise MarketDataError(
+                MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500
+            ) from None
+        for component in relative.parts:
+            current = current / component
+            if current.exists() or current.is_symlink():
+                self._reject_link_or_reparse(current)
+        resolved = path.resolve(strict=False)
+        resolved_owner = owner_root.resolve(strict=True)
+        if resolved != resolved_owner and resolved_owner not in resolved.parents:
+            raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500)
+        return resolved
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(directory, flags)
+            os.fsync(descriptor)
+        except OSError:
+            # Win32 does not provide POSIX directory handles through os.open.
+            # No other platform may silently skip this durability boundary.
+            if os.name != "nt":
+                raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def _owner_root(self, owner: str) -> Path:
         try:
@@ -109,12 +167,14 @@ class ArchiveStore:
                 MarketDataCode.ARCHIVE_INTEGRITY, "Invalid archive owner.", 500
             ) from None
         path = self._root / owner
+        if path.exists() or path.is_symlink():
+            self._reject_link_or_reparse(path)
         for name in ("staging", "objects", "manifests", "quarantine"):
             directory = path / name
             directory.mkdir(parents=True, exist_ok=True)
-            if directory.is_symlink():
-                raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500)
-        return path
+            self._reject_link_or_reparse(directory)
+            self._assert_beneath_owner(path, directory)
+        return self._assert_beneath_owner(path, path)
 
     def resolve(self, owner: str, uri: str) -> Path:
         match = _URI.fullmatch(uri)
@@ -126,8 +186,8 @@ class ArchiveStore:
             raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Invalid archive URI.", 500)
         folder = "objects" if kind == "object" else "manifests"
         suffix = ".parquet" if kind == "object" else ".json"
-        path = (self._owner_root(owner) / folder / f"{identifier}{suffix}").resolve()
-        owner_root = self._owner_root(owner).resolve()
+        owner_root = self._owner_root(owner)
+        path = self._assert_beneath_owner(owner_root, owner_root / folder / f"{identifier}{suffix}")
         if (
             owner_root not in path.parents
             or path.is_symlink()
@@ -157,15 +217,8 @@ class ArchiveStore:
             raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500)
         final = self.resolve(owner, uri)
         os.replace(resolved_temp, final)
-        try:
-            with final.parent.open("rb") as directory:
-                os.fsync(directory.fileno())
-        except PermissionError:
-            # Windows does not permit opening directories; atomic replace remains the
-            # strongest local primitive there. Linux production performs directory fsync.
-            if os.name != "nt":
-                raise
         final.chmod(0o400)
+        self._fsync_directory(final.parent)
         return final
 
     def read_verified(self, owner: str, uri: str, digest: str, length: int) -> bytes:
@@ -287,177 +340,650 @@ def _archive_rows_from_revision(
     return result
 
 
+_MANIFEST_EXTRA_FIELDS = {
+    "parent_manifest_uri",
+    "parent_manifest_sha256",
+    "selected_bars",
+    "correction_chain_records",
+    "format_version",
+    "origin_publication_id",
+    "origin_publication_ordinal",
+    "contract_projection",
+    "contract_projection_sha256",
+    "calendar_projection",
+}
+_CHAIN_RECORD_FIELDS = {
+    "completed_bar",
+    "payload_sha256",
+    "correction_reason",
+    "aggregate_lineage_sha256",
+    "version_fingerprint_sha256",
+    "bar_record_id",
+    "source_revision",
+    "received_at",
+    "supersedes_bar_record_id",
+    "aggregate_components",
+}
+_AGGREGATE_COMPONENT_FIELDS = {
+    "ordinal",
+    "source_bar_record_id",
+    "source_dataset_revision_id",
+    "source_manifest_uri",
+    "source_manifest_sha256",
+    "source_manifest_byte_length",
+}
+
+
+def _validate_manifest_schema(document: Any) -> None:
+    if not isinstance(document, dict):
+        raise TypeError("manifest must be an object")
+    expected = (
+        set(DatasetRevision.model_fields) - {"manifest_sha256", "manifest_byte_length"}
+    ) | _MANIFEST_EXTRA_FIELDS
+    if set(document) != expected or document.get("format_version") != "ft-dataset-manifest-v1":
+        raise ValueError("manifest has an invalid strict schema")
+    FuturesContract.model_validate(document["contract_projection"])
+    CalendarVersion.model_validate(document["calendar_projection"])
+    if document["contract_projection_sha256"] != canonical_sha256(document["contract_projection"]):
+        raise ValueError("manifest contract projection digest differs")
+    if not isinstance(document["selected_bars"], list) or not isinstance(
+        document["correction_chain_records"], list
+    ):
+        raise TypeError("manifest arrays have an invalid schema")
+    for item in document["selected_bars"]:
+        CompletedBar.model_validate(item)
+    for record in document["correction_chain_records"]:
+        if not isinstance(record, dict) or set(record) != _CHAIN_RECORD_FIELDS:
+            raise ValueError("manifest correction record has an invalid strict schema")
+        CompletedBar.model_validate(record["completed_bar"])
+        components = record["aggregate_components"]
+        if not isinstance(components, list) or any(
+            not isinstance(component, dict) or set(component) != _AGGREGATE_COMPONENT_FIELDS
+            for component in components
+        ):
+            raise ValueError("manifest aggregate component has an invalid strict schema")
+
+
+def _verify_catalog_reconstruction_dag(
+    connection: Any,
+    store: ArchiveStore,
+    owner: str,
+    seed_revision_id: str,
+) -> list[CompletedBar]:
+    """Verify the complete catalog-backed parent/aggregate DAG before staging."""
+
+    if sys.getrecursionlimit() < 4096:
+        sys.setrecursionlimit(4096)
+    verified: dict[str, tuple[dict[str, Any], list[CompletedBar]]] = {}
+    verified_projections: dict[str, DatasetRevision] = {}
+    closures: dict[str, set[str]] = {}
+    visiting: set[str] = set()
+
+    def verify(revision_id: str, *, target_interval: int | None = None) -> set[str]:
+        if revision_id in verified:
+            if (
+                target_interval is not None
+                and verified[revision_id][0]["series_key"]["interval_seconds"] >= target_interval
+            ):
+                raise ValueError("aggregate dependency interval is not smaller")
+            return closures[revision_id]
+        if revision_id in visiting or len(verified) + len(visiting) >= 1000:
+            raise ValueError("cyclic or over-bound reconstruction DAG")
+        visiting.add(revision_id)
+        row = (
+            connection.execute(
+                select(dataset_revisions).where(
+                    and_(
+                        dataset_revisions.c.owner_user_id == owner,
+                        dataset_revisions.c.dataset_revision_id == revision_id,
+                    )
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row is None or row["status"] != "published":
+            raise ValueError("reconstruction revision is absent or not published")
+        manifest_bytes = store.read_verified(
+            owner, row["manifest_uri"], row["manifest_sha256"], row["manifest_byte_length"]
+        )
+        document = json.loads(manifest_bytes)
+        _validate_manifest_schema(document)
+        _validate_manifest_correction_history(document)
+        payload = {
+            name: document[name]
+            for name in DatasetRevision.model_fields
+            if name not in {"manifest_sha256", "manifest_byte_length"}
+        }
+        payload.update(
+            manifest_sha256=row["manifest_sha256"],
+            manifest_byte_length=row["manifest_byte_length"],
+        )
+        projection = DatasetRevision.model_validate(payload)
+        catalog_projection = DatasetRevision.model_validate(row["projection"])
+        contract_hash = connection.execute(
+            select(contract_versions.c.projection_sha256).where(
+                and_(
+                    contract_versions.c.owner_user_id == owner,
+                    contract_versions.c.contract_id == projection.series_key.contract_id,
+                    contract_versions.c.contract_version == projection.contract_version,
+                )
+            )
+        ).scalar_one_or_none()
+        differing_projection_fields = [
+            name
+            for name in DatasetRevision.model_fields
+            if getattr(projection, name) != getattr(catalog_projection, name)
+        ]
+        if (
+            differing_projection_fields
+            or projection.dataset_revision_id != revision_id
+            or projection.owner_user_id != owner
+            or projection.manifest_uri != row["manifest_uri"]
+            or projection.parent_revision_id != row["parent_revision_id"]
+            or projection.parent_depth != row["parent_depth"]
+            or contract_hash != document["contract_projection_sha256"]
+        ):
+            raise ValueError(
+                "manifest and catalog projection differ: " + ",".join(differing_projection_fields)
+            )
+        if (
+            target_interval is not None
+            and projection.series_key.interval_seconds >= target_interval
+        ):
+            raise ValueError("aggregate dependency interval is not smaller")
+        catalog_partitions = list(
+            connection.execute(
+                select(revision_partitions.c.ordinal, archive_objects)
+                .join(
+                    archive_objects,
+                    and_(
+                        archive_objects.c.owner_user_id == revision_partitions.c.owner_user_id,
+                        archive_objects.c.object_id == revision_partitions.c.object_id,
+                    ),
+                )
+                .where(
+                    and_(
+                        revision_partitions.c.owner_user_id == owner,
+                        revision_partitions.c.dataset_revision_id == revision_id,
+                    )
+                )
+                .order_by(revision_partitions.c.ordinal)
+            ).mappings()
+        )
+        if len(catalog_partitions) != len(projection.partition_refs):
+            raise ValueError("manifest partition count differs from catalog")
+        object_bars: list[CompletedBar] = []
+        for ordinal, (ref, catalog_object) in enumerate(
+            zip(projection.partition_refs, catalog_partitions, strict=True)
+        ):
+            if (
+                catalog_object["ordinal"] != ordinal
+                or catalog_object["object_id"] != ref.object_id
+                or catalog_object["series_id"] != row["series_id"]
+                or catalog_object["uri"] != ref.uri
+                or catalog_object["sha256"] != ref.sha256
+                or catalog_object["byte_length"] != ref.byte_length
+                or catalog_object["row_count"] != ref.row_count
+                or catalog_object["min_start_at"] != ref.min_start_at
+                or catalog_object["max_end_at"] != ref.max_end_at
+                or catalog_object["min_source_revision"] != ref.min_source_revision
+                or catalog_object["max_source_revision"] != ref.max_source_revision
+                or catalog_object["state"] != "published"
+            ):
+                raise ValueError("manifest object metadata differs from catalog")
+            parquet_bytes = store.read_verified(owner, ref.uri, ref.sha256, ref.byte_length)
+            temp = store.write_temp(owner, parquet_bytes, "dag-verify")
+            try:
+                partition_bars = [_bar(item) for item in pl.read_parquet(temp).to_dicts()]
+            finally:
+                temp.unlink(missing_ok=True)
+            if len(partition_bars) != ref.row_count or partition_bars != sorted(
+                partition_bars, key=lambda item: (item.start_at, item.bar_record_id)
+            ):
+                raise ValueError("Parquet rows violate manifest ordering or count")
+            object_bars.extend(partition_bars)
+        selected = [CompletedBar.model_validate(item) for item in document["selected_bars"]]
+        if object_bars != selected:
+            raise ValueError("Parquet rows differ from manifest selected bars")
+        catalog_selected = list(
+            connection.execute(
+                select(revision_bars.c.bar_record_id)
+                .where(
+                    and_(
+                        revision_bars.c.owner_user_id == owner,
+                        revision_bars.c.dataset_revision_id == revision_id,
+                    )
+                )
+                .order_by(revision_bars.c.ordinal)
+            ).scalars()
+        )
+        if catalog_selected != [bar.bar_record_id for bar in selected]:
+            raise ValueError("manifest selection differs from catalog")
+        closure_ids = {revision_id}
+        if projection.parent_revision_id is not None:
+            parent_uri = document.get("parent_manifest_uri")
+            parent_sha = document.get("parent_manifest_sha256")
+            parent = (
+                connection.execute(
+                    select(
+                        dataset_revisions.c.manifest_uri, dataset_revisions.c.manifest_sha256
+                    ).where(
+                        and_(
+                            dataset_revisions.c.owner_user_id == owner,
+                            dataset_revisions.c.dataset_revision_id
+                            == projection.parent_revision_id,
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if (
+                parent is None
+                or parent_uri != parent["manifest_uri"]
+                or parent_sha != parent["manifest_sha256"]
+            ):
+                raise ValueError("parent locator differs from catalog")
+            closure_ids.update(verify(projection.parent_revision_id))
+        for record in document.get("correction_chain_records", []):
+            for component in record.get("aggregate_components", []):
+                dependency_id = component["source_dataset_revision_id"]
+                dependency = (
+                    connection.execute(
+                        select(
+                            dataset_revisions.c.manifest_uri, dataset_revisions.c.manifest_sha256
+                        ).where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == owner,
+                                dataset_revisions.c.dataset_revision_id == dependency_id,
+                            )
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if (
+                    dependency is None
+                    or component["source_manifest_uri"] != dependency["manifest_uri"]
+                    or component["source_manifest_sha256"] != dependency["manifest_sha256"]
+                ):
+                    raise ValueError("aggregate dependency locator differs from catalog")
+                closure_ids.update(
+                    verify(dependency_id, target_interval=projection.series_key.interval_seconds)
+                )
+        visiting.remove(revision_id)
+        verified[revision_id] = (document, selected)
+        verified_projections[revision_id] = projection
+        closures[revision_id] = closure_ids
+        unique_objects = {
+            ref.object_id: ref
+            for closure_revision_id in closure_ids
+            for ref in verified_projections[closure_revision_id].partition_refs
+        }
+        if (
+            projection.restore_closure_revision_count != len(closure_ids)
+            or projection.restore_closure_row_count
+            != sum(len(verified[item][1]) for item in closure_ids)
+            or projection.restore_closure_bytes
+            != sum(ref.byte_length for ref in unique_objects.values())
+        ):
+            raise ValueError("manifest reconstruction closure summaries differ")
+        return closure_ids
+
+    verify(seed_revision_id)
+    revision_count = len(verified)
+    row_count = sum(len(item[1]) for item in verified.values())
+    referenced_bytes = sum(
+        ref.byte_length
+        for document, _ in verified.values()
+        for ref in DatasetRevision.model_validate(
+            {
+                **{
+                    name: document[name]
+                    for name in DatasetRevision.model_fields
+                    if name not in {"manifest_sha256", "manifest_byte_length"}
+                },
+                "manifest_sha256": "0" * 64,
+                "manifest_byte_length": 1,
+            }
+        ).partition_refs
+    )
+    if revision_count > 1000 or row_count > 2_000_000 or referenced_bytes > 10 * 1024**3:
+        raise ValueError("reconstruction DAG exceeds bounds")
+    return verified[seed_revision_id][1]
+
+
+def _catalog_reconstruction_ids(
+    connection: Any, owner: str, seed_revision_ids: set[str]
+) -> set[str]:
+    closure: set[str] = set()
+    frontier = set(seed_revision_ids)
+    while frontier:
+        if len(closure | frontier) > 1000:
+            raise ValueError("reconstruction DAG exceeds bounds")
+        batch = tuple(sorted(frontier))
+        rows = list(
+            connection.execute(
+                select(
+                    dataset_revisions.c.dataset_revision_id,
+                    dataset_revisions.c.parent_revision_id,
+                    dataset_revisions.c.status,
+                ).where(
+                    and_(
+                        dataset_revisions.c.owner_user_id == owner,
+                        dataset_revisions.c.dataset_revision_id.in_(batch),
+                    )
+                )
+            ).mappings()
+        )
+        if len(rows) != len(batch) or any(row["status"] != "published" for row in rows):
+            raise ValueError("reconstruction DAG contains an unavailable revision")
+        aggregate_ids = set(
+            connection.execute(
+                select(aggregate_components.c.source_dataset_revision_id)
+                .join(
+                    revision_bars,
+                    and_(
+                        revision_bars.c.owner_user_id == aggregate_components.c.owner_user_id,
+                        revision_bars.c.bar_record_id
+                        == aggregate_components.c.derived_bar_record_id,
+                    ),
+                )
+                .where(
+                    and_(
+                        revision_bars.c.owner_user_id == owner,
+                        revision_bars.c.dataset_revision_id.in_(batch),
+                    )
+                )
+            ).scalars()
+        )
+        closure.update(batch)
+        frontier = (
+            aggregate_ids | {row["parent_revision_id"] for row in rows if row["parent_revision_id"]}
+        ) - closure
+    return closure
+
+
 def _quarantine_dependency_closure(
     catalog: MarketDataCatalog, owner: str, seed_revision_id: str
 ) -> tuple[str, ...]:
-    """Fence and quarantine all same-owner parent and aggregate dependants."""
+    """Build, fence, recheck, and quarantine the complete dependency closure."""
 
-    with catalog.engine.begin() as connection:
-        seed_objects = list(
-            connection.execute(
-                select(revision_partitions.c.object_id).where(
-                    and_(
-                        revision_partitions.c.owner_user_id == owner,
-                        revision_partitions.c.dataset_revision_id == seed_revision_id,
-                    )
-                )
-            ).scalars()
+    expansion = text(
+        """
+        WITH candidates AS (
+          SELECT r.dataset_revision_id
+            FROM market_data_dataset_revisions r
+            JOIN ft05_corruption_work w ON w.dataset_revision_id=r.parent_revision_id
+           WHERE r.owner_user_id=:owner
+          UNION
+          SELECT rb.dataset_revision_id
+            FROM market_data_revision_bars rb
+            JOIN market_data_aggregate_components ac
+              ON ac.owner_user_id=rb.owner_user_id
+             AND ac.derived_bar_record_id=rb.bar_record_id
+            JOIN ft05_corruption_work w
+              ON w.dataset_revision_id=ac.source_dataset_revision_id
+           WHERE rb.owner_user_id=:owner
+        ), page AS (
+          SELECT DISTINCT dataset_revision_id
+            FROM candidates
+           ORDER BY dataset_revision_id
+           LIMIT 1000
         )
-        closure = set(
-            connection.execute(
-                select(revision_partitions.c.dataset_revision_id).where(
-                    and_(
-                        revision_partitions.c.owner_user_id == owner,
-                        revision_partitions.c.object_id.in_(seed_objects),
-                    )
-                )
-            ).scalars()
-        )
-        closure.add(seed_revision_id)
-        frontier = set(closure)
-        while frontier:
-            parent_children = set(
+        INSERT INTO ft05_corruption_work(dataset_revision_id)
+        SELECT dataset_revision_id FROM page
+        ON CONFLICT DO NOTHING
+        """
+    )
+
+    class _ClosureChanged(Exception):
+        pass
+
+    for attempt in range(3):
+        try:
+            with (
+                catalog.engine.connect().execution_options(
+                    isolation_level="SERIALIZABLE"
+                ) as connection,
+                connection.begin(),
+            ):
                 connection.execute(
-                    select(dataset_revisions.c.dataset_revision_id).where(
+                    text(
+                        "CREATE TEMP TABLE ft05_corruption_work "
+                        "(dataset_revision_id varchar(36) PRIMARY KEY) ON COMMIT DROP"
+                    )
+                )
+                connection.execute(
+                    text("INSERT INTO ft05_corruption_work VALUES (:seed) ON CONFLICT DO NOTHING"),
+                    {"seed": seed_revision_id},
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO ft05_corruption_work
+                        SELECT DISTINCT shared.dataset_revision_id
+                          FROM market_data_revision_partitions seed
+                          JOIN market_data_revision_partitions shared
+                            ON shared.owner_user_id=seed.owner_user_id
+                           AND shared.object_id=seed.object_id
+                         WHERE seed.owner_user_id=:owner
+                           AND seed.dataset_revision_id=:seed
+                        ON CONFLICT DO NOTHING
+                        """
+                    ),
+                    {"owner": owner, "seed": seed_revision_id},
+                )
+                while connection.execute(expansion, {"owner": owner}).rowcount:
+                    pass
+                closure = tuple(
+                    connection.execute(
+                        text(
+                            "SELECT dataset_revision_id FROM ft05_corruption_work "
+                            "ORDER BY dataset_revision_id"
+                        )
+                    ).scalars()
+                )
+                affected_publications = tuple(
+                    connection.execute(
+                        select(publications)
+                        .join(
+                            publication_revisions,
+                            and_(
+                                publication_revisions.c.owner_user_id
+                                == publications.c.owner_user_id,
+                                publication_revisions.c.publication_id
+                                == publications.c.publication_id,
+                            ),
+                        )
+                        .where(
+                            and_(
+                                publications.c.owner_user_id == owner,
+                                publication_revisions.c.dataset_revision_id.in_(closure),
+                            )
+                        )
+                        .distinct()
+                        .order_by(publications.c.operation, publications.c.idempotency_key)
+                    ).mappings()
+                )
+                for publication in affected_publications:
+                    root_operation = (
+                        "dataset.publish"
+                        if publication["operation"] == "publish"
+                        else "dataset.recover_quarantined_latest"
+                    )
+                    connection.execute(
+                        select(idempotency)
+                        .where(
+                            and_(
+                                idempotency.c.owner_user_id == owner,
+                                idempotency.c.operation == root_operation,
+                                idempotency.c.idempotency_key == publication["idempotency_key"],
+                            )
+                        )
+                        .with_for_update()
+                    ).first()
+                affected_series = tuple(
+                    connection.execute(
+                        select(dataset_revisions.c.series_id)
+                        .where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == owner,
+                                dataset_revisions.c.dataset_revision_id.in_(closure),
+                            )
+                        )
+                        .distinct()
+                        .order_by(dataset_revisions.c.series_id)
+                    ).scalars()
+                )
+                fences = tuple(
+                    connection.execute(
+                        select(series_fences)
+                        .where(
+                            and_(
+                                series_fences.c.owner_user_id == owner,
+                                series_fences.c.series_id.in_(affected_series),
+                            )
+                        )
+                        .order_by(series_fences.c.series_id)
+                        .with_for_update()
+                    ).mappings()
+                )
+                # No edge or affected series may appear between discovery and fencing.
+                if connection.execute(expansion, {"owner": owner}).rowcount:
+                    raise _ClosureChanged
+                stable_series = tuple(
+                    connection.execute(
+                        select(dataset_revisions.c.series_id)
+                        .where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == owner,
+                                dataset_revisions.c.dataset_revision_id.in_(
+                                    select(text("dataset_revision_id")).select_from(
+                                        text("ft05_corruption_work")
+                                    )
+                                ),
+                            )
+                        )
+                        .distinct()
+                        .order_by(dataset_revisions.c.series_id)
+                    ).scalars()
+                )
+                if stable_series != affected_series:
+                    raise _ClosureChanged
+                now = catalog._now()
+                holder = str(uuid7())
+                fresh_fences: dict[str, int] = {}
+                for fence in fences:
+                    fresh_fences[fence["series_id"]] = int(fence["fencing_token"]) + 1
+                    connection.execute(
+                        update(series_fences)
+                        .where(
+                            and_(
+                                series_fences.c.owner_user_id == owner,
+                                series_fences.c.series_id == fence["series_id"],
+                            )
+                        )
+                        .values(
+                            fencing_token=fence["fencing_token"] + 1,
+                            holder=holder,
+                            lease_expires_at=now,
+                        )
+                    )
+                connection.execute(
+                    update(dataset_revisions)
+                    .where(
                         and_(
                             dataset_revisions.c.owner_user_id == owner,
-                            dataset_revisions.c.parent_revision_id.in_(frontier),
+                            dataset_revisions.c.dataset_revision_id.in_(closure),
+                            dataset_revisions.c.status.in_(("building", "published")),
                         )
                     )
-                ).scalars()
-            )
-            aggregate_children = set(
-                connection.execute(
-                    select(revision_bars.c.dataset_revision_id)
-                    .join(
-                        aggregate_components,
-                        and_(
-                            aggregate_components.c.owner_user_id == revision_bars.c.owner_user_id,
-                            aggregate_components.c.derived_bar_record_id
-                            == revision_bars.c.bar_record_id,
-                        ),
+                    .values(
+                        status="quarantined",
+                        record_version=case((dataset_revisions.c.status == "building", 2), else_=3),
                     )
-                    .where(
-                        and_(
-                            revision_bars.c.owner_user_id == owner,
-                            aggregate_components.c.source_dataset_revision_id.in_(frontier),
+                )
+                publication_ids = tuple(p["publication_id"] for p in affected_publications)
+                if publication_ids:
+                    for publication in affected_publications:
+                        connection.execute(
+                            update(publications)
+                            .where(
+                                and_(
+                                    publications.c.owner_user_id == owner,
+                                    publications.c.publication_id == publication["publication_id"],
+                                    publications.c.state.in_(("staged", "published")),
+                                )
+                            )
+                            .values(
+                                state="quarantined",
+                                safe_reason="ARCHIVE_INTEGRITY",
+                                fencing_token=fresh_fences[publication["series_id"]],
+                                updated_at=now,
+                            )
                         )
-                    )
-                ).scalars()
-            )
-            newly_found = (parent_children | aggregate_children) - closure
-            closure.update(newly_found)
-            frontier = newly_found
-        affected_series = list(
-            connection.execute(
-                select(dataset_revisions.c.series_id)
-                .where(
-                    and_(
-                        dataset_revisions.c.owner_user_id == owner,
-                        dataset_revisions.c.dataset_revision_id.in_(closure),
-                    )
-                )
-                .distinct()
-                .order_by(dataset_revisions.c.series_id)
-            ).scalars()
-        )
-        now = catalog._now()
-        for series_id in affected_series:
-            fence = (
-                connection.execute(
-                    select(series_fences)
-                    .where(
-                        and_(
-                            series_fences.c.owner_user_id == owner,
-                            series_fences.c.series_id == series_id,
+                    connection.execute(
+                        update(publication_files)
+                        .where(
+                            and_(
+                                publication_files.c.owner_user_id == owner,
+                                publication_files.c.publication_id.in_(publication_ids),
+                            )
                         )
+                        .values(state="quarantined")
                     )
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
-            connection.execute(
-                update(series_fences)
-                .where(
-                    and_(
-                        series_fences.c.owner_user_id == owner,
-                        series_fences.c.series_id == series_id,
+                    connection.execute(
+                        update(publication_retention_conversions)
+                        .where(
+                            and_(
+                                publication_retention_conversions.c.owner_user_id == owner,
+                                publication_retention_conversions.c.publication_id.in_(
+                                    publication_ids
+                                ),
+                                publication_retention_conversions.c.state == "planned",
+                            )
+                        )
+                        .values(state="cancelled")
                     )
+                object_ids = tuple(
+                    connection.execute(
+                        select(revision_partitions.c.object_id)
+                        .where(
+                            and_(
+                                revision_partitions.c.owner_user_id == owner,
+                                revision_partitions.c.dataset_revision_id.in_(closure),
+                            )
+                        )
+                        .distinct()
+                    ).scalars()
                 )
-                .values(
-                    fencing_token=fence["fencing_token"] + 1,
-                    holder=str(uuid7()),
-                    lease_expires_at=now,
-                )
-            )
-        connection.execute(
-            update(dataset_revisions)
-            .where(
-                and_(
-                    dataset_revisions.c.owner_user_id == owner,
-                    dataset_revisions.c.dataset_revision_id.in_(closure),
-                )
-            )
-            .values(status="quarantined", record_version=3)
-        )
-        affected_publications = list(
-            connection.execute(
-                select(publication_revisions.c.publication_id)
-                .where(
-                    and_(
-                        publication_revisions.c.owner_user_id == owner,
-                        publication_revisions.c.dataset_revision_id.in_(closure),
+                if object_ids:
+                    connection.execute(
+                        update(archive_objects)
+                        .where(
+                            and_(
+                                archive_objects.c.owner_user_id == owner,
+                                archive_objects.c.object_id.in_(object_ids),
+                                archive_objects.c.state == "published",
+                            )
+                        )
+                        .values(state="quarantined")
                     )
-                )
-                .distinct()
-            ).scalars()
-        )
-        if affected_publications:
-            connection.execute(
-                update(publications)
-                .where(
-                    and_(
-                        publications.c.owner_user_id == owner,
-                        publications.c.publication_id.in_(affected_publications),
-                    )
-                )
-                .values(state="quarantined", safe_reason="ARCHIVE_INTEGRITY", updated_at=now)
-            )
-            connection.execute(
-                update(publication_files)
-                .where(
-                    and_(
-                        publication_files.c.owner_user_id == owner,
-                        publication_files.c.publication_id.in_(affected_publications),
-                    )
-                )
-                .values(state="quarantined")
-            )
-        object_ids = list(
-            connection.execute(
-                select(revision_partitions.c.object_id)
-                .where(
-                    and_(
-                        revision_partitions.c.owner_user_id == owner,
-                        revision_partitions.c.dataset_revision_id.in_(closure),
-                    )
-                )
-                .distinct()
-            ).scalars()
-        )
-        if object_ids:
-            connection.execute(
-                update(archive_objects)
-                .where(
-                    and_(
-                        archive_objects.c.owner_user_id == owner,
-                        archive_objects.c.object_id.in_(object_ids),
-                    )
-                )
-                .values(state="quarantined")
-            )
-        return tuple(sorted(closure))
+                return closure
+        except _ClosureChanged:
+            if attempt == 2:
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "Corruption closure changed while fencing.",
+                    409,
+                    retryable=True,
+                ) from None
+        except OperationalError as error:
+            if getattr(error.orig, "sqlstate", None) != "40001" or attempt == 2:
+                raise
+    raise AssertionError("unreachable")
 
 
 class MarketDataReader:
@@ -465,6 +991,9 @@ class MarketDataReader:
         self, catalog: MarketDataCatalog, store: ArchiveStore, *, context_is_current: Any
     ) -> None:
         self.catalog, self.store, self.context_is_current = catalog, store, context_is_current
+
+    def _inject(self, point: str) -> None:
+        pass
 
     def _auth(self, context: UserContext) -> None:
         if not self.context_is_current(context):
@@ -525,14 +1054,211 @@ class MarketDataReader:
                 _quarantine_dependency_closure(self.catalog, owner, revision_id)
             raise
 
+    def _archive_snapshot_references(
+        self, c: Any, owner: str, revision_id: str
+    ) -> dict[str, dict[str, Any]]:
+        revision = (
+            c.execute(
+                select(dataset_revisions).where(
+                    and_(
+                        dataset_revisions.c.owner_user_id == owner,
+                        dataset_revisions.c.dataset_revision_id == revision_id,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        manifest_bytes = self.store.read_verified(
+            owner,
+            revision["manifest_uri"],
+            revision["manifest_sha256"],
+            revision["manifest_byte_length"],
+        )
+        document = json.loads(manifest_bytes)
+        references: dict[str, dict[str, Any]] = {}
+        for partition in document["partition_refs"]:
+            parquet_bytes = self.store.read_verified(
+                owner,
+                partition["uri"],
+                partition["sha256"],
+                partition["byte_length"],
+            )
+            temp = self.store.write_temp(owner, parquet_bytes, "snapshot-read")
+            try:
+                for ordinal, row in enumerate(pl.read_parquet(temp).to_dicts()):
+                    references[row["bar_record_id"]] = {
+                        "origin_kind": "archive_object",
+                        "dataset_revision_id": revision_id,
+                        "object_id": partition["object_id"],
+                        "source_ordinal": ordinal,
+                        "active_marker": False,
+                    }
+            finally:
+                temp.unlink(missing_ok=True)
+        for ordinal, record in enumerate(document.get("correction_chain_records", [])):
+            references.setdefault(
+                record["bar_record_id"],
+                {
+                    "origin_kind": "archive_chain",
+                    "dataset_revision_id": revision_id,
+                    "object_id": None,
+                    "source_ordinal": ordinal,
+                    "active_marker": False,
+                },
+            )
+        return references
+
+    @contextmanager
+    def _read_transaction(self) -> Any:
+        with (
+            self.catalog.engine.connect().execution_options(
+                isolation_level="REPEATABLE READ"
+            ) as connection,
+            connection.begin(),
+        ):
+            yield connection
+
+    def _decode_snapshot_row(
+        self,
+        connection: Any,
+        owner: str,
+        row: Any,
+        object_cache: dict[str, list[CompletedBar]],
+        manifest_cache: dict[str, dict[str, Any]],
+    ) -> CompletedBar:
+        if row["origin_kind"] == "active":
+            active = (
+                connection.execute(
+                    select(active_bars).where(
+                        and_(
+                            active_bars.c.owner_user_id == owner,
+                            active_bars.c.bar_record_id == row["bar_record_id"],
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if active is None:
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "A frozen active selection is unavailable.",
+                    500,
+                )
+            decoded = _bar(dict(active))
+        elif row["origin_kind"] == "archive_object":
+            object_id = cast(str, row["object_id"])
+            if object_id not in object_cache:
+                archived = (
+                    connection.execute(
+                        select(archive_objects).where(
+                            and_(
+                                archive_objects.c.owner_user_id == owner,
+                                archive_objects.c.object_id == object_id,
+                                archive_objects.c.state == "published",
+                            )
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if archived is None:
+                    raise MarketDataError(
+                        MarketDataCode.ARCHIVE_INTEGRITY,
+                        "A frozen archive object is unavailable.",
+                        500,
+                    )
+                data = self.store.read_verified(
+                    owner, archived["uri"], archived["sha256"], archived["byte_length"]
+                )
+                temp = self.store.write_temp(owner, data, "snapshot-page")
+                try:
+                    object_cache[object_id] = [
+                        _bar(item) for item in pl.read_parquet(temp).to_dicts()
+                    ]
+                finally:
+                    temp.unlink(missing_ok=True)
+            source_ordinal = cast(int, row["source_ordinal"])
+            try:
+                decoded = object_cache[object_id][source_ordinal]
+            except IndexError:
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "A frozen archive row reference is invalid.",
+                    500,
+                ) from None
+        else:
+            revision_id = cast(str, row["dataset_revision_id"])
+            if revision_id not in manifest_cache:
+                revision = (
+                    connection.execute(
+                        select(dataset_revisions).where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == owner,
+                                dataset_revisions.c.dataset_revision_id == revision_id,
+                                dataset_revisions.c.status == "published",
+                            )
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if revision is None:
+                    raise MarketDataError(
+                        MarketDataCode.ARCHIVE_INTEGRITY,
+                        "A frozen archive chain is unavailable.",
+                        500,
+                    )
+                manifest_cache[revision_id] = json.loads(
+                    self.store.read_verified(
+                        owner,
+                        revision["manifest_uri"],
+                        revision["manifest_sha256"],
+                        revision["manifest_byte_length"],
+                    )
+                )
+            source_ordinal = cast(int, row["source_ordinal"])
+            try:
+                record = manifest_cache[revision_id]["correction_chain_records"][source_ordinal]
+                decoded = CompletedBar.model_validate(record["completed_bar"])
+            except IndexError, KeyError, TypeError, ValueError:
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "A frozen archive-chain reference is invalid.",
+                    500,
+                ) from None
+        if decoded.bar_record_id != row["bar_record_id"] or decoded.start_at != row["start_at"]:
+            raise MarketDataError(
+                MarketDataCode.ARCHIVE_INTEGRITY,
+                "A frozen read reference does not match its immutable registry row.",
+                500,
+            )
+        return decoded
+
     def read_bars(self, context: UserContext, request: ReadBarsRequest) -> ReadBarsResult:
+        for attempt in range(2):
+            try:
+                return self._read_bars_once(context, request)
+            except OperationalError:
+                if not attempt:
+                    continue
+                raise MarketDataError(
+                    MarketDataCode.DEPENDENCY_UNAVAILABLE,
+                    "The market-data snapshot could not be completed.",
+                    503,
+                    retryable=True,
+                ) from None
+        raise AssertionError("unreachable")
+
+    def _read_bars_once(self, context: UserContext, request: ReadBarsRequest) -> ReadBarsResult:
         self._auth(context)
         self._range(request.coverage_start, request.coverage_end)
         request_hash = hashlib.sha256(
             canonical_json_bytes(request.model_copy(update={"cursor": None, "limit": 5000}))
         ).hexdigest()
         if request.cursor is not None:
-            with self.catalog.engine.begin() as c:
+            with self._read_transaction() as c:
                 header = (
                     c.execute(
                         select(read_snapshots)
@@ -571,11 +1297,91 @@ class MarketDataReader:
                         )
                         .order_by(read_snapshot_bars.c.ordinal)
                         .limit(request.limit)
+                        .with_for_update(read=True)
                     ).mappings()
                 )
+                all_rows = list(
+                    c.execute(
+                        select(read_snapshot_bars)
+                        .where(
+                            and_(
+                                read_snapshot_bars.c.owner_user_id == context.user_id,
+                                read_snapshot_bars.c.read_snapshot_id == request.cursor.snapshot_id,
+                            )
+                        )
+                        .order_by(read_snapshot_bars.c.ordinal)
+                        .with_for_update(read=True)
+                    ).mappings()
+                )
+                active_ids = sorted(
+                    row["bar_record_id"] for row in all_rows if row["origin_kind"] == "active"
+                )
+                if active_ids:
+                    tuple(
+                        c.execute(
+                            select(active_bars.c.bar_record_id)
+                            .where(
+                                and_(
+                                    active_bars.c.owner_user_id == context.user_id,
+                                    active_bars.c.bar_record_id.in_(active_ids),
+                                )
+                            )
+                            .order_by(active_bars.c.bar_record_id)
+                            .with_for_update(read=True)
+                        ).scalars()
+                    )
+                revision_ids = sorted(
+                    {
+                        row["dataset_revision_id"]
+                        for row in all_rows
+                        if row["dataset_revision_id"] is not None
+                    }
+                )
+                if revision_ids:
+                    tuple(
+                        c.execute(
+                            select(dataset_revisions.c.dataset_revision_id)
+                            .where(
+                                and_(
+                                    dataset_revisions.c.owner_user_id == context.user_id,
+                                    dataset_revisions.c.dataset_revision_id.in_(revision_ids),
+                                )
+                            )
+                            .order_by(dataset_revisions.c.dataset_revision_id)
+                            .with_for_update(read=True)
+                        ).scalars()
+                    )
+                object_ids = sorted(
+                    {row["object_id"] for row in all_rows if row["object_id"] is not None}
+                )
+                if object_ids:
+                    tuple(
+                        c.execute(
+                            select(archive_objects.c.object_id)
+                            .where(
+                                and_(
+                                    archive_objects.c.owner_user_id == context.user_id,
+                                    archive_objects.c.object_id.in_(object_ids),
+                                )
+                            )
+                            .order_by(archive_objects.c.object_id)
+                            .with_for_update(read=True)
+                        ).scalars()
+                    )
+                object_cache: dict[str, list[CompletedBar]] = {}
+                manifest_cache: dict[str, dict[str, Any]] = {}
+                decoded_all = [
+                    self._decode_snapshot_row(c, context.user_id, row, object_cache, manifest_cache)
+                    for row in all_rows
+                ]
+                decoded_by_ordinal = {
+                    row["ordinal"]: decoded
+                    for row, decoded in zip(all_rows, decoded_all, strict=True)
+                }
+                decoded_page = [decoded_by_ordinal[row["ordinal"]] for row in page_rows]
                 selections = tuple(
                     BarSelection(
-                        bar=CompletedBar.model_validate(row["bar"]),
+                        bar=decoded,
                         origin="archive" if row["origin_kind"] != "active" else "active",
                         availability_at=row["availability_at"],
                         correction_observations=tuple(
@@ -583,7 +1389,7 @@ class MarketDataReader:
                             for item in row["correction_observations"]
                         ),
                     )
-                    for row in page_rows
+                    for row, decoded in zip(page_rows, decoded_page, strict=True)
                 )
                 last = page_rows[-1]["ordinal"] if page_rows else request.cursor.after_ordinal
                 next_cursor = (
@@ -607,26 +1413,13 @@ class MarketDataReader:
                     .mappings()
                     .one()
                 )
-                frozen_bars = [
-                    CompletedBar.model_validate(value)
-                    for value in c.execute(
-                        select(read_snapshot_bars.c.bar)
-                        .where(
-                            and_(
-                                read_snapshot_bars.c.owner_user_id == context.user_id,
-                                read_snapshot_bars.c.read_snapshot_id == request.cursor.snapshot_id,
-                            )
-                        )
-                        .order_by(read_snapshot_bars.c.ordinal)
-                    ).scalars()
-                ]
                 coverage = self._coverage(
                     c,
                     context,
                     sr,
                     request.coverage_start,
                     request.coverage_end,
-                    frozen_bars,
+                    decoded_all,
                     header["published_base_revision_id"]
                     if isinstance(request.policy, PinnedRead)
                     else None,
@@ -637,8 +1430,24 @@ class MarketDataReader:
                     next_cursor=next_cursor,
                     published_base_revision_id=header["published_base_revision_id"],
                 )
-        with self.catalog.engine.begin() as c:
-            sr = self.catalog._series_for(c, context.user_id, request.series_key)
+        with self._read_transaction() as c:
+            sr = (
+                c.execute(
+                    select(series).where(
+                        and_(
+                            series.c.owner_user_id == context.user_id,
+                            series.c.source == request.series_key.source,
+                            series.c.price_basis == request.series_key.price_basis,
+                            series.c.contract_id == request.series_key.contract_id,
+                            series.c.interval_seconds == request.series_key.interval_seconds,
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if sr is None:
+                raise not_found()
             archive_rows: list[CompletedBar] = []
             base = sr["latest_revision_id"]
             if isinstance(request.policy, PinnedRead):
@@ -651,17 +1460,21 @@ class MarketDataReader:
                     base,
                     include_history=isinstance(request.policy, CausalLatestRead),
                 )
+            self._inject("between_manifest_and_active_queries")
             active = []
             if not isinstance(request.policy, PinnedRead):
                 active = [
                     _bar(dict(r))
                     for r in c.execute(
-                        select(active_bars).where(
+                        select(active_bars)
+                        .where(
                             and_(
                                 active_bars.c.owner_user_id == context.user_id,
                                 active_bars.c.series_id == sr["series_id"],
                             )
                         )
+                        .order_by(active_bars.c.bar_record_id)
+                        .with_for_update(read=True)
                     ).mappings()
                 ]
             observations_by_start: dict[datetime, tuple[CorrectionObservation, ...]] = {}
@@ -837,6 +1650,11 @@ class MarketDataReader:
                 )
                 for b in chosen
             )
+            archive_references = (
+                self._archive_snapshot_references(c, context.user_id, base)
+                if base and archive_rows
+                else {}
+            )
             snapshot_id = str(uuid7())
             now = self.catalog._now()
             c.execute(
@@ -861,10 +1679,20 @@ class MarketDataReader:
                             "owner_user_id": context.user_id,
                             "read_snapshot_id": snapshot_id,
                             "ordinal": ordinal,
-                            "bar": selection.bar.model_dump(mode="json"),
-                            "origin_kind": "active"
-                            if selection.origin == "active"
-                            else "archive_object",
+                            "series_id": sr["series_id"],
+                            "start_at": selection.bar.start_at,
+                            "bar_record_id": selection.bar.bar_record_id,
+                            **(
+                                {
+                                    "origin_kind": "active",
+                                    "dataset_revision_id": None,
+                                    "object_id": None,
+                                    "source_ordinal": None,
+                                    "active_marker": True,
+                                }
+                                if selection.origin == "active"
+                                else archive_references[selection.bar.bar_record_id]
+                            ),
                             "availability_at": selection.availability_at,
                             "correction_observations": [
                                 item.model_dump(mode="json")
@@ -920,8 +1748,29 @@ class MarketDataReader:
                 ).scalars()
             )
         )
+        conflict_count = (
+            0
+            if revision_id is not None
+            else c.execute(
+                select(func.count())
+                .select_from(bar_conflicts)
+                .where(
+                    and_(
+                        bar_conflicts.c.owner_user_id == context.user_id,
+                        bar_conflicts.c.series_id == sr["series_id"],
+                        bar_conflicts.c.start_at >= start,
+                        bar_conflicts.c.start_at < end,
+                    )
+                )
+            ).scalar_one()
+        )
         spans: list[CoverageSpan] = []
-        counts = {"valid": 0, "missing": 0, "invalid": 0, "duplicate_conflict": 0}
+        counts = {
+            "valid": 0,
+            "missing": 0,
+            "invalid": 0,
+            "duplicate_conflict": conflict_count,
+        }
         step = timedelta(seconds=sr["interval_seconds"])
         for w in cal.windows:
             left = max(start, w.start_at)
@@ -1153,55 +2002,130 @@ class DatasetPublisher:
         effective_parent = request.expected_parent_revision_id
         terminal_error: MarketDataError | None = None
         resume_publication_id: str | None = None
-        with self.catalog.engine.begin() as admission:
+        fencing_token: int | None = None
+        with self.catalog.engine.begin() as root_transaction:
             replay = self.catalog._idempotent(
-                admission, context, "dataset.publish", idempotency_key, request
+                root_transaction, context, "dataset.publish", idempotency_key, request
             )
             if replay:
                 result = PublicationResult.model_validate(replay)
                 return result.model_copy(update={"replayed": True})
-            root = (
+        with (
+            self.catalog.engine.connect().execution_options(
+                isolation_level="SERIALIZABLE"
+            ) as admission,
+            admission.begin(),
+        ):
+            series_filter = and_(
+                series.c.owner_user_id == context.user_id,
+                series.c.source == request.series_key.source,
+                series.c.price_basis == request.series_key.price_basis,
+                series.c.contract_id == request.series_key.contract_id,
+                series.c.interval_seconds == request.series_key.interval_seconds,
+            )
+            series_identity = admission.execute(
+                select(series.c.series_id).where(series_filter)
+            ).scalar_one_or_none()
+            if series_identity is None:
+                raise not_found()
+            staged_root_keys = tuple(
                 admission.execute(
-                    select(idempotency).where(
+                    select(publications.c.idempotency_key)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == context.user_id,
+                            publications.c.series_id == series_identity,
+                            publications.c.state == "staged",
+                        )
+                    )
+                    .order_by(publications.c.idempotency_key)
+                ).scalars()
+            )
+            root_keys = tuple(sorted(set(staged_root_keys) | {idempotency_key}))
+            locked_roots = list(
+                admission.execute(
+                    select(idempotency)
+                    .where(
                         and_(
                             idempotency.c.owner_user_id == context.user_id,
                             idempotency.c.operation == "dataset.publish",
-                            idempotency.c.idempotency_key == idempotency_key,
+                            idempotency.c.idempotency_key.in_(root_keys),
                         )
                     )
+                    .order_by(idempotency.c.operation, idempotency.c.idempotency_key)
+                    .with_for_update()
+                ).mappings()
+            )
+            root = next(row for row in locked_roots if row["idempotency_key"] == idempotency_key)
+            fence_row = (
+                admission.execute(
+                    select(series_fences)
+                    .where(
+                        and_(
+                            series_fences.c.owner_user_id == context.user_id,
+                            series_fences.c.series_id == series_identity,
+                        )
+                    )
+                    .with_for_update()
                 )
                 .mappings()
                 .one()
             )
-            admitted_series = self.catalog._series_for(
-                admission, context.user_id, request.series_key
-            )
-            current_parent = admitted_series["latest_revision_id"]
-            now = self.catalog._now()
-            competing = list(
+            staged_publication_ids = tuple(
                 admission.execute(
-                    select(publications, idempotency)
-                    .join(
-                        idempotency,
-                        and_(
-                            idempotency.c.owner_user_id == publications.c.owner_user_id,
-                            idempotency.c.operation == "dataset.publish",
-                            idempotency.c.idempotency_key == publications.c.idempotency_key,
-                        ),
-                    )
+                    select(publications.c.publication_id)
                     .where(
                         and_(
                             publications.c.owner_user_id == context.user_id,
-                            publications.c.series_id == admitted_series["series_id"],
+                            publications.c.series_id == series_identity,
                             publications.c.state == "staged",
-                            publications.c.idempotency_key != idempotency_key,
-                            idempotency.c.state == "started",
                         )
                     )
-                    .order_by(idempotency.c.idempotency_key)
+                    .order_by(publications.c.publication_id)
+                ).scalars()
+            )
+            locked_publications = list(
+                admission.execute(
+                    select(publications)
+                    .where(publications.c.publication_id.in_(staged_publication_ids))
+                    .order_by(publications.c.publication_id)
                     .with_for_update()
                 ).mappings()
             )
+            admitted_series = (
+                admission.execute(select(series).where(series_filter).with_for_update())
+                .mappings()
+                .one()
+            )
+            stable_publications = tuple(
+                admission.execute(
+                    select(publications.c.publication_id)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == context.user_id,
+                            publications.c.series_id == series_identity,
+                            publications.c.state == "staged",
+                        )
+                    )
+                    .order_by(publications.c.publication_id)
+                ).scalars()
+            )
+            if stable_publications != staged_publication_ids:
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "Publication admission changed while locks were acquired.",
+                    409,
+                    retryable=True,
+                )
+            current_parent = admitted_series["latest_revision_id"]
+            now = self.catalog._now()
+            roots_by_key = {row["idempotency_key"]: row for row in locked_roots}
+            competing = [
+                {**publication, **roots_by_key[publication["idempotency_key"]]}
+                for publication in locked_publications
+                if publication["idempotency_key"] != idempotency_key
+                and roots_by_key[publication["idempotency_key"]]["state"] == "started"
+            ]
             if any(
                 competitor["lease_expires_at"] is not None and competitor["lease_expires_at"] > now
                 for competitor in competing
@@ -1217,7 +2141,12 @@ class DatasetPublisher:
                 admission.execute(
                     update(publications)
                     .where(publications.c.publication_id == stale_publication_id)
-                    .values(state="quarantined", safe_reason="DISPLACED", updated_at=now)
+                    .values(
+                        state="quarantined",
+                        safe_reason="DISPLACED",
+                        fencing_token=int(fence_row["fencing_token"]) + 1,
+                        updated_at=now,
+                    )
                 )
                 admission.execute(
                     update(publication_retention_conversions)
@@ -1339,6 +2268,7 @@ class DatasetPublisher:
                             .values(
                                 state="quarantined",
                                 safe_reason="DISPLACED",
+                                fencing_token=int(fence_row["fencing_token"]) + 1,
                                 updated_at=now,
                             )
                         )
@@ -1391,6 +2321,22 @@ class DatasetPublisher:
                                 updated_at=now,
                             )
                         )
+            if terminal_error is None and resume_publication_id is None:
+                fencing_token = int(fence_row["fencing_token"]) + 1
+                admission.execute(
+                    update(series_fences)
+                    .where(
+                        and_(
+                            series_fences.c.owner_user_id == context.user_id,
+                            series_fences.c.series_id == series_identity,
+                        )
+                    )
+                    .values(
+                        fencing_token=fencing_token,
+                        holder=self.worker_id,
+                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    )
+                )
         if terminal_error is not None:
             raise terminal_error
         if resume_publication_id is not None:
@@ -1412,8 +2358,17 @@ class DatasetPublisher:
                     )
                 ).scalar_one()
             return PublicationResult.model_validate(saved).model_copy(update={"replayed": True})
-        with self.catalog.engine.connect() as c:
-            sr = self.catalog._series_for(c, context.user_id, request.series_key)
+        if fencing_token is None:
+            raise MarketDataError(
+                MarketDataCode.DEPENDENCY_UNAVAILABLE,
+                "Publication control transaction did not allocate a fence.",
+                503,
+                retryable=True,
+            )
+        with self.catalog.engine.connect().execution_options(
+            isolation_level="REPEATABLE READ"
+        ) as c:
+            sr = c.execute(select(series).where(series_filter)).mappings().one()
             if sr["latest_revision_id"] != effective_parent:
                 raise MarketDataError(
                     MarketDataCode.STALE_VERSION, "Publication parent is stale.", 409
@@ -1534,36 +2489,6 @@ class DatasetPublisher:
                     )
                 return match
 
-            fence = (
-                c.execute(
-                    select(series_fences)
-                    .where(
-                        and_(
-                            series_fences.c.owner_user_id == context.user_id,
-                            series_fences.c.series_id == sr["series_id"],
-                        )
-                    )
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
-            fencing_token = fence["fencing_token"] + 1
-            c.execute(
-                update(series_fences)
-                .where(
-                    and_(
-                        series_fences.c.owner_user_id == context.user_id,
-                        series_fences.c.series_id == sr["series_id"],
-                    )
-                )
-                .values(
-                    fencing_token=fencing_token,
-                    holder=self.worker_id,
-                    lease_expires_at=self.catalog._now() + timedelta(seconds=self.lease_seconds),
-                )
-            )
-            c.commit()
             self._inject("after_stale_takeover_commit_before_snapshot")
 
             def check_fence() -> None:
@@ -1589,17 +2514,25 @@ class DatasetPublisher:
 
             if parent_revision is not None:
                 try:
-                    parent_rows = _archive_rows_from_revision(
-                        self.store, context.user_id, dict(parent_row)
+                    parent_rows = _verify_catalog_reconstruction_dag(
+                        c,
+                        self.store,
+                        context.user_id,
+                        parent_revision.dataset_revision_id,
                     )
-                except MarketDataError as error:
-                    if error.code == MarketDataCode.ARCHIVE_INTEGRITY:
-                        _quarantine_dependency_closure(
-                            self.catalog,
-                            context.user_id,
-                            parent_revision.dataset_revision_id,
-                        )
-                    raise
+                except (MarketDataError, KeyError, TypeError, ValueError) as error:
+                    _quarantine_dependency_closure(
+                        self.catalog,
+                        context.user_id,
+                        parent_revision.dataset_revision_id,
+                    )
+                    if isinstance(error, MarketDataError):
+                        raise
+                    raise MarketDataError(
+                        MarketDataCode.ARCHIVE_INTEGRITY,
+                        "Publication parent reconstruction closure is invalid.",
+                        500,
+                    ) from error
             by = {bar.start_at: bar for bar in parent_rows}
             for b in active_rows:
                 by[b.start_at] = b
@@ -1844,6 +2777,147 @@ class DatasetPublisher:
             )
             prior_rows = 0 if parent_revision is None else parent_revision.restore_closure_row_count
             prior_bytes = 0 if parent_revision is None else parent_revision.restore_closure_bytes
+            known_database_closure = (
+                set()
+                if parent_revision is None
+                else _catalog_reconstruction_ids(
+                    c, context.user_id, {parent_revision.dataset_revision_id}
+                )
+            )
+            known_object_ids = (
+                set(
+                    c.execute(
+                        select(revision_partitions.c.object_id).where(
+                            and_(
+                                revision_partitions.c.owner_user_id == context.user_id,
+                                revision_partitions.c.dataset_revision_id.in_(
+                                    tuple(known_database_closure)
+                                ),
+                            )
+                        )
+                    ).scalars()
+                )
+                if known_database_closure
+                else set()
+            )
+            planned_bar_ids = {
+                chain_bar.bar_record_id
+                for selection, _ in planned
+                for selected_bar in selection
+                for chain_bar in versions_by_start[selected_bar.start_at].values()
+                if chain_bar.source_revision <= selected_bar.source_revision
+            }
+            aggregate_lineage_by_bar: dict[str, list[dict[str, Any]]] = {
+                bar_record_id: [] for bar_record_id in planned_bar_ids
+            }
+            if planned_bar_ids:
+                component_rows = list(
+                    c.execute(
+                        select(
+                            aggregate_components.c.derived_bar_record_id,
+                            aggregate_components.c.ordinal,
+                            aggregate_components.c.source_bar_record_id,
+                            aggregate_components.c.source_dataset_revision_id,
+                            dataset_revisions.c.manifest_uri.label("source_manifest_uri"),
+                            dataset_revisions.c.manifest_sha256.label("source_manifest_sha256"),
+                            dataset_revisions.c.manifest_byte_length.label(
+                                "source_manifest_byte_length"
+                            ),
+                        )
+                        .join(
+                            dataset_revisions,
+                            and_(
+                                dataset_revisions.c.owner_user_id
+                                == aggregate_components.c.owner_user_id,
+                                dataset_revisions.c.dataset_revision_id
+                                == aggregate_components.c.source_dataset_revision_id,
+                            ),
+                        )
+                        .where(
+                            and_(
+                                aggregate_components.c.owner_user_id == context.user_id,
+                                aggregate_components.c.derived_bar_record_id.in_(
+                                    tuple(planned_bar_ids)
+                                ),
+                            )
+                        )
+                        .order_by(
+                            aggregate_components.c.derived_bar_record_id,
+                            aggregate_components.c.ordinal,
+                        )
+                    ).mappings()
+                )
+                for component in component_rows:
+                    aggregate_lineage_by_bar[component["derived_bar_record_id"]].append(
+                        {
+                            name: value
+                            for name, value in component.items()
+                            if name != "derived_bar_record_id"
+                        }
+                    )
+            dependency_seeds = {
+                component["source_dataset_revision_id"]
+                for components in aggregate_lineage_by_bar.values()
+                for component in components
+            }
+            dependency_closure_by_seed: dict[str, set[str]] = {}
+            for dependency_id in sorted(dependency_seeds):
+                _verify_catalog_reconstruction_dag(c, self.store, context.user_id, dependency_id)
+                dependency_closure_by_seed[dependency_id] = _catalog_reconstruction_ids(
+                    c, context.user_id, {dependency_id}
+                )
+            all_dependency_ids = (
+                set().union(*dependency_closure_by_seed.values())
+                if dependency_closure_by_seed
+                else set()
+            )
+            dependency_row_counts: dict[str, int] = {}
+            dependency_objects_by_revision: dict[str, list[dict[str, Any]]] = {}
+            if all_dependency_ids:
+                dependency_row_counts = {
+                    revision: int(count)
+                    for revision, count in c.execute(
+                        select(
+                            revision_bars.c.dataset_revision_id,
+                            func.count(),
+                        )
+                        .where(
+                            and_(
+                                revision_bars.c.owner_user_id == context.user_id,
+                                revision_bars.c.dataset_revision_id.in_(tuple(all_dependency_ids)),
+                            )
+                        )
+                        .group_by(revision_bars.c.dataset_revision_id)
+                    )
+                }
+                for dependency_object in c.execute(
+                    select(
+                        revision_partitions.c.dataset_revision_id,
+                        archive_objects.c.object_id,
+                        archive_objects.c.byte_length,
+                    )
+                    .join(
+                        archive_objects,
+                        and_(
+                            archive_objects.c.owner_user_id == revision_partitions.c.owner_user_id,
+                            archive_objects.c.object_id == revision_partitions.c.object_id,
+                        ),
+                    )
+                    .where(
+                        and_(
+                            revision_partitions.c.owner_user_id == context.user_id,
+                            revision_partitions.c.dataset_revision_id.in_(
+                                tuple(all_dependency_ids)
+                            ),
+                        )
+                    )
+                ).mappings():
+                    dependency_objects_by_revision.setdefault(
+                        dependency_object["dataset_revision_id"], []
+                    ).append(dict(dependency_object))
+            # The repeatable-read snapshot is now fully materialized.  Parquet
+            # encoding, hashing, and filesystem writes must not hold a DB transaction.
+            c.commit()
             for ordinal, (selection, kind) in enumerate(planned):
                 planned_revision_id = revision_id if kind == "final" else str(uuid7())
                 grouped: dict[Any, list[CompletedBar]] = {}
@@ -1893,6 +2967,9 @@ class DatasetPublisher:
                 is_rollover = kind == "rollover"
                 parent_id = None if is_rollover else prior_id
                 depth = 0 if is_rollover else prior_depth + 1
+                if is_rollover:
+                    known_database_closure = set()
+                    known_object_ids = {ref.object_id for ref in partition_refs}
                 closure_count = 1 if is_rollover else prior_count + 1
                 closure_rows = len(selection) if is_rollover else prior_rows + len(selection)
                 written_bytes = sum(len(value["data"]) for value in object_items)
@@ -1927,39 +3004,7 @@ class DatasetPublisher:
                         )
                     for index, chain_bar in enumerate(chain):
                         registry = registry_rows[chain_bar.bar_record_id]
-                        aggregate_lineage = list(
-                            c.execute(
-                                select(
-                                    aggregate_components.c.ordinal,
-                                    aggregate_components.c.source_bar_record_id,
-                                    aggregate_components.c.source_dataset_revision_id,
-                                    dataset_revisions.c.manifest_uri.label("source_manifest_uri"),
-                                    dataset_revisions.c.manifest_sha256.label(
-                                        "source_manifest_sha256"
-                                    ),
-                                    dataset_revisions.c.manifest_byte_length.label(
-                                        "source_manifest_byte_length"
-                                    ),
-                                )
-                                .join(
-                                    dataset_revisions,
-                                    and_(
-                                        dataset_revisions.c.owner_user_id
-                                        == aggregate_components.c.owner_user_id,
-                                        dataset_revisions.c.dataset_revision_id
-                                        == aggregate_components.c.source_dataset_revision_id,
-                                    ),
-                                )
-                                .where(
-                                    and_(
-                                        aggregate_components.c.owner_user_id == context.user_id,
-                                        aggregate_components.c.derived_bar_record_id
-                                        == chain_bar.bar_record_id,
-                                    )
-                                )
-                                .order_by(aggregate_components.c.ordinal)
-                            ).mappings()
-                        )
+                        aggregate_lineage = aggregate_lineage_by_bar[chain_bar.bar_record_id]
                         local_chain_records.append(
                             {
                                 "completed_bar": chain_bar.model_dump(mode="json"),
@@ -1994,6 +3039,41 @@ class DatasetPublisher:
                                 )
                             )
                 watermark_bar = max(selection, key=lambda bar: (bar.received_at, bar.bar_record_id))
+                local_dependency_seeds = {
+                    component["source_dataset_revision_id"]
+                    for record in local_chain_records
+                    for component in record["aggregate_components"]
+                }
+                dependency_closure = (
+                    set().union(
+                        *(dependency_closure_by_seed[item] for item in local_dependency_seeds)
+                    )
+                    if local_dependency_seeds
+                    else set()
+                )
+                new_dependency_ids = dependency_closure - known_database_closure
+                if new_dependency_ids:
+                    closure_count += len(new_dependency_ids)
+                    closure_rows += sum(dependency_row_counts[item] for item in new_dependency_ids)
+                    dependency_objects = {
+                        item["object_id"]: item
+                        for revision in new_dependency_ids
+                        for item in dependency_objects_by_revision[revision]
+                    }.values()
+                    closure_bytes += sum(
+                        item["byte_length"]
+                        for item in dependency_objects
+                        if item["object_id"] not in known_object_ids
+                    )
+                    known_object_ids.update(item["object_id"] for item in dependency_objects)
+                    known_database_closure.update(new_dependency_ids)
+                known_object_ids.update(ref.object_id for ref in partition_refs)
+                if closure_count > 1000 or closure_rows > 2_000_000 or closure_bytes > 10 * 1024**3:
+                    raise MarketDataError(
+                        MarketDataCode.VALIDATION_ERROR,
+                        "Publication reconstruction DAG exceeds bounds.",
+                        422,
+                    )
                 projection: dict[str, Any] = {
                     "schema_version": "v1",
                     "dataset_revision_id": planned_revision_id,
@@ -2045,6 +3125,7 @@ class DatasetPublisher:
                     "origin_publication_id": publication_id,
                     "origin_publication_ordinal": ordinal,
                     "contract_projection": contract_projection.model_dump(mode="json"),
+                    "contract_projection_sha256": canonical_sha256(contract_projection),
                     "calendar_projection": calendar.model_dump(mode="json"),
                 }
                 manifest = canonical_json_bytes(projection)
@@ -2268,7 +3349,13 @@ class DatasetPublisher:
                             "ordinal": index,
                             "series_id": sr["series_id"],
                             "start_at": bar.start_at,
+                            "source_revision": bar.source_revision,
                             "bar_record_id": bar.bar_record_id,
+                            "object_id": next(
+                                ref.object_id
+                                for ref in item["revision"].partition_refs
+                                if ref.min_start_at <= bar.start_at < ref.max_end_at
+                            ),
                         }
                         for index, bar in enumerate(item["selection"])
                     ],
@@ -2447,6 +3534,7 @@ class DatasetPublisher:
 
         try:
             document = json.loads(manifest)
+            _validate_manifest_schema(document)
             _validate_manifest_correction_history(document)
             revision_payload = {
                 name: document[name]
@@ -2507,6 +3595,7 @@ class DatasetPublisher:
                 )
             try:
                 parent_document = json.loads(parent_bytes)
+                _validate_manifest_schema(parent_document)
                 _validate_manifest_correction_history(parent_document)
                 parent_payload = {
                     name: parent_document[name]
@@ -2584,6 +3673,7 @@ class DatasetPublisher:
                     )
                 try:
                     dependency_document = json.loads(dependency_bytes)
+                    _validate_manifest_schema(dependency_document)
                     _validate_manifest_correction_history(dependency_document)
                     dependency_payload = {
                         name: dependency_document[name]
@@ -2647,6 +3737,7 @@ class DatasetPublisher:
                         )
                     try:
                         parsed_document = json.loads(parent_bytes)
+                        _validate_manifest_schema(parsed_document)
                         _validate_manifest_correction_history(parsed_document)
                         parsed_payload = {
                             name: parsed_document[name]
@@ -2734,26 +3825,83 @@ class DatasetPublisher:
         for closure_revision, _, _ in closure:
             for ref in closure_revision.partition_refs:
                 self.store.read_verified(context.user_id, ref.uri, ref.sha256, ref.byte_length)
-        for dependency_revision_id, dependency_uri, dependency_sha in dependency_order:
-            with self.catalog.engine.begin() as dependency_check:
-                dependency_exists = dependency_check.execute(
-                    select(dataset_revisions.c.dataset_revision_id).where(
-                        and_(
-                            dataset_revisions.c.owner_user_id == context.user_id,
-                            dataset_revisions.c.dataset_revision_id == dependency_revision_id,
-                        )
-                    )
-                ).scalar()
-            if dependency_exists is None:
-                self.restore_retained_manifest(
-                    context,
-                    RetainedManifestRestoreRequest(
-                        manifest_uri=dependency_uri,
-                        expected_manifest_sha256=dependency_sha,
-                    ),
-                    idempotency_key=str(uuid7()),
+        manifest_nodes: dict[str, tuple[DatasetRevision, dict[str, Any]]] = {
+            item.dataset_revision_id: (item, item_document) for item, item_document, _ in closure
+        }
+        for _, _, dependency_chain in dependency_cache.values():
+            for dependency_revision, dependency_document in dependency_chain:
+                manifest_nodes[dependency_revision.dataset_revision_id] = (
+                    dependency_revision,
+                    dependency_document,
                 )
-        with self.catalog.engine.begin() as c:
+        calculated_closures: dict[str, set[str]] = {}
+
+        def calculate_closure(revision_id: str, active: set[str]) -> set[str]:
+            if revision_id in calculated_closures:
+                return calculated_closures[revision_id]
+            if revision_id in active or revision_id not in manifest_nodes:
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "Retained manifest reconstruction graph is incomplete or cyclic.",
+                    500,
+                )
+            active.add(revision_id)
+            node_revision, node_document = manifest_nodes[revision_id]
+            result = {revision_id}
+            if node_revision.parent_revision_id is not None:
+                result.update(calculate_closure(node_revision.parent_revision_id, active))
+            for chain_item in node_document["correction_chain_records"]:
+                for component in chain_item["aggregate_components"]:
+                    result.update(
+                        calculate_closure(component["source_dataset_revision_id"], active)
+                    )
+            active.remove(revision_id)
+            calculated_closures[revision_id] = result
+            unique_objects = {
+                ref.object_id: ref
+                for member in result
+                for ref in manifest_nodes[member][0].partition_refs
+            }
+            if (
+                node_revision.restore_closure_revision_count != len(result)
+                or node_revision.restore_closure_row_count
+                != sum(len(manifest_nodes[member][1]["selected_bars"]) for member in result)
+                or node_revision.restore_closure_bytes
+                != sum(ref.byte_length for ref in unique_objects.values())
+            ):
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "Retained manifest reconstruction summaries differ.",
+                    500,
+                )
+            return result
+
+        for node_id, (node_revision, node_document) in manifest_nodes.items():
+            calculate_closure(node_id, set())
+            decoded = _archive_rows_from_revision(
+                self.store,
+                context.user_id,
+                {
+                    "manifest_uri": node_revision.manifest_uri,
+                    "manifest_sha256": node_revision.manifest_sha256,
+                    "manifest_byte_length": node_revision.manifest_byte_length,
+                },
+            )
+            expected_rows = [
+                CompletedBar.model_validate(item) for item in node_document["selected_bars"]
+            ]
+            if decoded != expected_rows:
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "Retained manifest Parquet rows differ from its selection.",
+                    500,
+                )
+        self._inject("restore_after_preflight_before_transaction")
+        committed_result: RestoreResult | None = None
+        with (
+            self.catalog.engine.connect().execution_options(isolation_level="SERIALIZABLE") as c,
+            c.begin(),
+        ):
             existing = (
                 c.execute(
                     select(dataset_revisions).where(
@@ -2876,6 +4024,256 @@ class DatasetPublisher:
                 create=True,
             )
             restored = 0
+
+            def restore_dependency_revision(
+                dependency_revision: DatasetRevision, dependency_document: dict[str, Any]
+            ) -> None:
+                nonlocal restored
+                existing_dependency = c.execute(
+                    select(dataset_revisions.c.manifest_sha256).where(
+                        and_(
+                            dataset_revisions.c.owner_user_id == context.user_id,
+                            dataset_revisions.c.dataset_revision_id
+                            == dependency_revision.dataset_revision_id,
+                        )
+                    )
+                ).scalar()
+                if existing_dependency is not None:
+                    if existing_dependency != dependency_revision.manifest_sha256:
+                        raise MarketDataError(
+                            MarketDataCode.ARCHIVE_INTEGRITY,
+                            "Aggregate dependency digest conflicts with catalog.",
+                            500,
+                        )
+                    return
+                dependency_calendar = CalendarVersion.model_validate(
+                    dependency_document["calendar_projection"]
+                )
+                dependency_contract = FuturesContract.model_validate(
+                    dependency_document["contract_projection"]
+                )
+                calendar_hash = c.execute(
+                    select(calendar_versions.c.payload_sha256).where(
+                        and_(
+                            calendar_versions.c.owner_user_id == context.user_id,
+                            calendar_versions.c.calendar_id == dependency_calendar.calendar_id,
+                            calendar_versions.c.calendar_version
+                            == dependency_calendar.calendar_version,
+                        )
+                    )
+                ).scalar()
+                contract_hash = c.execute(
+                    select(contract_versions.c.projection_sha256).where(
+                        and_(
+                            contract_versions.c.owner_user_id == context.user_id,
+                            contract_versions.c.contract_id == dependency_contract.contract_id,
+                            contract_versions.c.contract_version
+                            == dependency_contract.record_version,
+                        )
+                    )
+                ).scalar()
+                if calendar_hash != canonical_sha256(
+                    dependency_calendar
+                ) or contract_hash != canonical_sha256(dependency_contract):
+                    raise MarketDataError(
+                        MarketDataCode.ARCHIVE_INTEGRITY,
+                        "Aggregate dependency metadata binding is unavailable.",
+                        500,
+                    )
+                dependency_series = self.catalog._series_for(
+                    c,
+                    context.user_id,
+                    SeriesKey(
+                        **dependency_revision.series_key.model_dump(exclude={"owner_user_id"})
+                    ),
+                    create=True,
+                )
+                for chain_item in dependency_document.get("correction_chain_records", []):
+                    chain_bar = CompletedBar.model_validate(chain_item["completed_bar"])
+                    insertion = c.execute(
+                        pg_insert(bar_versions)
+                        .values(
+                            owner_user_id=context.user_id,
+                            bar_record_id=chain_bar.bar_record_id,
+                            schema_version="v1",
+                            series_id=dependency_series["series_id"],
+                            start_at=chain_bar.start_at,
+                            source_revision=chain_bar.source_revision,
+                            payload_hash=chain_item["payload_sha256"],
+                            supersedes_bar_record_id=chain_item["supersedes_bar_record_id"],
+                            correction_reason=chain_item["correction_reason"],
+                            aggregate_lineage_sha256=chain_item["aggregate_lineage_sha256"],
+                            version_fingerprint_sha256=chain_item["version_fingerprint_sha256"],
+                            received_at=chain_bar.received_at,
+                            quality="valid",
+                            created_at=chain_bar.created_at,
+                            record_version=1,
+                        )
+                        .on_conflict_do_nothing()
+                    )
+                    restored += insertion.rowcount
+                for ref in dependency_revision.partition_refs:
+                    insertion = c.execute(
+                        pg_insert(archive_objects)
+                        .values(
+                            owner_user_id=context.user_id,
+                            object_id=ref.object_id,
+                            series_id=dependency_series["series_id"],
+                            uri=ref.uri,
+                            sha256=ref.sha256,
+                            byte_length=ref.byte_length,
+                            row_count=ref.row_count,
+                            min_start_at=ref.min_start_at,
+                            max_end_at=ref.max_end_at,
+                            min_source_revision=ref.min_source_revision,
+                            max_source_revision=ref.max_source_revision,
+                            state="published",
+                            origin_publication_id=ref.origin_publication_id,
+                            publication_id=None,
+                            catalog_origin="retained_manifest",
+                        )
+                        .on_conflict_do_nothing()
+                    )
+                    restored += insertion.rowcount
+                c.execute(
+                    insert(dataset_revisions).values(
+                        owner_user_id=context.user_id,
+                        dataset_revision_id=dependency_revision.dataset_revision_id,
+                        schema_version="v1",
+                        series_id=dependency_series["series_id"],
+                        contract_version=dependency_revision.contract_version,
+                        calendar_id=dependency_revision.calendar_id,
+                        calendar_version=dependency_revision.calendar_version,
+                        projection=dependency_revision.model_dump(mode="json"),
+                        parent_revision_id=dependency_revision.parent_revision_id,
+                        manifest_uri=dependency_revision.manifest_uri,
+                        manifest_sha256=dependency_revision.manifest_sha256,
+                        manifest_byte_length=dependency_revision.manifest_byte_length,
+                        coverage_start=dependency_revision.coverage_start,
+                        coverage_end=dependency_revision.coverage_end,
+                        source_watermark=dependency_revision.source_watermark.model_dump(
+                            mode="json"
+                        ),
+                        correction_refs=[
+                            item.model_dump(mode="json")
+                            for item in dependency_revision.correction_refs
+                        ],
+                        status="published",
+                        created_at=dependency_revision.created_at,
+                        published_at=dependency_revision.published_at,
+                        parent_depth=dependency_revision.parent_depth,
+                        restore_closure_revision_count=dependency_revision.restore_closure_revision_count,
+                        restore_closure_row_count=dependency_revision.restore_closure_row_count,
+                        restore_closure_bytes=dependency_revision.restore_closure_bytes,
+                        rollover_from_revision_id=dependency_revision.rollover_from_revision_id,
+                        rollover_from_manifest_uri=dependency_revision.rollover_from_manifest_uri,
+                        rollover_from_manifest_sha256=dependency_revision.rollover_from_manifest_sha256,
+                        recovery_from_quarantined_revision_id=dependency_revision.recovery_from_quarantined_revision_id,
+                        recovery_from_manifest_uri=dependency_revision.recovery_from_manifest_uri,
+                        recovery_from_manifest_sha256=dependency_revision.recovery_from_manifest_sha256,
+                        record_version=dependency_revision.record_version,
+                    )
+                )
+                restored += 1
+                selected_dependency_bars = [
+                    CompletedBar.model_validate(item)
+                    for item in dependency_document["selected_bars"]
+                ]
+                if selected_dependency_bars:
+                    c.execute(
+                        insert(revision_bars),
+                        [
+                            {
+                                "owner_user_id": context.user_id,
+                                "dataset_revision_id": dependency_revision.dataset_revision_id,
+                                "ordinal": ordinal,
+                                "series_id": dependency_series["series_id"],
+                                "start_at": bar.start_at,
+                                "source_revision": bar.source_revision,
+                                "bar_record_id": bar.bar_record_id,
+                                "object_id": next(
+                                    ref.object_id
+                                    for ref in dependency_revision.partition_refs
+                                    if ref.min_start_at <= bar.start_at < ref.max_end_at
+                                ),
+                            }
+                            for ordinal, bar in enumerate(selected_dependency_bars)
+                        ],
+                    )
+                    restored += len(selected_dependency_bars)
+                if dependency_revision.partition_refs:
+                    c.execute(
+                        insert(revision_partitions),
+                        [
+                            {
+                                "owner_user_id": context.user_id,
+                                "dataset_revision_id": dependency_revision.dataset_revision_id,
+                                "ordinal": ordinal,
+                                "object_id": ref.object_id,
+                            }
+                            for ordinal, ref in enumerate(dependency_revision.partition_refs)
+                        ],
+                    )
+                    restored += len(dependency_revision.partition_refs)
+                if dependency_revision.correction_refs:
+                    c.execute(
+                        insert(correction_ref_rows),
+                        [
+                            {
+                                "owner_user_id": context.user_id,
+                                "dataset_revision_id": dependency_revision.dataset_revision_id,
+                                "ordinal": ordinal,
+                                "old_bar_record_id": item.old_bar_record_id,
+                                "new_bar_record_id": item.new_bar_record_id,
+                                "reason": item.reason,
+                                "received_at": item.received_at,
+                            }
+                            for ordinal, item in enumerate(dependency_revision.correction_refs)
+                        ],
+                    )
+                    restored += len(dependency_revision.correction_refs)
+                for chain_item in dependency_document.get("correction_chain_records", []):
+                    for component in chain_item.get("aggregate_components", []):
+                        insertion = c.execute(
+                            pg_insert(aggregate_components)
+                            .values(
+                                owner_user_id=context.user_id,
+                                derived_bar_record_id=chain_item["bar_record_id"],
+                                ordinal=component["ordinal"],
+                                source_bar_record_id=component["source_bar_record_id"],
+                                source_dataset_revision_id=component["source_dataset_revision_id"],
+                            )
+                            .on_conflict_do_nothing()
+                        )
+                        restored += insertion.rowcount
+
+            restored_dependency_revisions: set[str] = set()
+            for dependency_revision_id, _, _ in dependency_order:
+                dependency_root, _, dependency_chain = dependency_cache[dependency_revision_id]
+                for dependency_revision, dependency_document in dependency_chain:
+                    if dependency_revision.dataset_revision_id in restored_dependency_revisions:
+                        continue
+                    restore_dependency_revision(dependency_revision, dependency_document)
+                    restored_dependency_revisions.add(dependency_revision.dataset_revision_id)
+                dependency_series = self.catalog._series_for(
+                    c,
+                    context.user_id,
+                    SeriesKey(**dependency_root.series_key.model_dump(exclude={"owner_user_id"})),
+                )
+                if dependency_series["latest_revision_id"] is None:
+                    c.execute(
+                        update(series)
+                        .where(
+                            and_(
+                                series.c.owner_user_id == context.user_id,
+                                series.c.series_id == dependency_series["series_id"],
+                            )
+                        )
+                        .values(
+                            latest_revision_id=dependency_root.dataset_revision_id,
+                            record_version=series.c.record_version + 1,
+                        )
+                    )
             for ancestor, ancestor_document, ancestor_bars in closure[:-1]:
                 if c.execute(
                     select(dataset_revisions.c.dataset_revision_id).where(
@@ -2991,7 +4389,13 @@ class DatasetPublisher:
                             "ordinal": ordinal,
                             "series_id": sr["series_id"],
                             "start_at": bar.start_at,
+                            "source_revision": bar.source_revision,
                             "bar_record_id": bar.bar_record_id,
+                            "object_id": next(
+                                ref.object_id
+                                for ref in ancestor.partition_refs
+                                if ref.min_start_at <= bar.start_at < ref.max_end_at
+                            ),
                         }
                         for ordinal, bar in enumerate(ancestor_bars)
                     ],
@@ -3187,7 +4591,13 @@ class DatasetPublisher:
                         ordinal=ordinal,
                         series_id=sr["series_id"],
                         start_at=bar.start_at,
+                        source_revision=bar.source_revision,
                         bar_record_id=bar.bar_record_id,
+                        object_id=next(
+                            ref.object_id
+                            for ref in revision.partition_refs
+                            if ref.min_start_at <= bar.start_at < ref.max_end_at
+                        ),
                     )
                 )
                 restored += 1
@@ -3260,7 +4670,12 @@ class DatasetPublisher:
                 idempotency_key,
                 result,
             )
-            return result
+            self._inject("restore_during_transaction_before_commit")
+            committed_result = result
+        self._inject("restore_after_transaction_commit")
+        if committed_result is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("restore transaction completed without a result")
+        return committed_result
 
     def recover_quarantined_latest(
         self,
@@ -3350,6 +4765,7 @@ class DatasetPublisher:
 
         try:
             source_document = json.loads(source_manifest)
+            _validate_manifest_schema(source_document)
             _validate_manifest_correction_history(source_document)
             if source_document["dataset_revision_id"] != request.quarantined_revision_id:
                 raise ValueError
@@ -3461,7 +4877,12 @@ class DatasetPublisher:
             CompletedBar.model_validate(item) for item in source_document["selected_bars"]
         ]
         final_selection = [
-            {"start_at": row["start_at"], "bar_record_id": row["bar_record_id"]} for row in selected
+            {
+                "start_at": row["start_at"],
+                "source_revision": row["source_revision"],
+                "bar_record_id": row["bar_record_id"],
+            }
+            for row in selected
         ]
         recovery_chain_records = list(source_document.get("correction_chain_records", []))
         recovery_correction_refs = list(source_projection.correction_refs)
@@ -3625,7 +5046,11 @@ class DatasetPublisher:
                         )
                     )
             recovered_selection = [
-                {"start_at": item.start_at, "bar_record_id": item.bar_record_id}
+                {
+                    "start_at": item.start_at,
+                    "source_revision": item.source_revision,
+                    "bar_record_id": item.bar_record_id,
+                }
                 for item in recovery_bars
             ]
             final_selection = recovered_selection
@@ -3694,6 +5119,54 @@ class DatasetPublisher:
             )
         now = self.catalog._now()
         manifest_uri = f"ft-archive://manifest/{revision_id}"
+        dependency_revision_count = 0
+        dependency_row_count = 0
+        dependency_object_bytes = 0
+        if aggregate_sources:
+            healthy_ids = {
+                item["healthy_revision"]["dataset_revision_id"]
+                for item in aggregate_sources.values()
+            }
+            with self.catalog.engine.begin() as closure_connection:
+                dependency_ids = _catalog_reconstruction_ids(
+                    closure_connection, context.user_id, healthy_ids
+                )
+                dependency_revision_count = len(dependency_ids)
+                dependency_row_count = int(
+                    closure_connection.execute(
+                        select(func.count())
+                        .select_from(revision_bars)
+                        .where(
+                            and_(
+                                revision_bars.c.owner_user_id == context.user_id,
+                                revision_bars.c.dataset_revision_id.in_(dependency_ids),
+                            )
+                        )
+                    ).scalar_one()
+                )
+                dependency_objects = list(
+                    closure_connection.execute(
+                        select(archive_objects.c.object_id, archive_objects.c.byte_length)
+                        .join(
+                            revision_partitions,
+                            and_(
+                                revision_partitions.c.owner_user_id
+                                == archive_objects.c.owner_user_id,
+                                revision_partitions.c.object_id == archive_objects.c.object_id,
+                            ),
+                        )
+                        .where(
+                            and_(
+                                revision_partitions.c.owner_user_id == context.user_id,
+                                revision_partitions.c.dataset_revision_id.in_(dependency_ids),
+                            )
+                        )
+                        .distinct()
+                    ).mappings()
+                )
+                dependency_object_bytes = sum(
+                    int(item["byte_length"]) for item in dependency_objects
+                )
         projection = source_projection.model_dump(
             mode="json", exclude={"manifest_sha256", "manifest_byte_length"}
         )
@@ -3708,9 +5181,10 @@ class DatasetPublisher:
             created_at=now,
             published_at=now,
             parent_depth=0,
-            restore_closure_revision_count=1,
-            restore_closure_row_count=len(final_selection),
-            restore_closure_bytes=sum(item.byte_length for item in partition_refs),
+            restore_closure_revision_count=1 + dependency_revision_count,
+            restore_closure_row_count=len(final_selection) + dependency_row_count,
+            restore_closure_bytes=sum(item.byte_length for item in partition_refs)
+            + dependency_object_bytes,
             rollover_from_revision_id=None,
             rollover_from_manifest_uri=None,
             rollover_from_manifest_sha256=None,
@@ -3733,6 +5207,9 @@ class DatasetPublisher:
             format_version="ft-dataset-manifest-v1",
             origin_publication_id=publication_id,
             origin_publication_ordinal=0,
+            contract_projection=source_document["contract_projection"],
+            contract_projection_sha256=source_document["contract_projection_sha256"],
+            calendar_projection=source_document["calendar_projection"],
         )
         manifest = canonical_json_bytes(projection)
         manifest_sha = hashlib.sha256(manifest).hexdigest()
@@ -3767,6 +5244,46 @@ class DatasetPublisher:
         )
         self._inject("after_rename_fsync_before_publish_tx")
         with self.catalog.engine.begin() as c:
+            c.execute(
+                select(idempotency.c.idempotency_key)
+                .where(
+                    and_(
+                        idempotency.c.owner_user_id == context.user_id,
+                        idempotency.c.operation == "dataset.recover_quarantined_latest",
+                        idempotency.c.idempotency_key == idempotency_key,
+                    )
+                )
+                .with_for_update()
+            ).one()
+            fence = (
+                c.execute(
+                    select(series_fences)
+                    .where(
+                        and_(
+                            series_fences.c.owner_user_id == context.user_id,
+                            series_fences.c.series_id == source["series_id"],
+                        )
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            fresh_fence = int(fence["fencing_token"]) + 1
+            c.execute(
+                update(series_fences)
+                .where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == source["series_id"],
+                    )
+                )
+                .values(
+                    fencing_token=fresh_fence,
+                    holder=self.worker_id,
+                    lease_expires_at=self.catalog._now() + timedelta(seconds=self.lease_seconds),
+                )
+            )
             locked = (
                 c.execute(
                     select(series)
@@ -3800,7 +5317,7 @@ class DatasetPublisher:
                     snapshot_sha256=hashlib.sha256(
                         canonical_json_bytes([row["bar_record_id"] for row in final_selection])
                     ).hexdigest(),
-                    fencing_token=0,
+                    fencing_token=fresh_fence,
                     state="published",
                     created_at=now,
                     updated_at=now,
@@ -3886,7 +5403,13 @@ class DatasetPublisher:
                         "ordinal": ordinal,
                         "series_id": source["series_id"],
                         "start_at": row["start_at"],
+                        "source_revision": row["source_revision"],
                         "bar_record_id": row["bar_record_id"],
+                        "object_id": next(
+                            ref.object_id
+                            for ref in partition_refs
+                            if ref.min_start_at <= row["start_at"] < ref.max_end_at
+                        ),
                     }
                     for ordinal, row in enumerate(final_selection)
                 ],
@@ -3939,11 +5462,68 @@ class DatasetPublisher:
             return result
 
     def reconcile_one(self, publication_id: str) -> RecoveryResult:
+        with self.catalog.engine.connect() as lookup:
+            identity = (
+                lookup.execute(
+                    select(publications).where(publications.c.publication_id == publication_id)
+                )
+                .mappings()
+                .first()
+            )
+        if not identity:
+            raise not_found()
+        if identity["state"] in ("published", "quarantined"):
+            return RecoveryResult(
+                publication_id=publication_id,
+                terminal_state=identity["state"],
+                action="noop",
+                replayed=True,
+            )
         with self.catalog.engine.begin() as c:
+            operation = (
+                "dataset.publish"
+                if identity["operation"] == "publish"
+                else "dataset.recover_quarantined_latest"
+            )
+            c.execute(
+                select(idempotency)
+                .where(
+                    and_(
+                        idempotency.c.owner_user_id == identity["owner_user_id"],
+                        idempotency.c.operation == operation,
+                        idempotency.c.idempotency_key == identity["idempotency_key"],
+                    )
+                )
+                .with_for_update()
+            ).one()
+            # Terminality is immutable and every publishing transition holds this
+            # root. Recheck before incrementing the fence so a terminal noop never
+            # displaces a live holder.
+            terminal = c.execute(
+                select(publications.c.state).where(
+                    and_(
+                        publications.c.owner_user_id == identity["owner_user_id"],
+                        publications.c.publication_id == publication_id,
+                    )
+                )
+            ).scalar_one()
+            if terminal in ("published", "quarantined"):
+                return RecoveryResult(
+                    publication_id=publication_id,
+                    terminal_state=terminal,
+                    action="noop",
+                    replayed=True,
+                )
+            fresh_fence = self._take_fence(c, identity["owner_user_id"], identity["series_id"])
             publication = (
                 c.execute(
                     select(publications)
-                    .where(publications.c.publication_id == publication_id)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == identity["owner_user_id"],
+                            publications.c.publication_id == publication_id,
+                        )
+                    )
                     .with_for_update()
                 )
                 .mappings()
@@ -3951,23 +5531,6 @@ class DatasetPublisher:
             )
             if not publication:
                 raise not_found()
-            fresh_fence = self._take_fence(
-                c, publication["owner_user_id"], publication["series_id"]
-            )
-            if publication["state"] == "published":
-                return RecoveryResult(
-                    publication_id=publication_id,
-                    terminal_state="published",
-                    action="noop",
-                    replayed=True,
-                )
-            if publication["state"] == "quarantined":
-                return RecoveryResult(
-                    publication_id=publication_id,
-                    terminal_state="quarantined",
-                    action="noop",
-                    replayed=True,
-                )
             owner = publication["owner_user_id"]
             files = (
                 c.execute(
@@ -4031,7 +5594,7 @@ class DatasetPublisher:
                                 dataset_revisions.c.dataset_revision_id == candidate,
                             )
                         )
-                        .values(status="quarantined")
+                        .values(status="quarantined", record_version=2)
                     )
                 return RecoveryResult(
                     publication_id=publication_id,
@@ -4213,7 +5776,7 @@ class DatasetPublisher:
                 )
                 .values(
                     status="published",
-                    published_at=self.catalog._now(),
+                    published_at=text("(projection->>'published_at')::timestamptz"),
                     record_version=2,
                 )
             )
@@ -4300,11 +5863,51 @@ class DatasetPublisher:
             )
 
     def cleanup_one(self, publication_id: str) -> CleanupResult:
+        with self.catalog.engine.connect() as lookup:
+            identity = (
+                lookup.execute(
+                    select(publications).where(publications.c.publication_id == publication_id)
+                )
+                .mappings()
+                .first()
+            )
+        if not identity:
+            raise not_found()
+        if identity["state"] != "published":
+            return CleanupResult(
+                publication_id=publication_id,
+                deleted_active_count=0,
+                blocked_active_count=0,
+                complete=False,
+                replayed=True,
+            )
         with self.catalog.engine.begin() as c:
+            operation = (
+                "dataset.publish"
+                if identity["operation"] == "publish"
+                else "dataset.recover_quarantined_latest"
+            )
+            c.execute(
+                select(idempotency)
+                .where(
+                    and_(
+                        idempotency.c.owner_user_id == identity["owner_user_id"],
+                        idempotency.c.operation == operation,
+                        idempotency.c.idempotency_key == identity["idempotency_key"],
+                    )
+                )
+                .with_for_update()
+            ).one()
+            self._take_fence(c, identity["owner_user_id"], identity["series_id"])
             publication = (
                 c.execute(
                     select(publications)
-                    .where(publications.c.publication_id == publication_id)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == identity["owner_user_id"],
+                            publications.c.publication_id == publication_id,
+                        )
+                    )
                     .with_for_update()
                 )
                 .mappings()
@@ -4313,7 +5916,72 @@ class DatasetPublisher:
             if not publication:
                 raise not_found()
             owner = publication["owner_user_id"]
-            self._take_fence(c, owner, publication["series_id"])
+            if publication["state"] != "published":
+                return CleanupResult(
+                    publication_id=publication_id,
+                    deleted_active_count=0,
+                    blocked_active_count=0,
+                    complete=False,
+                    replayed=True,
+                )
+            incomplete_catalog = any(
+                c.execute(statement).scalar_one() > 0
+                for statement in (
+                    select(func.count())
+                    .select_from(dataset_revisions)
+                    .join(
+                        publication_revisions,
+                        and_(
+                            publication_revisions.c.owner_user_id
+                            == dataset_revisions.c.owner_user_id,
+                            publication_revisions.c.dataset_revision_id
+                            == dataset_revisions.c.dataset_revision_id,
+                        ),
+                    )
+                    .where(
+                        and_(
+                            publication_revisions.c.owner_user_id == owner,
+                            publication_revisions.c.publication_id == publication_id,
+                            dataset_revisions.c.status != "published",
+                        )
+                    ),
+                    select(func.count())
+                    .select_from(archive_objects)
+                    .where(
+                        and_(
+                            archive_objects.c.owner_user_id == owner,
+                            archive_objects.c.publication_id == publication_id,
+                            archive_objects.c.state != "published",
+                        )
+                    ),
+                    select(func.count())
+                    .select_from(publication_files)
+                    .where(
+                        and_(
+                            publication_files.c.owner_user_id == owner,
+                            publication_files.c.publication_id == publication_id,
+                            publication_files.c.state != "published",
+                        )
+                    ),
+                    select(func.count())
+                    .select_from(publication_retention_conversions)
+                    .where(
+                        and_(
+                            publication_retention_conversions.c.owner_user_id == owner,
+                            publication_retention_conversions.c.publication_id == publication_id,
+                            publication_retention_conversions.c.state != "converted",
+                        )
+                    ),
+                )
+            )
+            if incomplete_catalog:
+                return CleanupResult(
+                    publication_id=publication_id,
+                    deleted_active_count=0,
+                    blocked_active_count=0,
+                    complete=False,
+                    replayed=True,
+                )
             pending = (
                 c.execute(
                     select(publication_cleanup_bars)
@@ -4334,6 +6002,29 @@ class DatasetPublisher:
             now = self.catalog._now()
             for row in pending:
                 self._inject("during_cleanup")
+                locked_active = c.execute(
+                    select(active_bars.c.bar_record_id)
+                    .where(
+                        and_(
+                            active_bars.c.owner_user_id == owner,
+                            active_bars.c.bar_record_id == row["bar_record_id"],
+                        )
+                    )
+                    .with_for_update()
+                ).scalar()
+                if locked_active is None:
+                    c.execute(
+                        update(publication_cleanup_bars)
+                        .where(
+                            and_(
+                                publication_cleanup_bars.c.owner_user_id == owner,
+                                publication_cleanup_bars.c.publication_id == publication_id,
+                                publication_cleanup_bars.c.bar_record_id == row["bar_record_id"],
+                            )
+                        )
+                        .values(cleaned_at=now)
+                    )
+                    continue
                 active_retention = c.execute(
                     select(bar_retention_refs.c.bar_record_id)
                     .where(
@@ -4358,8 +6049,7 @@ class DatasetPublisher:
                         and_(
                             read_snapshot_bars.c.owner_user_id == owner,
                             read_snapshots.c.expires_at > now,
-                            read_snapshot_bars.c.bar["bar_record_id"].as_string()
-                            == row["bar_record_id"],
+                            read_snapshot_bars.c.bar_record_id == row["bar_record_id"],
                         )
                     )
                     .limit(1)

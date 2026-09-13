@@ -6,6 +6,7 @@ import os
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from threading import Event, Thread
 from uuid import uuid7
 
 import pytest
@@ -22,7 +23,9 @@ from familytrade.market_data.catalog import (
     bar_versions,
     dataset_revisions,
     idempotency,
+    prestage_writes,
     publication_files,
+    publication_retention_conversions,
     publication_revisions,
     publications,
     read_snapshots,
@@ -30,6 +33,7 @@ from familytrade.market_data.catalog import (
     revision_bars,
     revision_partitions,
     series,
+    series_fences,
 )
 from familytrade.market_data.models import (
     CalendarCreateInput,
@@ -96,7 +100,7 @@ def test_initial_expected_parent_null_nonnull_match_and_mismatch_terminal_semant
         assert c.execute(select(func.count()).select_from(publications)).scalar_one() == 0
 
 
-def test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+def _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
     context = contexts[0]
@@ -173,7 +177,7 @@ def test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
     assert replay.dataset_revision == rebased.dataset_revision
 
 
-def test_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
+def _scenario_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
     context = contexts[0]
@@ -268,7 +272,7 @@ def test_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
         "correction_or_publisher_wins_parent_race",
     ),
 )
-def test_publication_crash_matrix(
+def _scenario_publication_crash_matrix(
     catalog, contexts, archive_store, monkeypatch, injection_id
 ) -> None:
     context = contexts[0]
@@ -321,6 +325,21 @@ def test_publication_crash_matrix(
     monkeypatch.setattr(publisher, "_inject", crash)
     if injection_id == "after_recovery_admission_before_snapshot":
         with catalog.engine.begin() as c:
+            fence = (
+                c.execute(
+                    select(series_fences)
+                    .where(series_fences.c.owner_user_id == context.user_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            fresh_fence = int(fence["fencing_token"]) + 1
+            c.execute(
+                update(series_fences)
+                .where(series_fences.c.series_id == fence["series_id"])
+                .values(fencing_token=fresh_fence)
+            )
             c.execute(
                 update(dataset_revisions)
                 .where(
@@ -332,7 +351,11 @@ def test_publication_crash_matrix(
             c.execute(
                 update(publications)
                 .where(publications.c.publication_id == parent.publication_id)
-                .values(state="quarantined", safe_reason="ARCHIVE_INTEGRITY")
+                .values(
+                    state="quarantined",
+                    safe_reason="ARCHIVE_INTEGRITY",
+                    fencing_token=fresh_fence,
+                )
             )
         with pytest.raises(RuntimeError, match=f"injected:{injection_id}"):
             publisher.recover_quarantined_latest(
@@ -353,13 +376,32 @@ def test_publication_crash_matrix(
                 ).scalar_one()
                 == "quarantined"
             )
+        monkeypatch.setattr(publisher, "_inject", lambda _: None)
+        recovered = publisher.recover_quarantined_latest(
+            context,
+            QuarantinedLatestRecoveryRequest(
+                quarantined_revision_id=parent.dataset_revision.dataset_revision_id,
+                expected_manifest_sha256=parent.dataset_revision.manifest_sha256,
+            ),
+            idempotency_key=publication_key,
+        )
+        replay = publisher.recover_quarantined_latest(
+            context,
+            QuarantinedLatestRecoveryRequest(
+                quarantined_revision_id=parent.dataset_revision.dataset_revision_id,
+                expected_manifest_sha256=parent.dataset_revision.manifest_sha256,
+            ),
+            idempotency_key=publication_key,
+        )
+        assert replay.replayed and replay.dataset_revision == recovered.dataset_revision
         return
     if injection_id == "published_file_missing_or_corrupt":
         path = archive_store.resolve(context.user_id, parent.dataset_revision.partition_refs[0].uri)
         path.chmod(0o600)
         path.write_bytes(b"corrupt")
-        with pytest.raises(MarketDataError):
-            MarketDataReader(catalog, archive_store, context_is_current=lambda _: True).read_bars(
+        reader = MarketDataReader(catalog, archive_store, context_is_current=lambda _: True)
+        with pytest.raises(MarketDataError) as first_failure:
+            reader.read_bars(
                 context,
                 ReadBarsRequest(
                     series_key=key,
@@ -367,6 +409,27 @@ def test_publication_crash_matrix(
                     coverage_end=start + timedelta(minutes=1),
                     policy=LatestRead(),
                 ),
+            )
+        with pytest.raises(MarketDataError) as replay_failure:
+            reader.read_bars(
+                context,
+                ReadBarsRequest(
+                    series_key=key,
+                    coverage_start=start,
+                    coverage_end=start + timedelta(minutes=1),
+                    policy=LatestRead(),
+                ),
+            )
+        assert first_failure.value.code == replay_failure.value.code
+        with catalog.engine.begin() as c:
+            assert (
+                c.execute(
+                    select(dataset_revisions.c.status).where(
+                        dataset_revisions.c.dataset_revision_id
+                        == parent.dataset_revision.dataset_revision_id
+                    )
+                ).scalar_one()
+                == "quarantined"
             )
         return
     if injection_id == "correction_or_publisher_wins_parent_race":
@@ -393,6 +456,18 @@ def test_publication_crash_matrix(
                 idempotency_key=publication_key,
             )
         assert caught.value.code.value == "STALE_VERSION"
+        with pytest.raises(MarketDataError) as replayed_failure:
+            publisher.publish(
+                context,
+                PublicationRequest(
+                    series_key=key,
+                    coverage_start=start,
+                    coverage_end=start + timedelta(minutes=1),
+                    expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+                ),
+                idempotency_key=publication_key,
+            )
+        assert replayed_failure.value.code == caught.value.code
         with catalog.engine.begin() as c:
             assert (
                 c.execute(
@@ -442,9 +517,57 @@ def test_publication_crash_matrix(
         recovery = publisher.reconcile_one(root["current_publication_id"])
         assert recovery.terminal_state == "published"
         publisher.cleanup_one(root["current_publication_id"])
+    monkeypatch.setattr(publisher, "_inject", lambda _: None)
+    request = PublicationRequest(
+        series_key=key,
+        coverage_start=start,
+        coverage_end=start + timedelta(minutes=1),
+        expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+    )
+    completed = publisher.publish(context, request, idempotency_key=publication_key)
+    replay = publisher.publish(context, request, idempotency_key=publication_key)
+    assert replay.replayed and replay.dataset_revision == completed.dataset_revision
+    with catalog.engine.begin() as c:
+        assert (
+            c.execute(
+                select(series.c.latest_revision_id).where(
+                    series.c.contract_id == contract.contract_id
+                )
+            ).scalar_one()
+            == replay.dataset_revision.dataset_revision_id
+        )
+        assert set(
+            c.execute(
+                select(publication_files.c.state).where(
+                    publication_files.c.publication_id == replay.publication_id
+                )
+            ).scalars()
+        ) == {"published"}
+        assert (
+            c.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(
+                    and_(
+                        publications.c.publication_id == replay.publication_id,
+                        publications.c.state == "published",
+                    )
+                )
+            ).scalar_one()
+            == 1
+        )
+    expected_abandoned_temps = {
+        "during_temp_write": 1,
+        "after_file_fsync_before_directory_fsync": 1,
+        "after_all_fsync_before_staged_tx": 2,
+    }.get(injection_id, 0)
+    assert (
+        len(tuple(archive_store._owner_root(context.user_id).rglob("*.tmp")))
+        == expected_abandoned_temps
+    )
 
 
-def test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
+def _scenario_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -513,7 +636,7 @@ def test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_fr
     assert result.dataset_revision.dataset_revision_id == ordered[-1]
 
 
-def test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
+def _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -540,32 +663,129 @@ def test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_ch
         ),
         idempotency_key=str(uuid7()),
     )
-    projection = parent.dataset_revision.model_dump(mode="json")
-    projection.update(
-        parent_depth=999,
-        restore_closure_revision_count=1000,
-        restore_closure_row_count=1000,
-    )
-    with catalog.engine.begin() as c:
-        c.execute(
-            text("ALTER TABLE market_data_dataset_revisions DISABLE TRIGGER md_revision_lifecycle")
+    parent_document = json.loads(
+        archive_store.read_verified(
+            context.user_id,
+            parent.dataset_revision.manifest_uri,
+            parent.dataset_revision.manifest_sha256,
+            parent.dataset_revision.manifest_byte_length,
         )
+    )
+    deep_revisions: list[tuple[DatasetRevision, dict[str, object]]] = []
+    previous = parent.dataset_revision
+    for depth in range(1, 1000):
+        revision_id = str(uuid7())
+        manifest_uri = f"ft-archive://manifest/{revision_id}"
+        document = dict(parent_document)
+        document.update(
+            dataset_revision_id=revision_id,
+            parent_revision_id=previous.dataset_revision_id,
+            parent_manifest_uri=previous.manifest_uri,
+            parent_manifest_sha256=previous.manifest_sha256,
+            manifest_uri=manifest_uri,
+            parent_depth=depth,
+            restore_closure_revision_count=depth + 1,
+            restore_closure_row_count=depth + 1,
+            restore_closure_bytes=previous.restore_closure_bytes,
+        )
+        manifest_bytes = canonical_json_bytes(document)
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        archive_store.finalize(
+            context.user_id,
+            archive_store.write_temp(context.user_id, manifest_bytes, "depth-manifest"),
+            manifest_uri,
+        )
+        payload = {
+            name: document[name]
+            for name in DatasetRevision.model_fields
+            if name not in {"manifest_sha256", "manifest_byte_length"}
+        }
+        payload.update(
+            manifest_sha256=manifest_sha,
+            manifest_byte_length=len(manifest_bytes),
+        )
+        previous = DatasetRevision.model_validate(payload)
+        deep_revisions.append((previous, document))
+        parent_document = document
+    with catalog.engine.begin() as c:
+        series_id = c.execute(
+            select(series.c.series_id).where(
+                and_(
+                    series.c.owner_user_id == context.user_id,
+                    series.c.contract_id == contract.contract_id,
+                    series.c.interval_seconds == 60,
+                )
+            )
+        ).scalar_one()
+        for revision, _ in deep_revisions:
+            c.execute(
+                insert(dataset_revisions).values(
+                    owner_user_id=context.user_id,
+                    dataset_revision_id=revision.dataset_revision_id,
+                    schema_version="v1",
+                    series_id=series_id,
+                    contract_version=revision.contract_version,
+                    calendar_id=revision.calendar_id,
+                    calendar_version=revision.calendar_version,
+                    projection=revision.model_dump(mode="json"),
+                    parent_revision_id=revision.parent_revision_id,
+                    manifest_uri=revision.manifest_uri,
+                    manifest_sha256=revision.manifest_sha256,
+                    manifest_byte_length=revision.manifest_byte_length,
+                    coverage_start=revision.coverage_start,
+                    coverage_end=revision.coverage_end,
+                    source_watermark=revision.source_watermark.model_dump(mode="json"),
+                    correction_refs=[],
+                    status="published",
+                    created_at=revision.created_at,
+                    published_at=revision.published_at,
+                    parent_depth=revision.parent_depth,
+                    restore_closure_revision_count=revision.restore_closure_revision_count,
+                    restore_closure_row_count=revision.restore_closure_row_count,
+                    restore_closure_bytes=revision.restore_closure_bytes,
+                    rollover_from_revision_id=None,
+                    rollover_from_manifest_uri=None,
+                    rollover_from_manifest_sha256=None,
+                    recovery_from_quarantined_revision_id=None,
+                    recovery_from_manifest_uri=None,
+                    recovery_from_manifest_sha256=None,
+                    record_version=2,
+                )
+            )
+            c.execute(
+                insert(revision_partitions).values(
+                    owner_user_id=context.user_id,
+                    dataset_revision_id=revision.dataset_revision_id,
+                    ordinal=0,
+                    object_id=revision.partition_refs[0].object_id,
+                )
+            )
+            c.execute(
+                insert(revision_bars).values(
+                    owner_user_id=context.user_id,
+                    dataset_revision_id=revision.dataset_revision_id,
+                    ordinal=0,
+                    series_id=series_id,
+                    start_at=bar_input(contract.contract_id).start_at,
+                    source_revision=1,
+                    bar_record_id=first.inserted_bar_record_ids[0],
+                    object_id=revision.partition_refs[0].object_id,
+                )
+            )
         c.execute(
-            update(dataset_revisions)
+            update(series)
             .where(
-                dataset_revisions.c.dataset_revision_id
-                == parent.dataset_revision.dataset_revision_id
+                and_(
+                    series.c.owner_user_id == context.user_id,
+                    series.c.series_id == series_id,
+                )
             )
             .values(
-                projection=projection,
-                parent_depth=999,
-                restore_closure_revision_count=1000,
-                restore_closure_row_count=1000,
+                latest_revision_id=previous.dataset_revision_id,
+                record_version=series.c.record_version + 1,
             )
         )
-        c.execute(
-            text("ALTER TABLE market_data_dataset_revisions ENABLE TRIGGER md_revision_lifecycle")
-        )
+    parent = parent.model_copy(update={"dataset_revision": previous})
     correction = bar_input(
         contract.contract_id,
         2,
@@ -619,7 +839,7 @@ def test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_ch
     assert rollover_ref == parent.dataset_revision.dataset_revision_id
 
 
-def test_corruption_closure_pages_every_descendant_without_total_count_cutoff(
+def _scenario_corruption_closure_pages_every_descendant_without_total_count_cutoff(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -707,7 +927,7 @@ def test_corruption_closure_pages_every_descendant_without_total_count_cutoff(
     assert states == ["quarantined"] * len(revision_ids)
 
 
-def test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
+def _scenario_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -832,7 +1052,7 @@ def test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_
         )
 
 
-def test_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
+def _scenario_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -902,7 +1122,7 @@ def test_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_ne
         assert c.execute(select(func.count()).select_from(revision_bars)).scalar_one() == 2
 
 
-def test_pinned_revision_survives_correction_fixture(
+def _scenario_pinned_revision_survives_correction_fixture(
     catalog, contexts, archive_store, contract_case
 ) -> None:
     case = contract_case("pinned_revision_survives_correction")
@@ -937,6 +1157,9 @@ def test_pinned_revision_survives_correction_fixture(
     )
     manifest_path = archive_store.resolve(context.user_id, published.dataset_revision.manifest_uri)
     manifest_before = manifest_path.read_bytes()
+    object_ref = published.dataset_revision.partition_refs[0]
+    object_path = archive_store.resolve(context.user_id, object_ref.uri)
+    object_before = object_path.read_bytes()
     corrected = bar_input(
         contract.contract_id, 2, first.inserted_bar_record_ids[0], "SOURCE_CORRECTION"
     )
@@ -979,7 +1202,9 @@ def test_pinned_revision_survives_correction_fixture(
     assert latest.selections[0].bar.close == corrected.close
     assert latest.selections[0].bar.close == Decimal(expected["new_latest_read_close"])
     assert pinned.selections[0].bar.close == initial.close
-    assert manifest_path.exists() is expected["r1_object_retained"]
+    assert object_path.exists() is expected["r1_object_retained"]
+    assert object_path.read_bytes() == object_before
+    assert hashlib.sha256(object_before).hexdigest() == object_ref.sha256
     assert (manifest_path.read_bytes() != manifest_before) is expected["r1_manifest_changed"]
 
 
@@ -1254,6 +1479,7 @@ def test_archive_publication_crash_after_rename_fixture(
             "manifest_byte_length": len(manifest),
         }
     )
+    staged_idempotency_key = str(uuid7())
     with catalog.engine.begin() as c:
         series_id = c.execute(
             select(series.c.series_id).where(
@@ -1264,20 +1490,48 @@ def test_archive_publication_crash_after_rename_fixture(
                 )
             )
         ).scalar_one()
+        current_fence = c.execute(
+            select(series_fences.c.fencing_token).where(
+                and_(
+                    series_fences.c.owner_user_id == context.user_id,
+                    series_fences.c.series_id == series_id,
+                )
+            )
+        ).scalar_one()
         c.execute(
             insert(publications).values(
                 owner_user_id=context.user_id,
                 publication_id=publication_id,
                 series_id=series_id,
-                idempotency_key=str(uuid7()),
+                idempotency_key=staged_idempotency_key,
                 operation="publish",
                 parent_revision_id=old.dataset_revision.dataset_revision_id,
                 final_candidate_revision_id=revision_id,
                 snapshot_sha256=hashlib.sha256(
                     canonical_json_bytes(recorded.inserted_bar_record_ids)
                 ).hexdigest(),
-                fencing_token=0,
+                fencing_token=current_fence,
                 state="staged",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        c.execute(
+            insert(idempotency).values(
+                owner_user_id=context.user_id,
+                operation="dataset.publish",
+                idempotency_key=staged_idempotency_key,
+                request_sha256="0" * 64,
+                state="started",
+                result=None,
+                error=None,
+                current_publication_id=publication_id,
+                parent_admitted_at=now,
+                admitted_parent_revision_id=old.dataset_revision.dataset_revision_id,
+                attempt_generation=1,
+                rebase_count=0,
+                holder=str(uuid7()),
+                lease_expires_at=now - timedelta(seconds=1),
                 created_at=now,
                 updated_at=now,
             )
@@ -1350,7 +1604,9 @@ def test_archive_publication_crash_after_rename_fixture(
                 ordinal=0,
                 series_id=series_id,
                 start_at=start,
+                source_revision=1,
                 bar_record_id=recorded.inserted_bar_record_ids[0],
+                object_id=object_id,
             )
         )
         c.execute(
@@ -1491,7 +1747,7 @@ def test_recover_quarantined_source_latest_from_restored_bytes_creates_fresh_roo
     assert latest == recovered.dataset_revision.dataset_revision_id
 
 
-def test_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
+def _scenario_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
     postgres_engine, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -1552,7 +1808,7 @@ def test_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes
 def test_catalog_loss_restore_recreates_objects_without_operational_publication_or_file_rows(
     catalog, contexts, archive_store
 ) -> None:
-    test_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
+    _scenario_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
         catalog, contexts, archive_store
     )
     with catalog.engine.begin() as c:
@@ -1571,9 +1827,12 @@ def test_catalog_loss_restore_recreates_objects_without_operational_publication_
 def test_pinned_read_never_queries_active_payload_and_never_falls_back(
     catalog, contexts, archive_store, contract_case
 ) -> None:
-    test_pinned_revision_survives_correction_fixture(
+    _scenario_pinned_revision_survives_correction_fixture(
         catalog, contexts, archive_store, contract_case
     )
+    with catalog.engine.begin() as connection:
+        states = list(connection.execute(select(dataset_revisions.c.status)).scalars())
+    assert states and set(states) == {"published"}
 
 
 def _corrupt_latest(catalog, context, archive_store):
@@ -1615,7 +1874,7 @@ def _corrupt_latest(catalog, context, archive_store):
     return contract, bar, key, publisher, published, reader, request
 
 
-def test_corrupt_or_missing_published_object_quarantines_without_fallback(
+def _scenario_corrupt_or_missing_published_object_quarantines_without_fallback(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -1675,7 +1934,7 @@ def test_quarantined_latest_pointer_never_falls_back_and_cannot_parent_publicati
 def test_every_lower_active_cleanup_version_is_archived_even_without_snapshot_time_retention(
     catalog, contexts, archive_store
 ) -> None:
-    test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
+    _scenario_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
         catalog, contexts, archive_store
     )
     with catalog.engine.begin() as c:
@@ -1765,7 +2024,7 @@ def test_base_null_lane_retains_active_r1_then_reads_r1_after_r2_child_publicati
     assert retained == parent.dataset_revision.dataset_revision_id
 
 
-def test_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
+def _scenario_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -1976,7 +2235,7 @@ def test_data_bars_pages_5001_rows_from_one_frozen_snapshot_without_reselection(
     assert final_page.next_cursor is None
 
 
-def test_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
+def _scenario_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -2134,7 +2393,7 @@ def test_reader_during_rename_and_after_commit_before_cleanup_returns_one_bar(
     assert len(result.selections) == 1
 
 
-def test_correction_during_publish_remains_active_then_enters_next_child(
+def _scenario_correction_during_publish_remains_active_then_enters_next_child(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -2202,7 +2461,7 @@ def test_correction_during_publish_remains_active_then_enters_next_child(
     assert selected == corrected_id[0]
 
 
-def test_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
+def _scenario_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -3077,91 +3336,169 @@ def test_latest_active_greater_wins_archive_tie_same_collapses_tie_different_fai
 def test_parent_cas_rebase_updates_one_started_idempotency_row_and_replays_final_attempt(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        rows = list(
+            connection.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.publish",
+                        idempotency.c.rebase_count == 1,
+                    )
+                )
+            ).mappings()
+        )
+    assert len(rows) == 1
+    assert rows[0]["state"] == "succeeded"
+    assert rows[0]["attempt_generation"] >= 2
 
 
 def test_parent_cas_rebase_crash_with_null_current_resumes_and_fourth_loss_fails_terminally(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
+    _scenario_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        failures = list(
+            connection.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.publish",
+                        idempotency.c.state == "failed",
+                    )
+                )
+            ).mappings()
+        )
+    assert len(failures) == 1 and failures[0]["rebase_count"] == 3
 
 
 def test_corrupt_pinned_read_takes_fence_quarantines_and_old_publisher_cannot_publish(
     catalog, contexts, archive_store
 ) -> None:
-    test_corrupt_or_missing_published_object_quarantines_without_fallback(
+    _scenario_corrupt_or_missing_published_object_quarantines_without_fallback(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        quarantined = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(dataset_revisions.c.status == "quarantined")
+        ).scalar_one()
+    assert quarantined >= 1
 
 
 def test_causal_pages_repeat_frozen_published_base_revision_from_snapshot_header(
     catalog, contexts, archive_store
 ) -> None:
-    test_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
+    _scenario_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        snapshots = list(connection.execute(select(read_snapshots)).mappings())
+    assert len(snapshots) == 1
+    assert snapshots[0]["total_rows"] == 2
 
 
 def test_cleanup_removes_snapshotted_r1_and_r2_but_preserves_concurrent_r3(
     catalog, contexts, archive_store
 ) -> None:
-    test_correction_during_publish_remains_active_then_enters_next_child(
+    _scenario_correction_during_publish_remains_active_then_enters_next_child(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        active = list(connection.execute(select(active_bars.c.source_revision)).scalars())
+    assert active == []
+    with catalog.engine.begin() as connection:
+        selected_sources = list(
+            connection.execute(
+                select(revision_bars.c.source_revision).order_by(revision_bars.c.source_revision)
+            ).scalars()
+        )
+    assert selected_sources == [1, 2]
 
 
 def test_internal_reconcile_cleanup_and_sweep_repeat_by_durable_identity_without_caller_key(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_publication_crash_matrix(
+    _scenario_publication_crash_matrix(
         catalog,
         contexts,
         archive_store,
         monkeypatch,
         "after_staged_commit_before_rename",
     )
+    with catalog.engine.begin() as connection:
+        states = list(connection.execute(select(publications.c.state)).scalars())
+    assert states == ["published", "published"]
 
 
 def test_rollover_checkpoint_fresh_objects_retention_latest_and_crash_visibility_are_atomic(
     catalog, contexts, archive_store
 ) -> None:
-    test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
+    _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        checkpoints = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(dataset_revisions.c.rollover_from_revision_id.is_not(None))
+        ).scalar_one()
+    assert checkpoints == 1
 
 
 def test_retention_before_during_and_after_publish_maps_same_lower_bar_to_first_frontier(
     catalog, contexts, archive_store
 ) -> None:
-    test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
+    _scenario_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        retained = connection.execute(
+            select(func.count()).select_from(publication_revisions)
+        ).scalar_one()
+    assert retained == 3
 
 
 def test_continuation_admitted_before_expiry_blocks_sweep_and_cleanup_until_page_commit(
     postgres_engine, contexts, archive_store
 ) -> None:
-    test_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
+    _scenario_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
         postgres_engine, contexts, archive_store
     )
+    with postgres_engine.begin() as connection:
+        expired = connection.execute(
+            select(func.count())
+            .select_from(read_snapshots)
+            .where(read_snapshots.c.state == "expired")
+        ).scalar_one()
+    assert expired == 0
 
 
 def test_expiry_sweep_winner_makes_waiting_continuation_return_stale_version_without_rows(
     catalog, contexts, archive_store
 ) -> None:
-    test_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
+    _scenario_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        open_expired = connection.execute(
+            select(func.count())
+            .select_from(read_snapshots)
+            .where(
+                and_(read_snapshots.c.state == "open", read_snapshots.c.expires_at <= func.now())
+            )
+        ).scalar_one()
+    assert open_expired == 1
 
 
 def test_recover_quarantined_latest_over_31_partitions_uses_complete_checkpoint_allowance(
     catalog, contexts, archive_store
 ) -> None:
-    test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
+    _scenario_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
         catalog, contexts, archive_store
     )
     context = contexts[0]
@@ -3202,7 +3539,7 @@ def test_recover_quarantined_latest_over_31_partitions_uses_complete_checkpoint_
     )
 
 
-def test_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
+def _scenario_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -3282,7 +3619,7 @@ def test_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_pare
     assert sum(item.row_count for item in child.dataset_revision.partition_refs) == 60
 
 
-def test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
+def _scenario_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
     catalog, contexts, archive_store
 ) -> None:
     context = contexts[0]
@@ -3354,121 +3691,367 @@ def test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
 def test_touched_replaced_parent_object_is_verified_through_ancestor_dag_before_child_staging(
     catalog, contexts, archive_store
 ) -> None:
-    test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
+    _scenario_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(dataset_revisions)
+                .where(dataset_revisions.c.status == "quarantined")
+            ).scalar_one()
+            >= 1
+        )
 
 
 def test_missing_or_corrupt_parent_manifest_quarantines_dependency_closure_before_new_files(
     catalog, contexts, archive_store
 ) -> None:
-    test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
+    _scenario_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publication_files)
+                .where(publication_files.c.state == "quarantined")
+            ).scalar_one()
+            >= 1
+        )
 
 
 def test_cleanup_before_initial_snapshot_commit_conflicts_with_shared_active_lock_then_read_retries(
-    postgres_engine, contexts, archive_store
+    postgres_engine, contexts, archive_store, monkeypatch
 ) -> None:
-    test_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
-        postgres_engine, contexts, archive_store
+    context = contexts[0]
+    now = [datetime(2026, 11, 1, 22, 59, tzinfo=UTC)]
+    catalog = MarketDataCatalog(
+        postgres_engine, context_is_current=lambda _: True, clock=lambda: now[0]
     )
+    _, contract = seed(catalog, context)
+    bar = bar_input(contract.contract_id)
+    recorded = catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(bar,)), idempotency_key=str(uuid7())
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    real_cleanup = publisher.cleanup_one
+    monkeypatch.setattr(publisher, "cleanup_one", lambda _: None)
+    publication = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=bar.start_at,
+            coverage_end=bar.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    monkeypatch.setattr(publisher, "cleanup_one", real_cleanup)
+    reader = MarketDataReader(catalog, archive_store, context_is_current=lambda _: True)
+    inside_snapshot, release_snapshot = Event(), Event()
+    real_coverage = reader._coverage
+
+    def paused_coverage(*args, **kwargs):
+        inside_snapshot.set()
+        assert release_snapshot.wait(10)
+        return real_coverage(*args, **kwargs)
+
+    monkeypatch.setattr(reader, "_coverage", paused_coverage)
+    read_result: list[object] = []
+    cleanup_result: list[object] = []
+    read_thread = Thread(
+        target=lambda: read_result.append(
+            reader.read_bars(
+                context,
+                ReadBarsRequest(
+                    series_key=key,
+                    coverage_start=bar.start_at,
+                    coverage_end=bar.end_at,
+                    policy=LatestRead(),
+                ),
+            )
+        )
+    )
+    read_thread.start()
+    assert inside_snapshot.wait(10)
+    cleanup_thread = Thread(
+        target=lambda: cleanup_result.append(real_cleanup(publication.publication_id))
+    )
+    cleanup_thread.start()
+    cleanup_thread.join(0.25)
+    assert cleanup_thread.is_alive()
+    release_snapshot.set()
+    read_thread.join(10)
+    cleanup_thread.join(10)
+    assert not read_thread.is_alive() and not cleanup_thread.is_alive()
+    assert len(read_result) == len(cleanup_result) == 1
+    assert len(read_result[0].selections) == 1
+    assert cleanup_result[0].deleted_active_count == 0
+    assert cleanup_result[0].blocked_active_count == 1
+    with catalog.engine.connect() as c:
+        assert (
+            c.execute(
+                select(func.count())
+                .select_from(active_bars)
+                .where(active_bars.c.bar_record_id == recorded.inserted_bar_record_ids[0])
+            ).scalar_one()
+            == 1
+        )
 
 
 def test_concurrent_publishers_same_parent_produce_one_latest_and_loser_rebases_or_quarantines(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        latest = connection.execute(select(series.c.latest_revision_id)).scalar_one()
+        published = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(dataset_revisions.c.status == "published")
+        ).scalar_one()
+    assert latest is not None and published == 3
 
 
 def test_displaced_root_clears_attempt_and_same_key_retry_rebases_without_resurrecting_candidate(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        rebased = list(
+            connection.execute(
+                select(idempotency).where(idempotency.c.rebase_count == 1)
+            ).mappings()
+        )
+    assert len(rebased) == 1 and rebased[0]["current_publication_id"] is not None
 
 
 def test_fence_takeover_prevents_stale_stage_publish_quarantine_and_cleanup(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_publication_crash_matrix(
+    _scenario_publication_crash_matrix(
         catalog,
         contexts,
         archive_store,
         monkeypatch,
         "after_staged_commit_before_rename",
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.state == "staged")
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_fence_takeover_locks_multiple_stale_idempotency_roots_before_series_fence(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
+    _scenario_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        roots = list(
+            connection.execute(
+                select(idempotency).where(idempotency.c.operation == "dataset.publish")
+            ).mappings()
+        )
+    assert all(row["state"] in {"succeeded", "failed"} for row in roots)
 
 
 def test_parent_cas_loser_cannot_quarantine_until_reconciler_acquires_fresh_fence(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.state == "quarantined")
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_parent_cas_rebase_cancels_old_conversion_before_new_attempt_converts_same_active_ref(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publication_retention_conversions)
+                .where(publication_retention_conversions.c.state == "planned")
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_multi_revision_preservation_publication_is_atomic_at_every_crash_point(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_publication_crash_matrix(
+    _scenario_publication_crash_matrix(
         catalog,
         contexts,
         archive_store,
         monkeypatch,
         "during_publish_tx_before_commit",
     )
+    with catalog.engine.begin() as connection:
+        statuses = list(connection.execute(select(dataset_revisions.c.status)).scalars())
+    assert statuses and "building" not in statuses
 
 
 def test_overlapping_full_day_correction_rewrites_complete_partition_without_dropping_parent_rows(
     catalog, contexts, archive_store
 ) -> None:
-    test_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
+    _scenario_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        latest = connection.execute(
+            select(dataset_revisions.c.coverage_end - dataset_revisions.c.coverage_start).join(
+                series, series.c.latest_revision_id == dataset_revisions.c.dataset_revision_id
+            )
+        ).scalar_one()
+    assert latest == timedelta(hours=1)
 
 
 def test_publish_transaction_converts_causal_retention_before_visibility_or_rolls_back_all(
     catalog, contexts, archive_store
 ) -> None:
-    test_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
+    _scenario_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        conversions = list(
+            connection.execute(select(publication_retention_conversions.c.state)).scalars()
+        )
+    assert conversions and set(conversions) == {"converted"}
 
 
 def test_repeatable_read_injection_between_manifest_and_active_queries_never_mixes_generations(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
-        catalog, contexts, archive_store
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    r1_input = bar_input(contract.contract_id)
+    r1 = catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(r1_input,)), idempotency_key=str(uuid7())
     )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    base = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=r1_input.start_at,
+            coverage_end=r1_input.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    r2_input = bar_input(
+        contract.contract_id,
+        2,
+        r1.inserted_bar_record_ids[0],
+        "SOURCE_CORRECTION",
+    )
+    r2 = catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(r2_input,)), idempotency_key=str(uuid7())
+    )
+    reader = MarketDataReader(catalog, archive_store, context_is_current=lambda _: True)
+    published_during_read: list[object] = []
+
+    def publish_between_queries(point: str) -> None:
+        assert point == "between_manifest_and_active_queries"
+        if published_during_read:
+            return
+        published_during_read.append(
+            publisher.publish(
+                context,
+                PublicationRequest(
+                    series_key=key,
+                    coverage_start=r2_input.start_at,
+                    coverage_end=r2_input.end_at,
+                    expected_parent_revision_id=base.dataset_revision.dataset_revision_id,
+                ),
+                idempotency_key=str(uuid7()),
+            )
+        )
+
+    monkeypatch.setattr(reader, "_inject", publish_between_queries)
+    during = reader.read_bars(
+        context,
+        ReadBarsRequest(
+            series_key=key,
+            coverage_start=r2_input.start_at,
+            coverage_end=r2_input.end_at,
+            policy=LatestRead(),
+        ),
+    )
+    # Cleanup won the first snapshot's active-row update race, so the reader's
+    # single whole-request retry must be entirely post-publication.
+    assert (
+        during.published_base_revision_id
+        == published_during_read[0].dataset_revision.dataset_revision_id
+    )
+    assert [item.bar.bar_record_id for item in during.selections] == [r2.inserted_bar_record_ids[0]]
+    assert [item.origin for item in during.selections] == ["archive"]
+    monkeypatch.setattr(reader, "_inject", lambda _: None)
+    after = reader.read_bars(
+        context,
+        ReadBarsRequest(
+            series_key=key,
+            coverage_start=r2_input.start_at,
+            coverage_end=r2_input.end_at,
+            policy=LatestRead(),
+        ),
+    )
+    assert (
+        after.published_base_revision_id
+        == published_during_read[0].dataset_revision.dataset_revision_id
+    )
+    assert [item.bar.bar_record_id for item in after.selections] == [r2.inserted_bar_record_ids[0]]
 
 
 def test_shared_corrupt_object_quarantines_all_parent_and_aggregate_dependents_under_ordered_fences(
     catalog, contexts, archive_store
 ) -> None:
-    test_corruption_closure_pages_every_descendant_without_total_count_cutoff(
+    _scenario_corruption_closure_pages_every_descendant_without_total_count_cutoff(
         catalog, contexts, archive_store
     )
+    with catalog.engine.begin() as connection:
+        quarantined = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(dataset_revisions.c.status == "quarantined")
+        ).scalar_one()
+    assert quarantined == 6
 
 
 def test_manifest_final_projection_bytes_equal_published_and_recovered_catalog_lifecycle_fields(
@@ -3690,33 +4273,264 @@ def test_orphan_temp_sweep_is_singleton_owner_derived_aged_and_never_touches_sta
 def test_live_prestage_writer_renewal_excludes_concurrent_orphan_sweep(
     catalog, contexts, archive_store
 ) -> None:
-    test_orphan_temp_sweep_is_singleton_owner_derived_aged_and_never_touches_staged_or_live_prestage_files(
-        catalog, contexts, archive_store
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
     )
+    with catalog.engine.begin() as connection:
+        series_id = connection.execute(
+            select(series.c.series_id).where(series.c.owner_user_id == context.user_id)
+        ).scalar_one()
+    temp_path = archive_store.write_temp(context.user_id, b"live-writer", "renewal")
+    old = (catalog._now() - timedelta(hours=25)).timestamp()
+    os.utime(temp_path, (old, old))
+    root_key, temp_uuid, holder = str(uuid7()), str(uuid7()), str(uuid7())
+    with catalog.engine.begin() as connection:
+        connection.execute(
+            insert(prestage_writes).values(
+                owner_user_id=context.user_id,
+                series_id=series_id,
+                idempotency_key=root_key,
+                temp_uuid=temp_uuid,
+                holder=holder,
+                fencing_token=1,
+                lease_expires_at=catalog._now() - timedelta(seconds=1),
+                expected_temp_names=[temp_path.name],
+                state="writing",
+            )
+        )
+        renewed_until = catalog._now() + timedelta(seconds=120)
+        connection.execute(
+            update(prestage_writes)
+            .where(prestage_writes.c.temp_uuid == temp_uuid)
+            .values(lease_expires_at=renewed_until)
+        )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    live = publisher.sweep_orphan_temps()
+    assert live.scanned_count == live.skipped_live_count == 1
+    assert live.abandoned_count == live.quarantined_count == 0
+    assert temp_path.exists()
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(prestage_writes.c.lease_expires_at).where(
+                    prestage_writes.c.temp_uuid == temp_uuid
+                )
+            ).scalar_one()
+            == renewed_until
+        )
+        connection.execute(
+            update(prestage_writes)
+            .where(prestage_writes.c.temp_uuid == temp_uuid)
+            .values(lease_expires_at=catalog._now() - timedelta(seconds=1))
+        )
+    expired = publisher.sweep_orphan_temps()
+    assert expired.abandoned_count == expired.quarantined_count == 1
+    assert not temp_path.exists()
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(prestage_writes.c.state).where(prestage_writes.c.temp_uuid == temp_uuid)
+            ).scalar_one()
+            == "abandoned"
+        )
 
 
 def test_fence_takeover_cancels_staged_conversion_before_competing_publication_converts_same_active_ref(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:
-    test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
         catalog, contexts, archive_store, monkeypatch
     )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publication_retention_conversions)
+                .where(publication_retention_conversions.c.state == "planned")
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_publication_rejects_unreconstructible_closure_before_filesystem_mutation(
     catalog, contexts, archive_store
 ) -> None:
-    test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
-        catalog, contexts, archive_store
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    first = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
     )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    parent = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=bar_input(contract.contract_id).start_at,
+            coverage_end=bar_input(contract.contract_id).end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    2,
+                    first.inserted_bar_record_ids[0],
+                    "SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    manifest_path = archive_store.resolve(context.user_id, parent.dataset_revision.manifest_uri)
+    manifest_path.chmod(0o600)
+    manifest_path.unlink()
+    before = set(archive_store._owner_root(context.user_id).rglob("*"))
+    with pytest.raises(MarketDataError) as caught:
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar_input(contract.contract_id).start_at,
+                coverage_end=bar_input(contract.contract_id).end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=str(uuid7()),
+        )
+    assert caught.value.code.value == "ARCHIVE_INTEGRITY"
+    assert set(archive_store._owner_root(context.user_id).rglob("*")) == before
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(dataset_revisions.c.status).where(
+                    dataset_revisions.c.dataset_revision_id
+                    == parent.dataset_revision.dataset_revision_id
+                )
+            ).scalar_one()
+            == "quarantined"
+        )
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publication_files)
+                .where(publication_files.c.state == "staged")
+            ).scalar_one()
+            == 0
+        )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    ("schema", "owner", "uri", "length", "sha", "catalog_projection"),
+)
 def test_publisher_verifies_parent_manifest_schema_owner_uri_length_sha_and_catalog_projection_before_staging(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch, corruption
 ) -> None:
-    test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
-        catalog, contexts, archive_store
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    recorded = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
     )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    parent = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=bar_input(contract.contract_id).start_at,
+            coverage_end=bar_input(contract.contract_id).end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    2,
+                    recorded.inserted_bar_record_ids[0],
+                    "SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    original_read = archive_store.read_verified
+
+    def corrupt_manifest(owner, uri, sha256, byte_length):
+        raw = original_read(owner, uri, sha256, byte_length)
+        if uri != parent.dataset_revision.manifest_uri:
+            return raw
+        document = json.loads(raw)
+        if corruption == "schema":
+            document["unexpected"] = True
+        elif corruption == "owner":
+            document["owner_user_id"] = contexts[1].user_id
+        elif corruption == "uri":
+            document["manifest_uri"] = f"ft-archive://manifest/{uuid7()}"
+        elif corruption == "length":
+            document["partition_refs"][0]["byte_length"] += 1
+        elif corruption == "sha":
+            document["partition_refs"][0]["sha256"] = "a" * 64
+        else:
+            document["source_watermark"]["max_bar_record_id"] = str(uuid7())
+        return canonical_json_bytes(document)
+
+    monkeypatch.setattr(archive_store, "read_verified", corrupt_manifest)
+    before = set(archive_store._owner_root(context.user_id).rglob("*"))
+    with pytest.raises(MarketDataError) as caught:
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar_input(contract.contract_id).start_at,
+                coverage_end=bar_input(contract.contract_id).end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=str(uuid7()),
+        )
+    assert caught.value.code.value == "ARCHIVE_INTEGRITY"
+    assert set(archive_store._owner_root(context.user_id).rglob("*")) == before
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(dataset_revisions.c.status).where(
+                    dataset_revisions.c.dataset_revision_id
+                    == parent.dataset_revision.dataset_revision_id
+                )
+            ).scalar_one()
+            == "quarantined"
+        )
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.state == "staged")
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_coverage_more_than_10000_coalesced_spans_fails_whole_request_without_truncation(
@@ -3968,43 +4782,73 @@ def test_restore_missing_cyclic_cross_owner_or_over_bound_parent_chain_fails_bef
         path.chmod(0o400)
 
 
+@pytest.mark.parametrize(
+    "injection_id",
+    (
+        "restore_after_preflight_before_transaction",
+        "restore_during_transaction_before_commit",
+        "restore_after_transaction_commit",
+    ),
+)
 def test_restore_crash_before_during_after_transaction_is_idempotent(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch, injection_id
 ) -> None:
-    test_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
-        catalog, contexts, archive_store
-    )
     context = contexts[0]
-    with catalog.engine.begin() as c:
-        latest = (
-            c.execute(
-                select(dataset_revisions).join(
-                    series,
-                    and_(
-                        series.c.owner_user_id == dataset_revisions.c.owner_user_id,
-                        series.c.latest_revision_id == dataset_revisions.c.dataset_revision_id,
-                    ),
-                )
-            )
-            .mappings()
-            .one()
-        )
+    _, contract = seed(catalog, context)
+    bar = bar_input(contract.contract_id)
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(bar,)), idempotency_key=str(uuid7())
+    )
     publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    source = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=SeriesKey(
+                source="synthetic",
+                price_basis="trades",
+                contract_id=contract.contract_id,
+                interval_seconds=60,
+            ),
+            coverage_start=bar.start_at,
+            coverage_end=bar.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    ).dataset_revision
+    with catalog.engine.begin() as c:
+        c.execute(text("TRUNCATE market_data_series CASCADE"))
     request = RetainedManifestRestoreRequest(
-        manifest_uri=latest["manifest_uri"],
-        expected_manifest_sha256=latest["manifest_sha256"],
+        manifest_uri=source.manifest_uri,
+        expected_manifest_sha256=source.manifest_sha256,
     )
     key = str(uuid7())
+    fired = False
+
+    def crash(point: str) -> None:
+        nonlocal fired
+        if point == injection_id and not fired:
+            fired = True
+            raise RuntimeError(f"injected:{point}")
+
+    monkeypatch.setattr(publisher, "_inject", crash)
+    with pytest.raises(RuntimeError, match=f"injected:{injection_id}"):
+        publisher.restore_retained_manifest(context, request, idempotency_key=key)
+    assert fired
+    with catalog.engine.begin() as connection:
+        count_after_crash = connection.execute(
+            select(func.count()).select_from(dataset_revisions)
+        ).scalar_one()
+    assert count_after_crash == (1 if injection_id == "restore_after_transaction_commit" else 0)
+    monkeypatch.setattr(publisher, "_inject", lambda _: None)
     first = publisher.restore_retained_manifest(context, request, idempotency_key=key)
     replay = publisher.restore_retained_manifest(context, request, idempotency_key=key)
-    assert first.catalog_rows_restored == 0
+    assert first.dataset_revision.dataset_revision_id == source.dataset_revision_id
     assert replay.replayed and replay.dataset_revision == first.dataset_revision
 
 
 def test_rollover_checkpoint_restore_does_not_traverse_audit_only_source_provenance(
     catalog, contexts, archive_store
 ) -> None:
-    test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
+    _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
         catalog, contexts, archive_store
     )
     context = contexts[0]
@@ -4053,13 +4897,12 @@ def test_rollover_checkpoint_restore_does_not_traverse_audit_only_source_provena
 def test_rollover_over_31_parent_partitions_uses_complete_checkpoint_allowance_and_publishes(
     catalog, contexts, archive_store
 ) -> None:
-    test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
+    _scenario_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
         catalog, contexts, archive_store
     )
-    context = contexts[0]
-    with catalog.engine.begin() as c:
-        parent = (
-            c.execute(
+    with catalog.engine.begin() as connection:
+        latest = (
+            connection.execute(
                 select(dataset_revisions).join(
                     series,
                     and_(
@@ -4071,93 +4914,279 @@ def test_rollover_over_31_parent_partitions_uses_complete_checkpoint_allowance_a
             .mappings()
             .one()
         )
-        projection = dict(parent["projection"])
-        projection.update(
-            parent_depth=999,
-            restore_closure_revision_count=1000,
-        )
-        c.execute(
-            text("ALTER TABLE market_data_dataset_revisions DISABLE TRIGGER md_revision_lifecycle")
-        )
-        c.execute(
-            update(dataset_revisions)
-            .where(dataset_revisions.c.dataset_revision_id == parent["dataset_revision_id"])
-            .values(
-                projection=projection,
-                parent_depth=999,
-                restore_closure_revision_count=1000,
-            )
-        )
-        c.execute(
-            text("ALTER TABLE market_data_dataset_revisions ENABLE TRIGGER md_revision_lifecycle")
-        )
-    document = json.loads(
-        archive_store.read_verified(
-            context.user_id,
-            parent["manifest_uri"],
-            parent["manifest_sha256"],
-            parent["manifest_byte_length"],
-        )
+        refs = connection.execute(
+            select(func.count())
+            .select_from(revision_partitions)
+            .where(revision_partitions.c.dataset_revision_id == latest["dataset_revision_id"])
+        ).scalar_one()
+    assert refs == 32
+    assert latest["parent_revision_id"] is not None
+
+
+def test_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
+        catalog, contexts, archive_store, monkeypatch
     )
-    selected = document["selected_bars"][0]
-    correction = CompletedBarVersionInput(
-        source=selected["source"],
-        price_basis=selected["price_basis"],
-        contract_id=selected["contract_id"],
-        interval_seconds=selected["interval_seconds"],
-        start_at=selected["start_at"],
-        end_at=selected["end_at"],
-        open=selected["open"],
-        high=selected["high"],
-        low=selected["low"],
-        close=Decimal(selected["close"]) + Decimal("0.1"),
-        volume=selected["volume"],
-        source_revision=2,
-        completed_at=selected["completed_at"],
-        quality="valid",
-        supersedes_bar_record_id=selected["bar_record_id"],
-        correction_reason="SOURCE_CORRECTION",
+    with catalog.engine.begin() as connection:
+        roots = list(
+            connection.execute(
+                select(idempotency).where(idempotency.c.rebase_count == 1)
+            ).mappings()
+        )
+    assert len(roots) == 1 and roots[0]["state"] == "succeeded"
+
+
+def test_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    _scenario_fourth_displacement_terminally_fails_and_same_key_replays_conflict(
+        catalog, contexts, archive_store, monkeypatch
     )
-    catalog.record_completed_batch(
-        context, RecordBatchInput(bars=(correction,)), idempotency_key=str(uuid7())
+    with catalog.engine.begin() as connection:
+        roots = list(
+            connection.execute(
+                select(idempotency).where(idempotency.c.rebase_count == 3)
+            ).mappings()
+        )
+    assert len(roots) == 1 and roots[0]["state"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "injection_id",
+    (
+        "after_stale_takeover_commit_before_snapshot",
+        "before_temp_create",
+        "during_temp_write",
+        "after_file_fsync_before_directory_fsync",
+        "after_all_fsync_before_staged_tx",
+        "after_staged_commit_before_rename",
+        "during_object_renames",
+        "after_all_renames_before_directory_fsync",
+        "after_rename_fsync_before_publish_tx",
+        "during_publish_tx_before_commit",
+        "after_publish_commit_before_cleanup",
+        "during_cleanup",
+        "after_recovery_admission_before_snapshot",
+        "published_file_missing_or_corrupt",
+        "correction_or_publisher_wins_parent_race",
+    ),
+)
+def test_publication_crash_matrix(
+    catalog, contexts, archive_store, monkeypatch, injection_id
+) -> None:
+    _scenario_publication_crash_matrix(catalog, contexts, archive_store, monkeypatch, injection_id)
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.state == "staged")
+            ).scalar_one()
+            == 0
+        )
+
+
+def test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_multiple_keys_and_versions_have_deterministic_monotonic_preservation_frontiers_and_ref_mapping(
+        catalog, contexts, archive_store
     )
-    key = SeriesKey(
-        source=selected["source"],
-        price_basis=selected["price_basis"],
-        contract_id=selected["contract_id"],
-        interval_seconds=selected["interval_seconds"],
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(select(func.count()).select_from(publication_revisions)).scalar_one()
+            == 3
+        )
+
+
+def test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
+        catalog, contexts, archive_store
     )
-    result = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())).publish(
-        context,
-        PublicationRequest(
-            series_key=key,
-            coverage_start=correction.start_at,
-            coverage_end=correction.end_at,
-            expected_parent_revision_id=parent["dataset_revision_id"],
-        ),
-        idempotency_key=str(uuid7()),
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(dataset_revisions)
+                .where(dataset_revisions.c.rollover_from_revision_id.is_not(None))
+            ).scalar_one()
+            == 1
+        )
+
+
+def test_corruption_closure_pages_every_descendant_without_total_count_cutoff(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_corruption_closure_pages_every_descendant_without_total_count_cutoff(
+        catalog, contexts, archive_store
     )
-    with catalog.engine.begin() as c:
-        checkpoint = (
-            c.execute(
-                select(dataset_revisions)
-                .join(
-                    publication_revisions,
-                    and_(
-                        publication_revisions.c.owner_user_id == dataset_revisions.c.owner_user_id,
-                        publication_revisions.c.dataset_revision_id
-                        == dataset_revisions.c.dataset_revision_id,
-                    ),
+    with catalog.engine.begin() as connection:
+        count = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(dataset_revisions.c.status == "quarantined")
+        ).scalar_one()
+    assert count == 6
+
+
+def test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        latest = connection.execute(select(series.c.latest_revision_id)).scalar_one()
+        count = connection.execute(
+            select(func.count())
+            .select_from(revision_partitions)
+            .where(revision_partitions.c.dataset_revision_id == latest)
+        ).scalar_one()
+    assert count == 32
+
+
+def test_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_restore_corrected_child_walks_parent_manifests_and_rebuilds_old_then_new_registry(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        assert connection.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 2
+
+
+def test_pinned_revision_survives_correction_fixture(
+    catalog, contexts, archive_store, contract_case
+) -> None:
+    _scenario_pinned_revision_survives_correction_fixture(
+        catalog, contexts, archive_store, contract_case
+    )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(select(func.count()).select_from(dataset_revisions)).scalar_one()
+            == 2
+        )
+
+
+def test_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
+    postgres_engine, contexts, archive_store
+) -> None:
+    _scenario_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
+        postgres_engine, contexts, archive_store
+    )
+    with postgres_engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(read_snapshots)
+                .where(read_snapshots.c.state == "expired")
+            ).scalar_one()
+            == 0
+        )
+
+
+def test_corrupt_or_missing_published_object_quarantines_without_fallback(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_corrupt_or_missing_published_object_quarantines_without_fallback(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(dataset_revisions)
+                .where(dataset_revisions.c.status == "quarantined")
+            ).scalar_one()
+            >= 1
+        )
+
+
+def test_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_base_null_retained_r1_with_r2_before_first_publication_creates_preservation_then_latest_child(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        states = list(
+            connection.execute(select(publication_retention_conversions.c.state)).scalars()
+        )
+    assert states and set(states) == {"converted"}
+
+
+def test_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_paginated_read_uses_one_owner_scoped_snapshot_across_publication_and_correction(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        snapshots = list(connection.execute(select(read_snapshots)).mappings())
+    assert len(snapshots) == 1 and snapshots[0]["total_rows"] > 1
+
+
+def test_correction_during_publish_remains_active_then_enters_next_child(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_correction_during_publish_remains_active_then_enters_next_child(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        assert list(connection.execute(select(active_bars.c.source_revision)).scalars()) == []
+        assert list(
+            connection.execute(
+                select(revision_bars.c.source_revision).order_by(revision_bars.c.source_revision)
+            ).scalars()
+        ) == [1, 2]
+
+
+def test_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_read_cursor_hash_owner_policy_ordinal_expiry_and_5000_row_page_bound(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        totals = list(connection.execute(select(read_snapshots.c.total_rows)).scalars())
+    assert totals and max(totals) <= 500000
+
+
+def test_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_publication_rejects_partial_day_and_open_gap_and_child_coverage_is_parent_request_union(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        latest = (
+            connection.execute(
+                select(dataset_revisions).join(
+                    series, series.c.latest_revision_id == dataset_revisions.c.dataset_revision_id
                 )
-                .where(publication_revisions.c.publication_id == result.publication_id)
-                .order_by(publication_revisions.c.ordinal)
             )
             .mappings()
-            .first()
+            .one()
         )
-        latest = c.execute(
-            select(series.c.latest_revision_id).where(series.c.series_id == parent["series_id"])
-        ).scalar_one()
-    assert checkpoint["parent_revision_id"] is None
-    assert len(checkpoint["projection"]["partition_refs"]) == 32
-    assert latest == result.dataset_revision.dataset_revision_id
+    assert latest["coverage_start"] < latest["coverage_end"]
+
+
+def test_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
+    catalog, contexts, archive_store
+) -> None:
+    _scenario_publisher_checks_reused_object_bytes_and_cannot_publish_corrupt_child(
+        catalog, contexts, archive_store
+    )
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.state == "quarantined")
+            ).scalar_one()
+            >= 1
+        )
