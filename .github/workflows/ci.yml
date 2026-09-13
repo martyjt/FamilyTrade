@@ -6,6 +6,35 @@ on:
     branches: [main]
 
 jobs:
+  access:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: familytrade_test
+          POSTGRES_PASSWORD: familytrade_test_password
+          POSTGRES_DB: familytrade_ft04_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U familytrade_test -d familytrade_ft04_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FAMILYTRADE_TEST_DATABASE_URL: postgresql+psycopg://familytrade_test:familytrade_test_password@127.0.0.1:5432/familytrade_ft04_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.13"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.3"
+      - run: uv sync --frozen --all-groups
+      - run: uv run pytest tests/access
+
   bootstrap:
     strategy:
       fail-fast: false
