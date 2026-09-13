@@ -20,6 +20,7 @@ from familytrade.access.models import (
     ErrorCode,
     LoginResult,
     UserContext,
+    UserDisableResult,
     unauthenticated,
 )
 from familytrade.access.repository import AccessRepository
@@ -103,20 +104,15 @@ class AccessService:
         password_valid = self._password_hash.verify(password, password_hash)
         if user is None or not password_valid or not cast(bool, user["enabled"]):
             raise unauthenticated()
-        now = self._now()
         session_token = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
-        absolute_expires = now + ABSOLUTE_TIMEOUT
-        self._repository.create_session(
+        _, absolute_expires = self._repository.create_session(
             user_id=cast(str, user["user_id"]),
             token_hash=_token_hash(session_token),
             csrf_hash=_token_hash(csrf_token),
-            scopes=cast(list[str], user["scopes"]),
-            is_administrator=cast(bool, user["is_administrator"]),
-            credential_version=cast(int, user["credential_version"]),
-            authenticated_at=now,
-            idle_expires_at=now + IDLE_TIMEOUT,
-            absolute_expires_at=absolute_expires,
+            expected_credential_version=cast(int, user["credential_version"]),
+            idle_timeout=IDLE_TIMEOUT,
+            absolute_timeout=ABSOLUTE_TIMEOUT,
         )
         return LoginResult(
             session_token=session_token,
@@ -127,9 +123,10 @@ class AccessService:
     def authenticate_browser(
         self, session_token: str, *, request_id: str, required_scope: str | None = None
     ) -> UserContext:
-        return self._authenticate_browser(
+        context, _ = self._authenticate_browser(
             session_token, request_id=request_id, required_scope=required_scope, touch=True
         )
+        return context
 
     def _authenticate_browser(
         self,
@@ -138,44 +135,13 @@ class AccessService:
         request_id: str,
         required_scope: str | None,
         touch: bool,
-    ) -> UserContext:
-        now = self._now()
-        session = self._repository.get_session(_token_hash(session_token))
-        if session is None:
-            raise unauthenticated()
-        invalid = (
-            session["revoked_at"] is not None
-            or not cast(bool, session["enabled"])
-            or now >= cast(datetime, session["idle_expires_at"])
-            or now >= cast(datetime, session["absolute_expires_at"])
-            or session["credential_version"] != session["current_credential_version"]
-            or session["is_administrator"] != session["current_is_administrator"]
-        )
-        if invalid:
-            raise unauthenticated()
-        scopes = tuple(sorted(set(cast(list[str], session["scopes"]))))
-        if required_scope is not None and required_scope not in scopes:
-            raise AccessError(
-                ErrorCode.INSUFFICIENT_SCOPE,
-                "The authenticated identity lacks the required scope.",
-                403,
-            )
-        next_idle_expiry = min(now + IDLE_TIMEOUT, cast(datetime, session["absolute_expires_at"]))
-        if touch:
-            self._repository.touch_session(
-                cast(str, session["auth_session_id"]), now, next_idle_expiry
-            )
-        return UserContext(
-            schema_version="v1",
-            user_id=cast(str, session["user_id"]),
-            auth_session_id=cast(str, session["auth_session_id"]),
-            auth_method="browser_session",
-            scopes=scopes,
-            authenticated_at=cast(datetime, session["authenticated_at"]),
-            expires_at=next_idle_expiry,
+    ) -> tuple[UserContext, bytes]:
+        return self._repository.authenticate_session(
+            _token_hash(session_token),
             request_id=request_id,
-            credential_version=cast(int, session["credential_version"]),
-            is_administrator=cast(bool, session["is_administrator"]),
+            required_scope=required_scope,
+            touch=touch,
+            idle_timeout=IDLE_TIMEOUT,
         )
 
     def authorize_browser_write(
@@ -190,18 +156,16 @@ class AccessService:
     ) -> BrowserWriteAuthorization:
         if operation not in BROWSER_WRITE_OPERATIONS:
             raise AccessError(ErrorCode.VALIDATION_ERROR, "Invalid browser write operation.", 422)
-        context = self._authenticate_browser(
+        context, expected_csrf_hash = self._authenticate_browser(
             session_token,
             request_id=request_id,
             required_scope=required_scope,
             touch=False,
         )
-        session = self._repository.get_session(_token_hash(session_token))
-        assert session is not None  # authentication above established the same hashed token
         if origin is None or origin not in self._allowed_origins:
             raise AccessError(ErrorCode.INVALID_ORIGIN, "Request origin is not allowed.", 403)
         supplied_csrf_hash = _token_hash(csrf_token)
-        if not secrets.compare_digest(supplied_csrf_hash, cast(bytes, session["csrf_hash"])):
+        if not secrets.compare_digest(supplied_csrf_hash, expected_csrf_hash):
             raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation failed.", 403)
         authorization_token = secrets.token_urlsafe(32)
         expires_at = self._repository.create_write_authorization(
@@ -221,10 +185,19 @@ class AccessService:
     def logout(self, authorization: BrowserWriteAuthorization) -> None:
         self._repository.revoke_authorized_session(authorization)
 
-    def disable_user(self, authorization: BrowserWriteAuthorization, target_user_id: str) -> None:
+    def disable_user(
+        self,
+        authorization: BrowserWriteAuthorization,
+        target_user_id: str,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> UserDisableResult:
         """Disable an invited user through a server-derived administrator session."""
         try:
-            self._repository.disable_authorized_user(authorization, target_user_id)
+            return self._repository.disable_authorized_user(
+                authorization, target_user_id, expected_version, idempotency_key
+            )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
             raise
@@ -329,7 +302,7 @@ class AccessService:
             self._repository.audit_authorized_not_found(authorization)
 
     def _require_current_context(self, context: UserContext) -> None:
-        if not self._repository.context_is_current(context, self._now()):
+        if not self._repository.context_is_current(context):
             raise unauthenticated()
 
     @staticmethod

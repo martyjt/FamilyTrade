@@ -3,13 +3,15 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import uuid7
 
 import pytest
+from sqlalchemy import func, text, update
 from sqlalchemy.engine import Engine
 
 from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, BrowserWriteAuthorization, ErrorCode
-from familytrade.access.repository import AccessRepository
+from familytrade.access.repository import AccessRepository, sessions
 from familytrade.access.service import ABSOLUTE_TIMEOUT, IDLE_TIMEOUT, AccessService
 
 
@@ -82,8 +84,12 @@ def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engi
     assert context.scopes == ("lanes:read",)
     assert context.is_administrator is True
     assert context.auth_session_id not in login.session_token
-    assert context.expires_at == clock.value + IDLE_TIMEOUT
-    assert login.expires_at == clock.value + ABSOLUTE_TIMEOUT
+    assert (
+        IDLE_TIMEOUT
+        <= context.expires_at - context.authenticated_at
+        < IDLE_TIMEOUT + timedelta(seconds=5)
+    )
+    assert login.expires_at - context.authenticated_at == ABSOLUTE_TIMEOUT
     assert service.cookie_settings.secure is True
     assert service.cookie_settings.httponly is True
     assert service.cookie_settings.samesite == "lax"
@@ -94,7 +100,7 @@ def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engi
 
 
 def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: Engine) -> None:
-    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    clock = MutableClock(datetime(2000, 1, 1, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
     user_id = service.invite_user(
         "alice", "test-password-A!", {"lanes:read"}, is_administrator=True
@@ -113,7 +119,12 @@ def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: En
     disable_authorization = authorize(
         service, admin_login.session_token, admin_login.csrf_token, "user.disable"
     )
-    service.disable_user(disable_authorization, user_id)
+    service.disable_user(
+        disable_authorization,
+        user_id,
+        expected_version=1,
+        idempotency_key=str(uuid7()),
+    )
     with pytest.raises(AccessError, match="Authentication is required"):
         service.login("alice", "test-password-A!")
 
@@ -128,21 +139,36 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
     )
 
     idle_login = service.login("alice", "test-password-A!")
-    clock.value += IDLE_TIMEOUT
+    idle_context = service.authenticate_browser(idle_login.session_token, request_id="initial-idle")
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            update(sessions)
+            .where(sessions.c.auth_session_id == idle_context.auth_session_id)
+            .values(
+                authenticated_at=func.clock_timestamp() - text("interval '2 hours'"),
+                idle_expires_at=func.clock_timestamp() - text("interval '1 second'"),
+            )
+        )
     with pytest.raises(AccessError) as idle_error:
         service.authenticate_browser(idle_login.session_token, request_id="idle")
     assert idle_error.value.code is ErrorCode.UNAUTHENTICATED
 
-    clock.value = datetime(2026, 9, 13, 1, 0, tzinfo=UTC)
     absolute_login = service.login("alice", "test-password-A!")
-    for _ in range(15):
-        clock.value += timedelta(hours=11)
-        service.authenticate_browser(absolute_login.session_token, request_id="touch")
-    clock.value = absolute_login.expires_at
+    absolute_context = service.authenticate_browser(
+        absolute_login.session_token, request_id="initial-absolute"
+    )
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            update(sessions)
+            .where(sessions.c.auth_session_id == absolute_context.auth_session_id)
+            .values(
+                authenticated_at=func.clock_timestamp() - text("interval '2 hours'"),
+                absolute_expires_at=func.clock_timestamp() - text("interval '1 second'"),
+            )
+        )
     with pytest.raises(AccessError):
         service.authenticate_browser(absolute_login.session_token, request_id="absolute")
 
-    clock.value = datetime(2026, 9, 13, 2, 0, tzinfo=UTC)
     revoked_login = service.login("alice", "test-password-A!")
     logout_authorization = authorize(
         service, revoked_login.session_token, revoked_login.csrf_token, "session.logout"
@@ -168,7 +194,29 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
         replacement_login.csrf_token,
         "user.disable",
     )
-    service.disable_user(disable_authorization, user_id)
+    service.disable_user(
+        disable_authorization,
+        user_id,
+        expected_version=2,
+        idempotency_key=str(uuid7()),
+    )
+
+
+def test_login_and_idle_projection_ignore_ahead_app_clock(postgres_engine: Engine) -> None:
+    clock = MutableClock(datetime(2099, 1, 1, 1, 0, tzinfo=UTC))
+    service = service_for(postgres_engine, clock)
+    service.invite_user("alice", "test-password-A!", {"lanes:read"})
+    with postgres_engine.connect() as connection:
+        before = connection.scalar(func.clock_timestamp())
+    login = service.login("alice", "test-password-A!")
+    context = service.authenticate_browser(login.session_token, request_id="database-clock")
+    with postgres_engine.connect() as connection:
+        after = connection.scalar(func.clock_timestamp())
+    assert before is not None and after is not None
+    assert before <= context.authenticated_at <= after
+    assert context.authenticated_at.year != 2099
+    assert login.expires_at == context.authenticated_at + ABSOLUTE_TIMEOUT
+    assert before + IDLE_TIMEOUT <= context.expires_at <= after + IDLE_TIMEOUT
 
 
 def test_scope_csrf_token_binding_origin_operation_and_forgery(postgres_engine: Engine) -> None:
@@ -260,7 +308,12 @@ def test_disable_user_requires_current_administrator_and_keeps_targets_opaque(
         service, reader.session_token, reader.csrf_token, "user.disable"
     )
     with pytest.raises(AccessError) as non_admin:
-        service.disable_user(reader_authorization, target_id)
+        service.disable_user(
+            reader_authorization,
+            target_id,
+            expected_version=1,
+            idempotency_key=str(uuid7()),
+        )
     assert non_admin.value.code is ErrorCode.INSUFFICIENT_SCOPE
     assert service.login("target", "test-password-target!")
 
@@ -268,20 +321,62 @@ def test_disable_user_requires_current_administrator_and_keeps_targets_opaque(
         service, admin.session_token, admin.csrf_token, "user.disable"
     )
     with pytest.raises(AccessError) as missing:
-        service.disable_user(missing_authorization, "00000000-0000-0000-0000-000000000000")
+        service.disable_user(
+            missing_authorization,
+            "00000000-0000-0000-0000-000000000000",
+            expected_version=1,
+            idempotency_key=str(uuid7()),
+        )
     assert missing.value.code is ErrorCode.NOT_FOUND
 
     disable_authorization = authorize(
         service, admin.session_token, admin.csrf_token, "user.disable"
     )
-    service.disable_user(disable_authorization, target_id)
+    disable_key = str(uuid7())
+    disabled = service.disable_user(
+        disable_authorization,
+        target_id,
+        expected_version=1,
+        idempotency_key=disable_key,
+    )
+    assert disabled.target_user_id == target_id
+    assert disabled.enabled is False
+    assert disabled.record_version == 2
     with pytest.raises(AccessError) as disabled_login:
         service.login("target", "test-password-target!")
     assert disabled_login.value.code is ErrorCode.UNAUTHENTICATED
 
+    replay_authorization = authorize(service, admin.session_token, admin.csrf_token, "user.disable")
+    assert (
+        service.disable_user(
+            replay_authorization,
+            target_id,
+            expected_version=1,
+            idempotency_key=disable_key,
+        )
+        == disabled
+    )
+
+    conflict_authorization = authorize(
+        service, admin.session_token, admin.csrf_token, "user.disable"
+    )
+    with pytest.raises(AccessError) as conflict:
+        service.disable_user(
+            conflict_authorization,
+            target_id,
+            expected_version=2,
+            idempotency_key=disable_key,
+        )
+    assert conflict.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
     repeat_authorization = authorize(service, admin.session_token, admin.csrf_token, "user.disable")
     with pytest.raises(AccessError) as repeated:
-        service.disable_user(repeat_authorization, target_id)
+        service.disable_user(
+            repeat_authorization,
+            target_id,
+            expected_version=1,
+            idempotency_key=str(uuid7()),
+        )
     assert repeated.value.code is ErrorCode.NOT_FOUND
 
 

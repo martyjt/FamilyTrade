@@ -575,6 +575,31 @@ def test_database_clock_controls_mutation_projection_despite_app_clock_skew(
     assert account.created_at.year != 2099
 
 
+def test_database_expired_session_cannot_revalidate_read_context_with_behind_app_clock(
+    postgres_engine: Engine,
+) -> None:
+    clock = MutableClock(datetime(2000, 1, 1, 1, 0, tzinfo=UTC))
+    service = make_service(postgres_engine, clock=clock)
+    alice = logged_in(service, "alice")
+    account = service.create_broker_account(
+        authorize(service, alice, "broker_account.create"),
+        account_payload("ACCOUNT-1111", b"read-expiry-secret"),
+        idempotency_key=str(uuid7()),
+    )
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            update(sessions)
+            .where(sessions.c.auth_session_id == alice.auth_session_id)
+            .values(
+                authenticated_at=func.clock_timestamp() - text("interval '2 hours'"),
+                idle_expires_at=func.clock_timestamp() - text("interval '1 second'"),
+            )
+        )
+    with pytest.raises(AccessError) as expired:
+        service.get_broker_account(alice, account.broker_account_id)
+    assert expired.value.code is ErrorCode.UNAUTHENTICATED
+
+
 def test_failed_idempotent_outcomes_survive_rollback_and_dependency_recovery(
     postgres_engine: Engine,
 ) -> None:
@@ -957,6 +982,74 @@ def test_concurrent_disable_revalidation_prevents_mutation_commit(postgres_engin
     assert denied.value.code is ErrorCode.UNAUTHENTICATED
     with postgres_engine.connect() as connection:
         assert connection.scalar(select(func.count()).select_from(broker_accounts)) == 0
+
+
+def test_user_disable_version_fence_durable_error_and_concurrent_single_commit(
+    postgres_engine: Engine,
+) -> None:
+    service = make_service(postgres_engine)
+    admin = logged_in(service, "admin")
+    stale_target = service.invite_user(
+        "stale-target", "test-password-stale-target!", {"lanes:read"}
+    )
+    stale_key = str(uuid7())
+    with pytest.raises(AccessError) as first_stale:
+        service.disable_user(
+            authorize(service, admin, "user.disable"),
+            stale_target,
+            expected_version=9,
+            idempotency_key=stale_key,
+        )
+    assert first_stale.value.code is ErrorCode.STALE_VERSION
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            update(users).where(users.c.user_id == stale_target).values(record_version=9)
+        )
+    with pytest.raises(AccessError) as replayed_stale:
+        service.disable_user(
+            authorize(service, admin, "user.disable"),
+            stale_target,
+            expected_version=9,
+            idempotency_key=stale_key,
+        )
+    assert replayed_stale.value.envelope("replay") == first_stale.value.envelope("replay")
+    with postgres_engine.connect() as connection:
+        stored_error = connection.scalar(
+            select(idempotency_records.c.result).where(
+                idempotency_records.c.owner_user_id == admin.user_id,
+                idempotency_records.c.operation == "user.disable",
+                idempotency_records.c.idempotency_key == stale_key,
+            )
+        )
+    assert stale_target not in json.dumps(stored_error)
+
+    concurrent_target = service.invite_user(
+        "concurrent-target", "test-password-concurrent!", {"lanes:read"}
+    )
+    authorizations = [authorize(service, admin, "user.disable") for _ in range(2)]
+    keys = [str(uuid7()), str(uuid7())]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                service.disable_user,
+                authorization,
+                concurrent_target,
+                expected_version=1,
+                idempotency_key=key,
+            )
+            for authorization, key in zip(authorizations, keys, strict=True)
+        ]
+        outcomes: list[object] = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=10))
+            except AccessError as error:
+                outcomes.append(error)
+    successes = [outcome for outcome in outcomes if not isinstance(outcome, AccessError)]
+    denials = [outcome for outcome in outcomes if isinstance(outcome, AccessError)]
+    assert len(successes) == 1
+    assert len(denials) == 1
+    assert denials[0].code is ErrorCode.NOT_FOUND
 
     bob = logged_in(service, "bob")
     revocation_authorization = authorize(service, bob, "broker_account.create")

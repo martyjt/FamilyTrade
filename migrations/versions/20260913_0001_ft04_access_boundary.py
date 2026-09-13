@@ -26,9 +26,11 @@ def upgrade() -> None:
         sa.Column("is_administrator", sa.Boolean(), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False),
         sa.Column("credential_version", sa.Integer(), nullable=False),
+        sa.Column("record_version", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("credential_version >= 1", name="ck_access_users_credential_version"),
+        sa.CheckConstraint("record_version >= 1", name="ck_access_users_record_version"),
     )
     op.create_table(
         "access_sessions",

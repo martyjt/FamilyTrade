@@ -120,6 +120,14 @@ class LoginResult:
 
 
 @dataclass(frozen=True, slots=True)
+class UserDisableResult:
+    schema_version: Literal["v1"]
+    target_user_id: str
+    enabled: Literal[False]
+    record_version: int
+
+
+@dataclass(frozen=True, slots=True)
 class CookieSettings:
     secure: Literal[True] = True
     httponly: Literal[True] = True

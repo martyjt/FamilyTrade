@@ -47,6 +47,7 @@ from familytrade.access.models import (
     BrowserWriteAuthorization,
     ErrorCode,
     UserContext,
+    UserDisableResult,
     not_found,
     parse_broker_account_create,
     stale_version,
@@ -72,9 +73,11 @@ users = Table(
     Column("is_administrator", Boolean, nullable=False),
     Column("enabled", Boolean, nullable=False),
     Column("credential_version", Integer, nullable=False),
+    Column("record_version", Integer, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     CheckConstraint("credential_version >= 1", name="ck_access_users_credential_version"),
+    CheckConstraint("record_version >= 1", name="ck_access_users_record_version"),
 )
 
 sessions = Table(
@@ -293,6 +296,7 @@ class AccessRepository:
                         is_administrator=is_administrator,
                         enabled=True,
                         credential_version=1,
+                        record_version=1,
                         created_at=now,
                         updated_at=now,
                     )
@@ -317,24 +321,37 @@ class AccessRepository:
         user_id: str,
         token_hash: bytes,
         csrf_hash: bytes,
-        scopes: Sequence[str],
-        is_administrator: bool,
-        credential_version: int,
-        authenticated_at: datetime,
-        idle_expires_at: datetime,
-        absolute_expires_at: datetime,
-    ) -> str:
+        expected_credential_version: int,
+        idle_timeout: timedelta,
+        absolute_timeout: timedelta,
+    ) -> tuple[str, datetime]:
         session_id = str(uuid7())
         with self._engine.begin() as connection:
+            user = (
+                connection.execute(
+                    select(users).where(users.c.user_id == user_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if (
+                user is None
+                or not cast(bool, user["enabled"])
+                or user["credential_version"] != expected_credential_version
+            ):
+                raise unauthenticated()
+            authenticated_at = cast(datetime, connection.scalar(select(func.clock_timestamp())))
+            idle_expires_at = authenticated_at + idle_timeout
+            absolute_expires_at = authenticated_at + absolute_timeout
             connection.execute(
                 insert(sessions).values(
                     auth_session_id=session_id,
                     user_id=user_id,
                     token_hash=token_hash,
                     csrf_hash=csrf_hash,
-                    scopes=list(scopes),
-                    is_administrator=is_administrator,
-                    credential_version=credential_version,
+                    scopes=list(cast(list[str], user["scopes"])),
+                    is_administrator=cast(bool, user["is_administrator"]),
+                    credential_version=cast(int, user["credential_version"]),
                     authenticated_at=authenticated_at,
                     last_seen_at=authenticated_at,
                     idle_expires_at=idle_expires_at,
@@ -342,23 +359,84 @@ class AccessRepository:
                     revoked_at=None,
                 )
             )
-        return session_id
+        return session_id, absolute_expires_at
 
-    def get_session(self, token_hash: bytes) -> RowMapping | None:
-        statement = (
-            select(
-                sessions,
-                users.c.enabled,
-                users.c.credential_version.label("current_credential_version"),
-                users.c.is_administrator.label("current_is_administrator"),
+    def authenticate_session(
+        self,
+        token_hash: bytes,
+        *,
+        request_id: str,
+        required_scope: str | None,
+        touch: bool,
+        idle_timeout: timedelta,
+    ) -> tuple[UserContext, bytes]:
+        with self._engine.begin() as connection:
+            session = (
+                connection.execute(
+                    select(
+                        sessions,
+                        users.c.enabled,
+                        users.c.credential_version.label("current_credential_version"),
+                        users.c.is_administrator.label("current_is_administrator"),
+                    )
+                    .join(users, sessions.c.user_id == users.c.user_id)
+                    .where(sessions.c.token_hash == token_hash)
+                    .with_for_update(of=[sessions, users])
+                )
+                .mappings()
+                .one_or_none()
             )
-            .join(users, sessions.c.user_id == users.c.user_id)
-            .where(sessions.c.token_hash == token_hash)
-        )
-        with self._engine.connect() as connection:
-            return connection.execute(statement).mappings().one_or_none()
+            now = cast(datetime, connection.scalar(select(func.clock_timestamp())))
+            if (
+                session is None
+                or session["revoked_at"] is not None
+                or not cast(bool, session["enabled"])
+                or now >= cast(datetime, session["idle_expires_at"])
+                or now >= cast(datetime, session["absolute_expires_at"])
+                or session["credential_version"] != session["current_credential_version"]
+                or session["is_administrator"] != session["current_is_administrator"]
+            ):
+                raise unauthenticated()
+            scopes = tuple(sorted(set(cast(list[str], session["scopes"]))))
+            if required_scope is not None and required_scope not in scopes:
+                raise AccessError(
+                    ErrorCode.INSUFFICIENT_SCOPE,
+                    "The authenticated identity lacks the required scope.",
+                    403,
+                )
+            next_idle_expiry = min(
+                now + idle_timeout, cast(datetime, session["absolute_expires_at"])
+            )
+            if touch:
+                connection.execute(
+                    update(sessions)
+                    .where(sessions.c.auth_session_id == session["auth_session_id"])
+                    .values(last_seen_at=now, idle_expires_at=next_idle_expiry)
+                )
+            return (
+                UserContext(
+                    schema_version="v1",
+                    user_id=cast(str, session["user_id"]),
+                    auth_session_id=cast(str, session["auth_session_id"]),
+                    auth_method="browser_session",
+                    scopes=scopes,
+                    authenticated_at=cast(datetime, session["authenticated_at"]),
+                    expires_at=(
+                        next_idle_expiry
+                        if touch
+                        else min(
+                            cast(datetime, session["idle_expires_at"]),
+                            cast(datetime, session["absolute_expires_at"]),
+                        )
+                    ),
+                    request_id=request_id,
+                    credential_version=cast(int, session["credential_version"]),
+                    is_administrator=cast(bool, session["is_administrator"]),
+                ),
+                cast(bytes, session["csrf_hash"]),
+            )
 
-    def context_is_current(self, context: UserContext, now: datetime) -> bool:
+    def context_is_current(self, context: UserContext) -> bool:
         statement = (
             select(sessions.c.auth_session_id)
             .join(users, sessions.c.user_id == users.c.user_id)
@@ -372,8 +450,8 @@ class AccessRepository:
                 sessions.c.scopes == list(context.scopes),
                 users.c.enabled.is_(True),
                 sessions.c.revoked_at.is_(None),
-                sessions.c.idle_expires_at > now,
-                sessions.c.absolute_expires_at > now,
+                sessions.c.idle_expires_at > func.clock_timestamp(),
+                sessions.c.absolute_expires_at > func.clock_timestamp(),
             )
         )
         with self._engine.connect() as connection:
@@ -435,14 +513,6 @@ class AccessRepository:
             )
             return expires_at
 
-    def touch_session(self, session_id: str, now: datetime, idle_expires_at: datetime) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(
-                update(sessions)
-                .where(sessions.c.auth_session_id == session_id)
-                .values(last_seen_at=now, idle_expires_at=idle_expires_at)
-            )
-
     def revoke_session(self, session_id: str, now: datetime) -> None:
         with self._engine.begin() as connection:
             connection.execute(
@@ -485,6 +555,7 @@ class AccessRepository:
                 .values(
                     password_hash=password_hash,
                     credential_version=users.c.credential_version + 1,
+                    record_version=users.c.record_version + 1,
                     updated_at=now,
                 )
             )
@@ -496,31 +567,66 @@ class AccessRepository:
             )
 
     def disable_authorized_user(
-        self, authorization: BrowserWriteAuthorization, target_user_id: str
-    ) -> None:
+        self,
+        authorization: BrowserWriteAuthorization,
+        target_user_id: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> UserDisableResult:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
                 connection, authorization, "user.disable"
             )
             target = (
                 connection.execute(
-                    select(users.c.user_id, users.c.enabled)
+                    select(users.c.user_id, users.c.enabled, users.c.record_version)
                     .where(users.c.user_id == target_user_id)
                     .with_for_update()
                 )
                 .mappings()
                 .one_or_none()
             )
-            if target is None or not cast(bool, target["enabled"]):
-                raise not_found()
+            request_sha256 = _request_hash(
+                {"target_user_id": target_user_id, "expected_version": expected_version}
+            )
+            replay = self._begin_user_disable_idempotent(
+                connection,
+                context,
+                idempotency_key,
+                request_sha256,
+                now,
+            )
             context, now = self._consume_write_authorization(
                 connection, authorization, "user.disable"
             )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
+            if replay is not None:
+                self._finish_write_authorization(connection, authorization, now)
+                return replay
+            try:
+                if target is None or not cast(bool, target["enabled"]):
+                    raise not_found()
+                current_version = cast(int, target["record_version"])
+                if current_version != expected_version:
+                    raise stale_version(expected_version, current_version)
+            except AccessError as error:
+                self._finish_idempotent_error(
+                    connection, context, "user.disable", idempotency_key, error
+                )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise
             result = connection.execute(
                 update(users)
                 .where(users.c.user_id == target_user_id, users.c.enabled.is_(True))
                 .values(
-                    enabled=False, credential_version=users.c.credential_version + 1, updated_at=now
+                    enabled=False,
+                    credential_version=users.c.credential_version + 1,
+                    record_version=users.c.record_version + 1,
+                    updated_at=now,
                 )
             )
             assert result.rowcount == 1
@@ -530,7 +636,15 @@ class AccessRepository:
                 .values(revoked_at=now)
             )
             self._audit(connection, context.user_id, "USER_DISABLED", None, now)
+            disabled = UserDisableResult(
+                schema_version="v1",
+                target_user_id=target_user_id,
+                enabled=False,
+                record_version=expected_version + 1,
+            )
+            self._finish_user_disable_idempotent(connection, context, idempotency_key, disabled)
             self._finish_write_authorization(connection, authorization, now)
+            return disabled
 
     def change_password(self, user_id: str, password_hash: str, now: datetime) -> None:
         with self._engine.begin() as connection:
@@ -547,6 +661,7 @@ class AccessRepository:
                 .values(
                     password_hash=password_hash,
                     credential_version=users.c.credential_version + 1,
+                    record_version=users.c.record_version + 1,
                     updated_at=now,
                 )
             )
@@ -1277,6 +1392,100 @@ class AccessRepository:
                         "http_status": error.http_status,
                         "retryable": error.retryable,
                         "details": safe_details,
+                    },
+                }
+            )
+        )
+
+    @staticmethod
+    def _begin_user_disable_idempotent(
+        connection: Connection,
+        context: UserContext,
+        idempotency_key: str,
+        request_sha256: bytes,
+        now: datetime,
+    ) -> UserDisableResult | AccessError | None:
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        connection.execute(
+            pg_insert(idempotency_records)
+            .values(
+                owner_user_id=context.user_id,
+                operation="user.disable",
+                idempotency_key=normalized_key,
+                request_sha256=request_sha256,
+                result=None,
+                created_at=now,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    idempotency_records.c.owner_user_id,
+                    idempotency_records.c.operation,
+                    idempotency_records.c.idempotency_key,
+                ]
+            )
+        )
+        record = (
+            connection.execute(
+                select(idempotency_records)
+                .where(
+                    idempotency_records.c.owner_user_id == context.user_id,
+                    idempotency_records.c.operation == "user.disable",
+                    idempotency_records.c.idempotency_key == normalized_key,
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one()
+        )
+        if not hmac.compare_digest(cast(bytes, record["request_sha256"]), request_sha256):
+            raise AccessError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "The idempotency key was reused with a different request.",
+                409,
+            )
+        stored_result = cast(dict[str, Any] | None, record["result"])
+        if stored_result is None:
+            return None
+        if stored_result.get("outcome") == "error":
+            stored_error = cast(dict[str, Any], stored_result["error"])
+            return AccessError(
+                ErrorCode(cast(str, stored_error["code"])),
+                cast(str, stored_error["message"]),
+                cast(int, stored_error["http_status"]),
+                retryable=cast(bool, stored_error["retryable"]),
+                details=cast(dict[str, Any], stored_error["details"]),
+            )
+        value = cast(dict[str, Any], stored_result["value"])
+        return UserDisableResult(
+            schema_version="v1",
+            target_user_id=cast(str, value["target_user_id"]),
+            enabled=False,
+            record_version=cast(int, value["record_version"]),
+        )
+
+    @staticmethod
+    def _finish_user_disable_idempotent(
+        connection: Connection,
+        context: UserContext,
+        idempotency_key: str,
+        result: UserDisableResult,
+    ) -> None:
+        connection.execute(
+            update(idempotency_records)
+            .where(
+                idempotency_records.c.owner_user_id == context.user_id,
+                idempotency_records.c.operation == "user.disable",
+                idempotency_records.c.idempotency_key
+                == _normalize_idempotency_key(idempotency_key),
+            )
+            .values(
+                result={
+                    "outcome": "success",
+                    "value": {
+                        "schema_version": result.schema_version,
+                        "target_user_id": result.target_user_id,
+                        "enabled": result.enabled,
+                        "record_version": result.record_version,
                     },
                 }
             )
