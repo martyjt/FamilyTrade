@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -558,6 +560,66 @@ def test_logout_and_password_change_are_idempotent_fenced_and_secret_safe(
     assert logout_authorization.authorization_token not in serialized_results
     assert stale_authorization.authorization_token not in serialized_results
     assert service.login("alice", replacement_secret)
+
+
+def test_passwords_use_nfc_and_slow_idempotency_discriminator(
+    postgres_engine: Engine,
+) -> None:
+    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    service = service_for(postgres_engine, clock)
+    initial_nfc = "initial-pássword-value!"
+    initial_nfd = unicodedata.normalize("NFD", initial_nfc)
+    user_id = service.invite_user("alice", initial_nfd, {"lanes:read"})
+    login = service.login("alice", initial_nfc)
+
+    replacement_nfc = "replacement-pássword-value!"
+    replacement_nfd = unicodedata.normalize("NFD", replacement_nfc)
+    authorization = authorize(service, login.session_token, login.csrf_token, "password.change")
+    idempotency_key = str(uuid7())
+    changed = service.change_password(
+        authorization,
+        replacement_nfd,
+        expected_version=1,
+        idempotency_key=idempotency_key,
+    )
+    assert (
+        service.change_password(
+            authorization,
+            replacement_nfc,
+            expected_version=1,
+            idempotency_key=idempotency_key,
+        )
+        == changed
+    )
+    assert service.login("alice", replacement_nfd)
+
+    fast_password_sha = hashlib.sha256(replacement_nfc.encode("utf-8")).hexdigest()
+    prior_canonical = json.dumps(
+        {"expected_version": 1, "password_sha256": fast_password_sha},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    prior_request_hash = hashlib.sha256(prior_canonical.encode("utf-8")).digest()
+    with postgres_engine.connect() as connection:
+        record = (
+            connection.execute(
+                select(idempotency_records).where(
+                    idempotency_records.c.owner_user_id == user_id,
+                    idempotency_records.c.operation == "password.change",
+                    idempotency_records.c.idempotency_key == idempotency_key,
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert record["request_sha256"] != prior_request_hash
+    assert record["request_sha256"] != hashlib.sha256(replacement_nfc.encode("utf-8")).digest()
+    stored = json.dumps(record["result"])
+    assert fast_password_sha not in stored
+    assert replacement_nfc not in stored
+    assert replacement_nfd not in stored
+    assert record["result"]["password_discriminator"].startswith("$argon2")
+    assert replacement_nfc not in repr(record["result"])
 
 
 def test_kek_test_value_is_base64_not_a_repository_secret() -> None:

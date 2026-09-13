@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import unicodedata
 from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -87,11 +88,12 @@ class AccessService:
     ) -> str:
         """Administrator-only bootstrap operation; it is deliberately not a public route."""
         normalized = _normalize_username(username)
-        _validate_password(initial_password)
+        normalized_password = _normalize_password(initial_password)
+        _validate_password(normalized_password)
         normalized_scopes = _normalize_scopes(scopes)
         return self._repository.create_invited_user(
             normalized,
-            self._password_hash.hash(initial_password),
+            self._password_hash.hash(normalized_password),
             normalized_scopes,
             is_administrator,
             self._now(),
@@ -99,11 +101,12 @@ class AccessService:
 
     def login(self, username: str, password: str) -> LoginResult:
         normalized = _normalize_username(username)
+        normalized_password = _normalize_password(password)
         user = self._repository.get_user_for_login(normalized)
         password_hash = (
             cast(str, user["password_hash"]) if user is not None else self._dummy_password_hash
         )
-        password_valid = self._password_hash.verify(password, password_hash)
+        password_valid = self._password_hash.verify(normalized_password, password_hash)
         if user is None or not password_valid or not cast(bool, user["enabled"]):
             raise unauthenticated()
         session_token = secrets.token_urlsafe(32)
@@ -214,11 +217,13 @@ class AccessService:
         expected_version: int,
         idempotency_key: str,
     ) -> PasswordChangeResult:
-        _validate_password(new_password)
+        normalized_password = _normalize_password(new_password)
+        _validate_password(normalized_password)
         return self._repository.change_authorized_password(
             authorization,
-            self._password_hash.hash(new_password),
-            hashlib.sha256(new_password.encode("utf-8")).hexdigest(),
+            self._password_hash.hash(normalized_password),
+            normalized_password,
+            self._password_hash.verify,
             expected_version,
             idempotency_key,
         )
@@ -350,6 +355,10 @@ def _validate_password(password: str) -> None:
             "Password must contain between 12 and 1024 characters.",
             422,
         )
+
+
+def _normalize_password(password: str) -> str:
+    return unicodedata.normalize("NFC", password)
 
 
 def _normalize_scopes(scopes: Collection[str]) -> tuple[str, ...]:

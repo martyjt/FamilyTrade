@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid7
@@ -588,14 +588,13 @@ class AccessRepository:
         self,
         authorization: BrowserWriteAuthorization,
         password_hash: str,
-        password_sha256: str,
+        normalized_password: str,
+        verify_password: Callable[[str, str], bool],
         expected_version: int,
         idempotency_key: str,
     ) -> PasswordChangeResult:
         with self._engine.begin() as connection:
-            request_sha256 = _request_hash(
-                {"password_sha256": password_sha256, "expected_version": expected_version}
-            )
+            request_sha256 = _request_hash({"expected_version": expected_version})
             try:
                 context, now = self._consume_write_authorization(
                     connection,
@@ -610,6 +609,8 @@ class AccessRepository:
                     "password.change",
                     idempotency_key,
                     request_sha256,
+                    normalized_password=normalized_password,
+                    verify_password=verify_password,
                 )
                 if replay is None:
                     raise
@@ -618,8 +619,14 @@ class AccessRepository:
                 return PasswordChangeResult(
                     schema_version="v1", record_version=cast(int, replay["record_version"])
                 )
-            replay = self._begin_simple_idempotent(
-                connection, context, "password.change", idempotency_key, request_sha256, now
+            replay = self._begin_password_change_idempotent(
+                connection,
+                context,
+                idempotency_key,
+                request_sha256,
+                normalized_password,
+                verify_password,
+                now,
             )
             context, now = self._consume_write_authorization(
                 connection,
@@ -641,8 +648,8 @@ class AccessRepository:
             )
             if current_version != expected_version:
                 error = stale_version(expected_version, cast(int, current_version))
-                self._finish_simple_idempotent_error(
-                    connection, context, "password.change", idempotency_key, error
+                self._finish_password_change_idempotent_error(
+                    connection, context, idempotency_key, password_hash, error
                 )
                 self._finish_write_authorization(connection, authorization, now)
                 connection.commit()
@@ -658,11 +665,11 @@ class AccessRepository:
                 )
             )
             changed = PasswordChangeResult(schema_version="v1", record_version=expected_version + 1)
-            self._finish_simple_idempotent(
+            self._finish_password_change_idempotent(
                 connection,
                 context,
-                "password.change",
                 idempotency_key,
+                password_hash,
                 {
                     "schema_version": changed.schema_version,
                     "record_version": changed.record_version,
@@ -1583,11 +1590,83 @@ class AccessRepository:
         )
 
     @staticmethod
-    def _finish_simple_idempotent_error(
+    def _begin_password_change_idempotent(
         connection: Connection,
         context: UserContext,
-        operation: str,
         idempotency_key: str,
+        request_sha256: bytes,
+        normalized_password: str,
+        verify_password: Callable[[str, str], bool],
+        now: datetime,
+    ) -> dict[str, Any] | AccessError | None:
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        connection.execute(
+            pg_insert(idempotency_records)
+            .values(
+                owner_user_id=context.user_id,
+                operation="password.change",
+                idempotency_key=normalized_key,
+                request_sha256=request_sha256,
+                result=None,
+                created_at=now,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    idempotency_records.c.owner_user_id,
+                    idempotency_records.c.operation,
+                    idempotency_records.c.idempotency_key,
+                ]
+            )
+        )
+        record = (
+            connection.execute(
+                select(idempotency_records)
+                .where(
+                    idempotency_records.c.owner_user_id == context.user_id,
+                    idempotency_records.c.operation == "password.change",
+                    idempotency_records.c.idempotency_key == normalized_key,
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one()
+        )
+        return _decode_password_idempotent(
+            record, request_sha256, normalized_password, verify_password
+        )
+
+    @staticmethod
+    def _finish_password_change_idempotent(
+        connection: Connection,
+        context: UserContext,
+        idempotency_key: str,
+        password_discriminator: str,
+        value: dict[str, Any],
+    ) -> None:
+        connection.execute(
+            update(idempotency_records)
+            .where(
+                idempotency_records.c.owner_user_id == context.user_id,
+                idempotency_records.c.operation == "password.change",
+                idempotency_records.c.idempotency_key
+                == _normalize_idempotency_key(idempotency_key),
+            )
+            .values(
+                result={
+                    "outcome": "success",
+                    "auth_session_id": context.auth_session_id,
+                    "password_discriminator": password_discriminator,
+                    "value": value,
+                }
+            )
+        )
+
+    @staticmethod
+    def _finish_password_change_idempotent_error(
+        connection: Connection,
+        context: UserContext,
+        idempotency_key: str,
+        password_discriminator: str,
         error: AccessError,
     ) -> None:
         safe_detail_keys = {"expected_version", "current_version", "path", "paths"}
@@ -1598,7 +1677,7 @@ class AccessRepository:
             update(idempotency_records)
             .where(
                 idempotency_records.c.owner_user_id == context.user_id,
-                idempotency_records.c.operation == operation,
+                idempotency_records.c.operation == "password.change",
                 idempotency_records.c.idempotency_key
                 == _normalize_idempotency_key(idempotency_key),
             )
@@ -1606,6 +1685,7 @@ class AccessRepository:
                 result={
                     "outcome": "error",
                     "auth_session_id": context.auth_session_id,
+                    "password_discriminator": password_discriminator,
                     "error": {
                         "code": error.code.value,
                         "message": error.message,
@@ -1644,6 +1724,9 @@ class AccessRepository:
         operation: str,
         idempotency_key: str,
         request_sha256: bytes,
+        *,
+        normalized_password: str | None = None,
+        verify_password: Callable[[str, str], bool] | None = None,
     ) -> dict[str, Any] | AccessError | None:
         if authorization.operation != operation:
             return None
@@ -1691,6 +1774,10 @@ class AccessRepository:
         stored_result = cast(dict[str, Any], record["result"])
         if stored_result.get("auth_session_id") != authorization_row["auth_session_id"]:
             return None
+        if normalized_password is not None and verify_password is not None:
+            return _decode_password_idempotent(
+                record, request_sha256, normalized_password, verify_password
+            )
         return _decode_simple_idempotent(record, request_sha256)
 
     @staticmethod
@@ -1941,6 +2028,31 @@ def _decode_simple_idempotent(
             details=cast(dict[str, Any], stored_error["details"]),
         )
     return cast(dict[str, Any], stored_result["value"])
+
+
+def _decode_password_idempotent(
+    record: RowMapping,
+    request_sha256: bytes,
+    normalized_password: str,
+    verify_password: Callable[[str, str], bool],
+) -> dict[str, Any] | AccessError | None:
+    if not hmac.compare_digest(cast(bytes, record["request_sha256"]), request_sha256):
+        raise AccessError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "The idempotency key was reused with a different request.",
+            409,
+        )
+    stored_result = cast(dict[str, Any] | None, record["result"])
+    if stored_result is None:
+        return None
+    discriminator = cast(str, stored_result["password_discriminator"])
+    if not verify_password(normalized_password, discriminator):
+        raise AccessError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "The idempotency key was reused with a different request.",
+            409,
+        )
+    return _decode_simple_idempotent(record, request_sha256)
 
 
 def _token_hash(value: str) -> bytes:
