@@ -4,14 +4,14 @@ import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
 from uuid import uuid7
 
 import pytest
-from sqlalchemy import event, func, insert, select, update
+from sqlalchemy import event, func, insert, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -32,6 +32,7 @@ from familytrade.access.repository import (
     audit_events,
     broker_accounts,
     credential_envelopes,
+    idempotency_records,
     sessions,
     users,
     write_authorizations,
@@ -553,6 +554,133 @@ def test_idempotency_hash_normalizes_unicode_but_not_secret_bytes(postgres_engin
     assert different_bytes.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
 
 
+def test_database_clock_controls_mutation_projection_despite_app_clock_skew(
+    postgres_engine: Engine,
+) -> None:
+    clock = MutableClock(datetime(2099, 9, 13, 1, 0, tzinfo=UTC))
+    service = make_service(postgres_engine, clock=clock)
+    alice = logged_in(service, "alice")
+    with postgres_engine.connect() as connection:
+        before = connection.scalar(select(func.clock_timestamp()))
+    account = service.create_broker_account(
+        authorize(service, alice, "broker_account.create"),
+        account_payload("ACCOUNT-1111", b"database-clock-secret"),
+        idempotency_key=str(uuid7()),
+    )
+    with postgres_engine.connect() as connection:
+        after = connection.scalar(select(func.clock_timestamp()))
+    assert before is not None and after is not None
+    assert before <= account.created_at <= after
+    assert account.updated_at == account.created_at
+    assert account.created_at.year != 2099
+
+
+def test_failed_idempotent_outcomes_survive_rollback_and_dependency_recovery(
+    postgres_engine: Engine,
+) -> None:
+    healthy = make_service(postgres_engine)
+    alice = logged_in(healthy, "alice")
+    unavailable = make_service(
+        postgres_engine,
+        EnvelopeCipher(StubKekRing({}, active_version="missing-version")),
+    )
+    create_key = str(uuid7())
+    create_payload = account_payload("PRIVATE-FAILURE-1111", b"create-failure-secret")
+    with pytest.raises(AccessError) as first_create:
+        unavailable.create_broker_account(
+            authorize(unavailable, alice, "broker_account.create"),
+            create_payload,
+            idempotency_key=create_key,
+        )
+    with pytest.raises(AccessError) as changed_create:
+        healthy.create_broker_account(
+            authorize(healthy, alice, "broker_account.create"),
+            account_payload("ACTUALLY-DIFFERENT-9999", b"create-failure-secret"),
+            idempotency_key=create_key,
+        )
+    assert changed_create.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    with pytest.raises(AccessError) as replayed_create:
+        healthy.create_broker_account(
+            authorize(healthy, alice, "broker_account.create"),
+            create_payload,
+            idempotency_key=create_key,
+        )
+    assert first_create.value.code is ErrorCode.DEPENDENCY_UNAVAILABLE
+    assert replayed_create.value.envelope("replay") == first_create.value.envelope("replay")
+    assert healthy.list_broker_accounts(alice) == ()
+
+    account = healthy.create_broker_account(
+        authorize(healthy, alice, "broker_account.create"),
+        account_payload("ACCOUNT-2222", b"original-secret"),
+        idempotency_key=str(uuid7()),
+    )
+    failing_replace = make_service(
+        postgres_engine,
+        FailingVerificationCipher(StubKekRing({"test-v1": b"K" * 32})),
+    )
+    replace_key = str(uuid7())
+    with pytest.raises(AccessError) as first_replace:
+        failing_replace.replace_credential(
+            authorize(failing_replace, alice, "credential.replace"),
+            account.broker_account_id,
+            b"replacement-failure-secret",
+            expected_version=1,
+            idempotency_key=replace_key,
+        )
+    with pytest.raises(AccessError) as replayed_replace:
+        healthy.replace_credential(
+            authorize(healthy, alice, "credential.replace"),
+            account.broker_account_id,
+            b"replacement-failure-secret",
+            expected_version=1,
+            idempotency_key=replace_key,
+        )
+    assert first_replace.value.code is ErrorCode.DEPENDENCY_UNAVAILABLE
+    assert replayed_replace.value.envelope("replay") == first_replace.value.envelope("replay")
+    assert healthy.get_broker_account(alice, account.broker_account_id).record_version == 1
+
+    revoke_key = str(uuid7())
+    with pytest.raises(AccessError) as first_revoke:
+        healthy.revoke_credential(
+            authorize(healthy, alice, "credential.revoke"),
+            account.broker_account_id,
+            expected_version=2,
+            idempotency_key=revoke_key,
+        )
+    healthy.replace_credential(
+        authorize(healthy, alice, "credential.replace"),
+        account.broker_account_id,
+        b"successful-replacement",
+        expected_version=1,
+        idempotency_key=str(uuid7()),
+    )
+    with pytest.raises(AccessError) as replayed_revoke:
+        healthy.revoke_credential(
+            authorize(healthy, alice, "credential.revoke"),
+            account.broker_account_id,
+            expected_version=2,
+            idempotency_key=revoke_key,
+        )
+    assert first_revoke.value.code is ErrorCode.STALE_VERSION
+    assert replayed_revoke.value.envelope("replay") == first_revoke.value.envelope("replay")
+
+    with postgres_engine.connect() as connection:
+        stored = connection.execute(
+            select(idempotency_records.c.result).where(
+                idempotency_records.c.owner_user_id == alice.user_id,
+                idempotency_records.c.result["outcome"].astext == "error",
+            )
+        ).scalars()
+        serialized = json.dumps(list(stored))
+    for forbidden in (
+        "PRIVATE-FAILURE-1111",
+        "create-failure-secret",
+        "replacement-failure-secret",
+        "synthetic",
+    ):
+        assert forbidden not in serialized
+
+
 @pytest.mark.parametrize(
     ("expiry_kind", "expected_code"),
     [
@@ -565,7 +693,7 @@ def test_expiry_while_waiting_for_mutation_locks_cannot_commit(
     expiry_kind: str,
     expected_code: ErrorCode,
 ) -> None:
-    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    clock = MutableClock(datetime(2099, 9, 13, 1, 0, tzinfo=UTC))
     service = make_service(postgres_engine, clock=clock)
     alice = logged_in(service, "alice")
     authorization = authorize(service, alice, "broker_account.create")
@@ -579,6 +707,14 @@ def test_expiry_while_waiting_for_mutation_locks_cannot_commit(
     with ThreadPoolExecutor(max_workers=1) as executor:
         with postgres_engine.begin() as blocker:
             if expiry_kind == "authorization":
+                blocker.execute(
+                    update(write_authorizations)
+                    .where(
+                        write_authorizations.c.authorization_hash
+                        == sha256(authorization.authorization_token.encode()).digest()
+                    )
+                    .values(expires_at=func.clock_timestamp() - text("interval '1 second'"))
+                )
                 blocker.execute(
                     select(write_authorizations)
                     .where(
@@ -594,7 +730,10 @@ def test_expiry_while_waiting_for_mutation_locks_cannot_commit(
                 blocker.execute(
                     update(sessions)
                     .where(sessions.c.auth_session_id == alice.auth_session_id)
-                    .values(idle_expires_at=clock.value + timedelta(minutes=1))
+                    .values(
+                        authenticated_at=func.clock_timestamp() - text("interval '2 hours'"),
+                        idle_expires_at=func.clock_timestamp() - text("interval '1 second'"),
+                    )
                 )
             event.listen(postgres_engine, "before_cursor_execute", mutation_query_started)
             try:
@@ -605,11 +744,6 @@ def test_expiry_while_waiting_for_mutation_locks_cannot_commit(
                     idempotency_key=str(uuid7()),
                 )
                 assert query_entered.wait(timeout=5)
-                clock.value = (
-                    authorization.expires_at
-                    if expiry_kind == "authorization"
-                    else clock.value + timedelta(minutes=2)
-                )
             finally:
                 event.remove(postgres_engine, "before_cursor_execute", mutation_query_started)
         with pytest.raises(AccessError) as expired:
@@ -692,12 +826,13 @@ def test_versioned_rewrap_and_wrong_or_missing_old_key_are_atomic(
         postgres_engine,
         EnvelopeCipher(StubKekRing({"test-v2": new_key}, active_version="test-v2")),
     )
+    missing_key = str(uuid7())
     with pytest.raises(AccessError) as missing:
         missing_old.rewrap_credentials(
             authorize(missing_old, alice, "credential.rewrap"),
             account.broker_account_id,
             expected_version=1,
-            idempotency_key=str(uuid7()),
+            idempotency_key=missing_key,
         )
     assert missing.value.code is ErrorCode.DEPENDENCY_UNAVAILABLE
     assert [
@@ -730,6 +865,14 @@ def test_versioned_rewrap_and_wrong_or_missing_old_key_are_atomic(
             StubKekRing({"test-v1": old_key, "test-v2": new_key}, active_version="test-v2")
         ),
     )
+    with pytest.raises(AccessError) as restored_replay:
+        rotating.rewrap_credentials(
+            authorize(rotating, alice, "credential.rewrap"),
+            account.broker_account_id,
+            expected_version=1,
+            idempotency_key=missing_key,
+        )
+    assert restored_replay.value.envelope("replay") == missing.value.envelope("replay")
     rotated = rotating.rewrap_credentials(
         authorize(rotating, alice, "credential.rewrap"),
         account.broker_account_id,

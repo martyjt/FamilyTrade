@@ -6,8 +6,8 @@ import hashlib
 import hmac
 import json
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid7
 
@@ -28,6 +28,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    func,
     insert,
     select,
     update,
@@ -384,10 +385,43 @@ class AccessRepository:
         authorization_token: str,
         request_id: str,
         operation: str,
-        expires_at: datetime,
-        now: datetime,
-    ) -> None:
+        lifetime: timedelta,
+    ) -> datetime:
         with self._engine.begin() as connection:
+            session = (
+                connection.execute(
+                    select(
+                        sessions,
+                        users.c.enabled,
+                        users.c.credential_version.label("current_credential_version"),
+                        users.c.is_administrator.label("current_is_administrator"),
+                    )
+                    .join(users, sessions.c.user_id == users.c.user_id)
+                    .where(
+                        sessions.c.auth_session_id == context.auth_session_id,
+                        sessions.c.user_id == context.user_id,
+                    )
+                    .with_for_update(of=[sessions, users])
+                )
+                .mappings()
+                .one_or_none()
+            )
+            now = cast(datetime, connection.scalar(select(func.clock_timestamp())))
+            if (
+                session is None
+                or not cast(bool, session["enabled"])
+                or session["revoked_at"] is not None
+                or now >= cast(datetime, session["idle_expires_at"])
+                or now >= cast(datetime, session["absolute_expires_at"])
+                or session["credential_version"] != session["current_credential_version"]
+                or session["is_administrator"] != session["current_is_administrator"]
+            ):
+                raise unauthenticated()
+            expires_at = min(
+                now + lifetime,
+                cast(datetime, session["idle_expires_at"]),
+                cast(datetime, session["absolute_expires_at"]),
+            )
             connection.execute(
                 insert(write_authorizations).values(
                     authorization_hash=_token_hash(authorization_token),
@@ -399,6 +433,7 @@ class AccessRepository:
                     created_at=now,
                 )
             )
+            return expires_at
 
     def touch_session(self, session_id: str, now: datetime, idle_expires_at: datetime) -> None:
         with self._engine.begin() as connection:
@@ -416,12 +451,10 @@ class AccessRepository:
                 .values(revoked_at=now)
             )
 
-    def revoke_authorized_session(
-        self, authorization: BrowserWriteAuthorization, clock: Callable[[], datetime]
-    ) -> None:
+    def revoke_authorized_session(self, authorization: BrowserWriteAuthorization) -> None:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
-                connection, authorization, "session.logout", clock, require_administrator=False
+                connection, authorization, "session.logout", require_administrator=False
             )
             self._finish_write_authorization(connection, authorization, now)
             connection.execute(
@@ -438,14 +471,12 @@ class AccessRepository:
         self,
         authorization: BrowserWriteAuthorization,
         password_hash: str,
-        clock: Callable[[], datetime],
     ) -> None:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
                 connection,
                 authorization,
                 "password.change",
-                clock,
                 require_administrator=False,
             )
             connection.execute(
@@ -464,16 +495,30 @@ class AccessRepository:
                 .values(revoked_at=now)
             )
 
-    def disable_user(self, user_id: str, now: datetime) -> None:
+    def disable_authorized_user(
+        self, authorization: BrowserWriteAuthorization, target_user_id: str
+    ) -> None:
         with self._engine.begin() as connection:
-            locked_user = connection.execute(
-                select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
-            ).scalar_one_or_none()
-            if locked_user is None:
+            context, now = self._consume_write_authorization(
+                connection, authorization, "user.disable"
+            )
+            target = (
+                connection.execute(
+                    select(users.c.user_id, users.c.enabled)
+                    .where(users.c.user_id == target_user_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if target is None or not cast(bool, target["enabled"]):
                 raise not_found()
+            context, now = self._consume_write_authorization(
+                connection, authorization, "user.disable"
+            )
             result = connection.execute(
                 update(users)
-                .where(users.c.user_id == user_id)
+                .where(users.c.user_id == target_user_id, users.c.enabled.is_(True))
                 .values(
                     enabled=False, credential_version=users.c.credential_version + 1, updated_at=now
                 )
@@ -481,9 +526,11 @@ class AccessRepository:
             assert result.rowcount == 1
             connection.execute(
                 update(sessions)
-                .where(sessions.c.user_id == user_id, sessions.c.revoked_at.is_(None))
+                .where(sessions.c.user_id == target_user_id, sessions.c.revoked_at.is_(None))
                 .values(revoked_at=now)
             )
+            self._audit(connection, context.user_id, "USER_DISABLED", None, now)
+            self._finish_write_authorization(connection, authorization, now)
 
     def change_password(self, user_id: str, password_hash: str, now: datetime) -> None:
         with self._engine.begin() as connection:
@@ -516,11 +563,10 @@ class AccessRepository:
         payload: Mapping[str, object],
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
-                connection, authorization, "broker_account.create", clock
+                connection, authorization, "broker_account.create"
             )
             create = parse_broker_account_create(dict(payload))
             request_sha256 = _request_hash(
@@ -540,6 +586,13 @@ class AccessRepository:
                 request_sha256,
                 now,
             )
+            context, now = self._consume_write_authorization(
+                connection, authorization, "broker_account.create"
+            )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
             if replay is not None:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
@@ -551,14 +604,26 @@ class AccessRepository:
                 "account_id": account_id,
                 "provider": create.provider,
             }
-            reference_envelope = cipher.encrypt(
-                create.provider_account_reference.encode("utf-8"),
-                purpose="provider_account_ref",
-                **binding,
-            )
-            credential_envelope = cipher.encrypt(
-                create.credential, purpose="provider_credential", **binding
-            )
+            try:
+                reference_envelope = cipher.encrypt(
+                    create.provider_account_reference.encode("utf-8"),
+                    purpose="provider_account_ref",
+                    **binding,
+                )
+                credential_envelope = cipher.encrypt(
+                    create.credential, purpose="provider_credential", **binding
+                )
+            except AccessError as error:
+                self._finish_idempotent_error(
+                    connection,
+                    context,
+                    "broker_account.create",
+                    idempotency_key,
+                    error,
+                )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise
             self._insert_envelope(
                 connection,
                 reference_id,
@@ -670,11 +735,10 @@ class AccessRepository:
         expected_version: int,
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
-                connection, authorization, "credential.replace", clock
+                connection, authorization, "credential.replace"
             )
             account = self._owned_account_for_update(connection, context, account_id)
             validate_secret_bytes(new_secret, path="/credential")
@@ -693,33 +757,48 @@ class AccessRepository:
                 request_sha256,
                 now,
             )
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.replace"
+            )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
             if replay is not None:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
-            if account["status"] == BrokerAccountStatus.DISABLED.value:
-                raise AccessError(
-                    ErrorCode.DEPENDENCY_UNAVAILABLE,
-                    "Broker account is disabled.",
-                    503,
+            try:
+                if account["status"] == BrokerAccountStatus.DISABLED.value:
+                    raise AccessError(
+                        ErrorCode.DEPENDENCY_UNAVAILABLE,
+                        "Broker account is disabled.",
+                        503,
+                    )
+                current_version = cast(int, account["record_version"])
+                if current_version != expected_version:
+                    raise stale_version(expected_version, current_version)
+                new_envelope = cipher.encrypt(
+                    new_secret,
+                    owner_user_id=context.user_id,
+                    account_id=account_id,
+                    provider=cast(str, account["provider"]),
+                    purpose="provider_credential",
                 )
-            current_version = cast(int, account["record_version"])
-            if current_version != expected_version:
-                raise stale_version(expected_version, current_version)
-            new_envelope = cipher.encrypt(
-                new_secret,
-                owner_user_id=context.user_id,
-                account_id=account_id,
-                provider=cast(str, account["provider"]),
-                purpose="provider_credential",
-            )
-            cipher.verify(
-                new_envelope,
-                new_secret,
-                owner_user_id=context.user_id,
-                account_id=account_id,
-                provider=cast(str, account["provider"]),
-                purpose="provider_credential",
-            )
+                cipher.verify(
+                    new_envelope,
+                    new_secret,
+                    owner_user_id=context.user_id,
+                    account_id=account_id,
+                    provider=cast(str, account["provider"]),
+                    purpose="provider_credential",
+                )
+            except AccessError as error:
+                self._finish_idempotent_error(
+                    connection, context, "credential.replace", idempotency_key, error
+                )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise
             new_id = str(uuid7())
             old_id = cast(str, account["credential_envelope_id"])
             connection.execute(
@@ -768,11 +847,10 @@ class AccessRepository:
         account_id: str,
         expected_version: int,
         idempotency_key: str,
-        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
-                connection, authorization, "credential.revoke", clock
+                connection, authorization, "credential.revoke"
             )
             account = self._owned_account_for_update(connection, context, account_id)
             request_sha256 = _request_hash(
@@ -786,12 +864,27 @@ class AccessRepository:
                 request_sha256,
                 now,
             )
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.revoke"
+            )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
             if replay is not None:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
-            current_version = cast(int, account["record_version"])
-            if current_version != expected_version:
-                raise stale_version(expected_version, current_version)
+            try:
+                current_version = cast(int, account["record_version"])
+                if current_version != expected_version:
+                    raise stale_version(expected_version, current_version)
+            except AccessError as error:
+                self._finish_idempotent_error(
+                    connection, context, "credential.revoke", idempotency_key, error
+                )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise
             credential_id = cast(str, account["credential_envelope_id"])
             connection.execute(
                 update(credential_envelopes)
@@ -828,11 +921,10 @@ class AccessRepository:
         expected_version: int,
         idempotency_key: str,
         cipher: EnvelopeCipher,
-        clock: Callable[[], datetime],
     ) -> BrokerAccountView:
         with self._engine.begin() as connection:
             context, now = self._consume_write_authorization(
-                connection, authorization, "credential.rewrap", clock
+                connection, authorization, "credential.rewrap"
             )
             account = self._owned_account_for_update(connection, context, account_id)
             request_sha256 = _request_hash(
@@ -846,56 +938,75 @@ class AccessRepository:
                 request_sha256,
                 now,
             )
+            context, now = self._consume_write_authorization(
+                connection, authorization, "credential.rewrap"
+            )
+            if isinstance(replay, AccessError):
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise replay
             if replay is not None:
                 self._finish_write_authorization(connection, authorization, now)
                 return replay
-            current_version = cast(int, account["record_version"])
-            if current_version != expected_version:
-                raise stale_version(expected_version, current_version)
-            rows = (
-                connection.execute(
-                    select(credential_envelopes)
-                    .where(
-                        credential_envelopes.c.owner_user_id == context.user_id,
-                        credential_envelopes.c.broker_account_id == account_id,
-                        credential_envelopes.c.status == "active",
+            savepoint = connection.begin_nested()
+            try:
+                current_version = cast(int, account["record_version"])
+                if current_version != expected_version:
+                    raise stale_version(expected_version, current_version)
+                rows = (
+                    connection.execute(
+                        select(credential_envelopes)
+                        .where(
+                            credential_envelopes.c.owner_user_id == context.user_id,
+                            credential_envelopes.c.broker_account_id == account_id,
+                            credential_envelopes.c.status == "active",
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
+                    .mappings()
+                    .all()
                 )
-                .mappings()
-                .all()
-            )
-            if {cast(str, row["purpose"]) for row in rows} != {
-                "provider_account_ref",
-                "provider_credential",
-            }:
-                raise AccessError(
-                    ErrorCode.DEPENDENCY_UNAVAILABLE,
-                    "Credential is unavailable.",
-                    503,
-                )
-            for row in rows:
-                purpose = cast(str, row["purpose"])
-                rewrapped = cipher.rewrap(
-                    _credential_envelope(row),
-                    owner_user_id=context.user_id,
-                    account_id=account_id,
-                    provider=cast(str, account["provider"]),
-                    purpose=purpose,
-                )
-                connection.execute(
-                    update(credential_envelopes)
-                    .where(
-                        credential_envelopes.c.credential_envelope_id
-                        == row["credential_envelope_id"],
-                        credential_envelopes.c.owner_user_id == context.user_id,
+                if {cast(str, row["purpose"]) for row in rows} != {
+                    "provider_account_ref",
+                    "provider_credential",
+                }:
+                    raise AccessError(
+                        ErrorCode.DEPENDENCY_UNAVAILABLE,
+                        "Credential is unavailable.",
+                        503,
                     )
-                    .values(
-                        wrapped_dek=rewrapped.wrapped_dek,
-                        wrap_nonce=rewrapped.wrap_nonce,
-                        key_version=rewrapped.key_version,
+                for row in rows:
+                    purpose = cast(str, row["purpose"])
+                    rewrapped = cipher.rewrap(
+                        _credential_envelope(row),
+                        owner_user_id=context.user_id,
+                        account_id=account_id,
+                        provider=cast(str, account["provider"]),
+                        purpose=purpose,
                     )
+                    connection.execute(
+                        update(credential_envelopes)
+                        .where(
+                            credential_envelopes.c.credential_envelope_id
+                            == row["credential_envelope_id"],
+                            credential_envelopes.c.owner_user_id == context.user_id,
+                        )
+                        .values(
+                            wrapped_dek=rewrapped.wrapped_dek,
+                            wrap_nonce=rewrapped.wrap_nonce,
+                            key_version=rewrapped.key_version,
+                        )
+                    )
+            except AccessError as error:
+                savepoint.rollback()
+                self._finish_idempotent_error(
+                    connection, context, "credential.rewrap", idempotency_key, error
                 )
+                self._finish_write_authorization(connection, authorization, now)
+                connection.commit()
+                raise
+            else:
+                savepoint.commit()
             connection.execute(
                 update(broker_accounts)
                 .where(
@@ -926,15 +1037,15 @@ class AccessRepository:
                 ).mappings()
             )
 
-    def audit_not_found(self, context: UserContext, now: datetime) -> None:
+    def audit_not_found(self, context: UserContext) -> None:
         """Audit an opaque denial without persisting the guessed identifier."""
         with self._engine.begin() as connection:
+            now = cast(datetime, connection.scalar(select(func.clock_timestamp())))
             self._audit(connection, context.user_id, "RESOURCE_NOT_FOUND", None, now)
 
-    def audit_authorized_not_found(
-        self, authorization: BrowserWriteAuthorization, now: datetime
-    ) -> None:
+    def audit_authorized_not_found(self, authorization: BrowserWriteAuthorization) -> None:
         with self._engine.begin() as connection:
+            now = cast(datetime, connection.scalar(select(func.clock_timestamp())))
             actor_user_id = connection.scalar(
                 select(sessions.c.user_id)
                 .join(
@@ -961,7 +1072,6 @@ class AccessRepository:
         connection: Connection,
         authorization: BrowserWriteAuthorization,
         expected_operation: str,
-        clock: Callable[[], datetime],
         *,
         require_administrator: bool = True,
     ) -> tuple[UserContext, datetime]:
@@ -994,7 +1104,7 @@ class AccessRepository:
             .with_for_update(of=[write_authorizations, sessions, users])
         )
         row = connection.execute(statement).mappings().one_or_none()
-        now = clock()
+        now = cast(datetime, connection.scalar(select(func.clock_timestamp())))
         if (
             row is None
             or authorization.operation != expected_operation
@@ -1064,7 +1174,7 @@ class AccessRepository:
         idempotency_key: str,
         request_sha256: bytes,
         now: datetime,
-    ) -> BrokerAccountView | None:
+    ) -> BrokerAccountView | AccessError | None:
         normalized_key = _normalize_idempotency_key(idempotency_key)
         connection.execute(
             pg_insert(idempotency_records)
@@ -1104,7 +1214,20 @@ class AccessRepository:
                 409,
             )
         stored_result = cast(dict[str, Any] | None, record["result"])
-        return _account_view_from_record(stored_result) if stored_result is not None else None
+        if stored_result is None:
+            return None
+        if stored_result.get("outcome") == "error":
+            stored_error = cast(dict[str, Any], stored_result["error"])
+            return AccessError(
+                ErrorCode(cast(str, stored_error["code"])),
+                cast(str, stored_error["message"]),
+                cast(int, stored_error["http_status"]),
+                retryable=cast(bool, stored_error["retryable"]),
+                details=cast(dict[str, Any], stored_error["details"]),
+            )
+        if stored_result.get("outcome") == "success":
+            return _account_view_from_record(cast(dict[str, Any], stored_result["value"]))
+        return _account_view_from_record(stored_result)
 
     @staticmethod
     def _finish_idempotent(
@@ -1122,7 +1245,41 @@ class AccessRepository:
                 idempotency_records.c.idempotency_key
                 == _normalize_idempotency_key(idempotency_key),
             )
-            .values(result=_account_view_record(result))
+            .values(result={"outcome": "success", "value": _account_view_record(result)})
+        )
+
+    @staticmethod
+    def _finish_idempotent_error(
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        idempotency_key: str,
+        error: AccessError,
+    ) -> None:
+        safe_detail_keys = {"expected_version", "current_version", "path", "paths"}
+        safe_details = {
+            key: value for key, value in error.details.items() if key in safe_detail_keys
+        }
+        connection.execute(
+            update(idempotency_records)
+            .where(
+                idempotency_records.c.owner_user_id == context.user_id,
+                idempotency_records.c.operation == operation,
+                idempotency_records.c.idempotency_key
+                == _normalize_idempotency_key(idempotency_key),
+            )
+            .values(
+                result={
+                    "outcome": "error",
+                    "error": {
+                        "code": error.code.value,
+                        "message": error.message,
+                        "http_status": error.http_status,
+                        "retryable": error.retryable,
+                        "details": safe_details,
+                    },
+                }
+            )
         )
 
     @staticmethod

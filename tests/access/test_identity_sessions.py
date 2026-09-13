@@ -96,7 +96,9 @@ def test_invited_login_derives_context_and_cookie_contract(postgres_engine: Engi
 def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: Engine) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
-    user_id = service.invite_user("alice", "test-password-A!", {"lanes:read"})
+    user_id = service.invite_user(
+        "alice", "test-password-A!", {"lanes:read"}, is_administrator=True
+    )
 
     for username, password in (("missing", "wrong-password!"), ("alice", "wrong-password!")):
         with pytest.raises(AccessError) as captured:
@@ -107,7 +109,11 @@ def test_unknown_wrong_and_disabled_users_share_safe_failure(postgres_engine: En
             "retryable": False,
             "details": {},
         }
-    service.disable_user(user_id)
+    admin_login = service.login("alice", "test-password-A!")
+    disable_authorization = authorize(
+        service, admin_login.session_token, admin_login.csrf_token, "user.disable"
+    )
+    service.disable_user(disable_authorization, user_id)
     with pytest.raises(AccessError, match="Authentication is required"):
         service.login("alice", "test-password-A!")
 
@@ -117,7 +123,9 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
 ) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)
-    user_id = service.invite_user("alice", "test-password-A!", {"lanes:read"})
+    user_id = service.invite_user(
+        "alice", "test-password-A!", {"lanes:read"}, is_administrator=True
+    )
 
     idle_login = service.login("alice", "test-password-A!")
     clock.value += IDLE_TIMEOUT
@@ -153,8 +161,14 @@ def test_idle_absolute_revoked_and_password_rotated_sessions_are_rejected(
     service.change_password(change_authorization, "replacement-pass-A!")
     with pytest.raises(AccessError):
         service.authenticate_browser(changed_login.session_token, request_id="rotated")
-    assert service.login("alice", "replacement-pass-A!")
-    service.disable_user(user_id)
+    replacement_login = service.login("alice", "replacement-pass-A!")
+    disable_authorization = authorize(
+        service,
+        replacement_login.session_token,
+        replacement_login.csrf_token,
+        "user.disable",
+    )
+    service.disable_user(disable_authorization, user_id)
 
 
 def test_scope_csrf_token_binding_origin_operation_and_forgery(postgres_engine: Engine) -> None:
@@ -229,6 +243,46 @@ def test_scope_csrf_token_binding_origin_operation_and_forgery(postgres_engine: 
             idempotency_key="00000000-0000-0000-0000-000000000002",
         )
     assert mismatched_error.value.code is ErrorCode.INVALID_CSRF
+
+
+def test_disable_user_requires_current_administrator_and_keeps_targets_opaque(
+    postgres_engine: Engine,
+) -> None:
+    clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
+    service = service_for(postgres_engine, clock)
+    service.invite_user("admin", "test-password-admin!", {"lanes:read"}, is_administrator=True)
+    target_id = service.invite_user("target", "test-password-target!", {"lanes:read"})
+    service.invite_user("reader", "test-password-reader!", {"lanes:read"})
+    admin = service.login("admin", "test-password-admin!")
+    reader = service.login("reader", "test-password-reader!")
+
+    reader_authorization = authorize(
+        service, reader.session_token, reader.csrf_token, "user.disable"
+    )
+    with pytest.raises(AccessError) as non_admin:
+        service.disable_user(reader_authorization, target_id)
+    assert non_admin.value.code is ErrorCode.INSUFFICIENT_SCOPE
+    assert service.login("target", "test-password-target!")
+
+    missing_authorization = authorize(
+        service, admin.session_token, admin.csrf_token, "user.disable"
+    )
+    with pytest.raises(AccessError) as missing:
+        service.disable_user(missing_authorization, "00000000-0000-0000-0000-000000000000")
+    assert missing.value.code is ErrorCode.NOT_FOUND
+
+    disable_authorization = authorize(
+        service, admin.session_token, admin.csrf_token, "user.disable"
+    )
+    service.disable_user(disable_authorization, target_id)
+    with pytest.raises(AccessError) as disabled_login:
+        service.login("target", "test-password-target!")
+    assert disabled_login.value.code is ErrorCode.UNAUTHENTICATED
+
+    repeat_authorization = authorize(service, admin.session_token, admin.csrf_token, "user.disable")
+    with pytest.raises(AccessError) as repeated:
+        service.disable_user(repeat_authorization, target_id)
+    assert repeated.value.code is ErrorCode.NOT_FOUND
 
 
 def test_kek_test_value_is_base64_not_a_repository_secret() -> None:

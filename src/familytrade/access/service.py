@@ -35,6 +35,7 @@ BROWSER_WRITE_OPERATIONS = frozenset(
         "credential.rewrap",
         "password.change",
         "session.logout",
+        "user.disable",
     }
 )
 SUPPORTED_SCOPES = frozenset(
@@ -202,16 +203,13 @@ class AccessService:
         supplied_csrf_hash = _token_hash(csrf_token)
         if not secrets.compare_digest(supplied_csrf_hash, cast(bytes, session["csrf_hash"])):
             raise AccessError(ErrorCode.INVALID_CSRF, "CSRF validation failed.", 403)
-        validated_at = self._now()
         authorization_token = secrets.token_urlsafe(32)
-        expires_at = min(validated_at + WRITE_AUTHORIZATION_TIMEOUT, context.expires_at)
-        self._repository.create_write_authorization(
+        expires_at = self._repository.create_write_authorization(
             context,
             authorization_token,
             request_id,
             operation,
-            expires_at,
-            validated_at,
+            WRITE_AUTHORIZATION_TIMEOUT,
         )
         return BrowserWriteAuthorization(
             authorization_token=authorization_token,
@@ -221,16 +219,20 @@ class AccessService:
         )
 
     def logout(self, authorization: BrowserWriteAuthorization) -> None:
-        self._repository.revoke_authorized_session(authorization, self._now)
+        self._repository.revoke_authorized_session(authorization)
 
-    def disable_user(self, user_id: str) -> None:
-        """Administrator-only operation; disabling rotates credentials and sessions."""
-        self._repository.disable_user(user_id, self._now())
+    def disable_user(self, authorization: BrowserWriteAuthorization, target_user_id: str) -> None:
+        """Disable an invited user through a server-derived administrator session."""
+        try:
+            self._repository.disable_authorized_user(authorization, target_user_id)
+        except AccessError as error:
+            self._audit_write_denial(authorization, error)
+            raise
 
     def change_password(self, authorization: BrowserWriteAuthorization, new_password: str) -> None:
         _validate_password(new_password)
         self._repository.change_authorized_password(
-            authorization, self._password_hash.hash(new_password), self._now
+            authorization, self._password_hash.hash(new_password)
         )
 
     def create_broker_account(
@@ -241,7 +243,7 @@ class AccessService:
         idempotency_key: str,
     ) -> BrokerAccountView:
         return self._repository.create_broker_account(
-            authorization, payload, idempotency_key, self._cipher, self._now
+            authorization, payload, idempotency_key, self._cipher
         )
 
     def get_broker_account(self, context: UserContext, account_id: str) -> BrokerAccountView:
@@ -275,7 +277,6 @@ class AccessService:
                 expected_version,
                 idempotency_key,
                 self._cipher,
-                self._now,
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
@@ -291,7 +292,7 @@ class AccessService:
     ) -> BrokerAccountView:
         try:
             return self._repository.revoke_credential(
-                authorization, account_id, expected_version, idempotency_key, self._now
+                authorization, account_id, expected_version, idempotency_key
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
@@ -312,7 +313,6 @@ class AccessService:
                 expected_version,
                 idempotency_key,
                 self._cipher,
-                self._now,
             )
         except AccessError as error:
             self._audit_write_denial(authorization, error)
@@ -320,13 +320,13 @@ class AccessService:
 
     def _audit_opaque_denial(self, context: UserContext, error: AccessError) -> None:
         if error.code is ErrorCode.NOT_FOUND:
-            self._repository.audit_not_found(context, self._now())
+            self._repository.audit_not_found(context)
 
     def _audit_write_denial(
         self, authorization: BrowserWriteAuthorization, error: AccessError
     ) -> None:
         if error.code is ErrorCode.NOT_FOUND:
-            self._repository.audit_authorized_not_found(authorization, self._now())
+            self._repository.audit_authorized_not_found(authorization)
 
     def _require_current_context(self, context: UserContext) -> None:
         if not self._repository.context_is_current(context, self._now()):
