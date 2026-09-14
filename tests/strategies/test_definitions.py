@@ -443,3 +443,29 @@ def test_next_zone_fixture_binds_both_sides_without_selecting_a_zone() -> None:
     assert fixture["long"]["known_zones"][1]["id"] == "L-old-near"
     assert fixture["short"]["known_zones"][1]["id"] == "S-near"
     assert fixture["no_target_long"]["known_zone_highs"] == ["2019.00"]
+
+
+def test_validate_transitions_same_id_and_replays_idempotently(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    definition = _fixture()
+    create = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    draft = repository.create_draft(context, create, idempotency_key=str(uuid7()))
+    request = {"schema_version": "v1", "draft_id": draft.strategy_version_id, "expected_version": 1}
+    key = str(uuid7())
+    first = repository.validate_draft(context, request, idempotency_key=key)
+    second = repository.validate_draft(context, request, idempotency_key=key)
+    assert first.valid and second.valid
+    assert first.strategy_version is not None and second.strategy_version is not None
+    assert first.strategy_version.strategy_version_id == draft.strategy_version_id
+    assert second.strategy_version.record_version == 2
