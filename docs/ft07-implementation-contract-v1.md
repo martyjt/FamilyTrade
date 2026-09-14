@@ -620,6 +620,40 @@ years later, with February 29 clipped to February 28 when the fifth year is not 
 leap year. Equality is allowed; a larger span is `UNSUPPORTED_CONFIGURATION`
 before state creation. Forward paper requires a null pinned
 revision, null `end_at`, `end_policy:"mark_open"`, and causal-latest selections.
+
+The backtest DatasetRevision cross-field projection is closed and uses the
+integrated model names without aliases. It requires:
+
+- `dataset_revision.owner_user_id == config.owner_user_id` and
+  `dataset_revision.status == "published"` with non-null `published_at`.
+- `dataset_revision.series_key.owner_user_id == config.owner_user_id`,
+  `.source == config.source`, `.price_basis == config.price_basis`, and
+  `.contract_id == config.contract.contract_id`.
+- `dataset_revision.series_key.interval_seconds == 60`, the canonical FT-05 source
+  interval consumed by this engine. It must divide
+  `config.fill_model.fill_interval_seconds`, which separately equals
+  `strategy_version.fill_interval_seconds`; an aggregate fill interval is never
+  misrepresented as the archive series interval.
+- `dataset_revision.contract_version == config.contract.record_version`.
+- `dataset_revision.calendar_id == config.calendar.calendar_id ==
+  config.contract.calendar_id` and `dataset_revision.calendar_version ==
+  config.calendar.calendar_version == config.contract.calendar_version`.
+- `config.calendar.coverage_start <= dataset_revision.coverage_start <
+  dataset_revision.coverage_end <= config.calendar.coverage_end` and
+  `dataset_revision.coverage_start <= config.start_at < config.end_at <=
+  dataset_revision.coverage_end`. Coverage remains half-open; equality at the outer
+  start/end is valid. Every accepted pinned warm-up or run `BarSelection` must also
+  be wholly contained in dataset and calendar coverage and have the same owned
+  series key and pinned revision ID.
+
+Any well-typed integrated record that fails one of these cross-field/range checks is
+`UNSUPPORTED_CONFIGURATION` from `initialize_engine` before state, bucket, or
+counter creation. An intrinsically malformed `DatasetRevision` remains the
+integrated Pydantic validation error before an `EngineConfig` exists. After
+initialization, replacing any nested revision/config value is `CONFIG_MISMATCH`
+against the checkpoint fingerprint. FT-07 neither repairs a revision nor performs
+an archive/catalog lookup.
+
 Backtest additionally requires `lane_id=null`; every RunEvent then has
 `aggregate_type:"run"` and `aggregate_id=run_id`. Forward paper requires a non-null
 `lane_id`; every RunEvent then has `aggregate_type:"lane"` and
@@ -1233,12 +1267,18 @@ forbidden. The USD pipeline is exactly:
    quantize it once to `0.01`; equity is `cash + rounded_unrealized_pnl`, quantized
    once to `0.01`. High-water, drawdowns, daily baselines/loss, fees, realized P&L,
    and unrealized P&L are stored as USD cents after their transition.
-5. Stop-risk modeled loss per contract is the full-precision slipped stop distance
-   times multiplier, plus two independently cent-quantized one-contract
-   commissions. The budget is full-precision
-   `risk_fraction * min(starting_cash,current_equity)`; floor `budget / modeled_loss`
-   before account/config caps. Inclusive risk comparisons use the modeled loss,
-   with no premature cent-rounding of price loss or budget.
+5. For any prospective integer quantity `q`, compute entry and assumed stop-exit
+   commissions independently with the actual Fill pipeline:
+   `C_entry(q)=money_round(rate*q)` and `C_exit(q)=money_round(rate*q)`. Compute
+   `price_loss(q)=abs(prospective_entry-slipped_stop)*multiplier*q` at full Decimal
+   precision, then `modeled_total_loss(q)=price_loss(q)+C_entry(q)+C_exit(q)` with no
+   further quantization. The same absolute-distance formula applies to long and
+   short. The stop-fraction budget is full-precision
+   `risk_fraction * min(starting_cash,current_equity)`. Every inclusive cap test
+   compares the unrounded budget/cap directly to `modeled_total_loss(q)`; equality
+   is allowed and only `>` fails. One-contract rounded commission may not be
+   multiplied by `q`, because that differs from an actual quantity-level Fill at
+   half-cent boundaries.
 
 The frozen Fill fields use these exact conventions. `slippage` is a nonnegative
 price magnitude `abs(fill_price-base_price)`, never a signed cash amount; adverse
@@ -1323,11 +1363,16 @@ no opening-gap record prematurely claims future seconds from its current bar.
 Canonical boundary examples are: commission `1.005` for one contract becomes
 `1.00`, commission `1.015` becomes `1.02`; with tick `0.005`, multiplier `1`, and
 quantity `1`, raw close P&L `0.005` becomes `0.00` while `0.015` becomes `0.02`.
-With entry `2000.000`, slipped stop `1999.995`, multiplier `100`, one-contract
-commission `1.005`, modeled loss is `0.500 + 1.00 + 1.00 = 2.500`; budget `2.500`
-admits one contract and any exact smaller budget admits zero. These examples bind
-the boundary order and do not alter tick-side rounding. Marks use the latest valid
-completed fill-interval close causally known.
+With entry `2000.000`, slipped stop `1999.995`, multiplier `100`, and commission rate
+`1.005`, quantity one has `price_loss=0.500`, each quantity-level commission `1.00`,
+and `modeled_total_loss=2.500`. Quantity two has `price_loss=1.000`, each commission
+`money_round(2.010)=2.01`, and total `5.020`; with stop-fraction budget and
+per-entry cap both `5.01`, it therefore exceeds the effective cap.
+Incorrectly multiplying the rounded one-contract fee would produce `5.000` and is
+forbidden. The result is identical for a long stop below entry and an equal-distance
+short stop above entry. These examples bind the boundary order and do not alter
+tick-side rounding. Marks use the latest valid completed fill-interval close
+causally known.
 
 The equity/drawdown series includes starting equity and equity after all events plus
 each valid fill-bar close mark, net of costs. High-water never resets. Drawdown is
@@ -1336,11 +1381,30 @@ bar retains the last price with `mark_status:"stale"`, emits its quality label, 
 blocks new entries; it neither invents a mark nor suppresses an already-active
 protective exit on a later valid bar.
 
-Stop-risk sizing uses the exact frozen budget and slipped-stop formula, includes two
-commissions, floors quantity, and then applies configured/account caps. Fixed size
-is rejected if the same modeled loss exceeds the per-entry cap. Entry geometry,
-prospective risk, one-position state, and the entry-counter increment are one pure
-state transition. Rejection reason codes are exactly `RISK_SIZE_ZERO`,
+At signal-time sizing, define `effective_sizing_cap=min(stop_fraction_budget,
+risk_policy.per_entry_loss_cap)` for stop-fraction policy. First preserve the frozen
+floor: `per_contract_reference_loss=price_loss(1)+C_entry(1)+C_exit(1)` and
+`q0=min(sizing_policy.max_quantity,
+floor(stop_fraction_budget/per_contract_reference_loss))`. Starting at `q0`, choose
+the first integer `q >= 1`
+whose quantity-level `modeled_total_loss(q) <= effective_sizing_cap`; equivalently,
+decrement the capped candidate deterministically until the nonlinear rounded-fee
+formula passes. If none passes, emit `REJECT/RISK_SIZE_ZERO` and no order. In the
+`rate=1.005,cap=5.01` example, a candidate two reduces to one.
+
+Fixed-contract policy never reduces its configured quantity. It accepts that exact
+quantity only when `modeled_total_loss(q) <= risk_policy.per_entry_loss_cap`; an
+excess emits `REJECT/RISK_SIZE_ZERO` with no order. Immediately before any already
+serialized entry Fill, recompute prices, geometry, commissions, and
+`modeled_total_loss` for that immutable `OrderIntent.quantity`. Stop-fraction uses
+the same effective sizing cap recomputed from current equity; fixed uses the
+per-entry cap. Neither policy resizes an all-or-none submitted order. An excess at
+this stage cancels it with `RISK_GAP`, zero Fill, and zero commission. Thus the
+quantity-two boundary reduces to one only during stop-fraction sizing, is rejected
+without reduction for fixed sizing, and is cancelled rather than resized if it
+arises from a later gap. Entry geometry, prospective risk, one-position state, and
+the entry-counter increment are one pure state transition. Rejection reason codes
+are exactly `RISK_SIZE_ZERO`,
 `ENTRY_GEOMETRY_GAP`, `RISK_GAP`, `DAILY_LOSS_LIMIT`, `DAILY_ENTRY_LIMIT`, and
 `CUMULATIVE_DRAWDOWN_LIMIT`.
 
@@ -1359,6 +1423,31 @@ order state, and open-position lifetime carry. Daily loss and cumulative drawdow
 limits latch inclusively at `>=`; daily entries are allowed only while count is
 strictly below the effective limit above. Latches cancel entry/setup state but preserve exits. A
 later recovery in equity does not clear a same-day daily-loss latch.
+
+Simultaneous latch ordering is canonical. The closed priority is
+`DAILY_LOSS_LIMIT` first, then `CUMULATIVE_DRAWDOWN_LIMIT`; `RiskState.latches` is
+always the duplicate-free subsequence of that order. At each valid close mark, first
+commit and emit `MARK_RECORDED`, then compute
+`daily_loss=max(0,daily_start_equity-equity)` and
+`cumulative_drawdown=max(0,high_water-equity)` from that same post-mark cents
+snapshot. Collect only newly reached inclusive limits in priority order. If both are
+new, one atomic risk transition stores both latches and cancels pending entry/setup
+state once using the first member of the newly reached tuple as reason
+(`DAILY_LOSS_LIMIT` when both are new); no protection or close intent is cancelled.
+
+After that atomic state transition, emit one `RISK_LATCHED` per newly inserted latch
+in priority order. The daily payload uses `observed=daily_loss` and
+`limit=risk_policy.daily_loss_cap`; the cumulative payload uses
+`observed=cumulative_drawdown` and
+`limit=risk_policy.cumulative_drawdown_cap`; both use the current stored
+`trading_day`. Their event effective time is the determining mark time. Both event
+state hashes include both committed latch flags and the completed cancellation; the
+first includes the event counter advanced once and the second the counter advanced
+twice. Only after both latch events emit any pending-entry `ORDER_STATE ... ->
+CANCELLED` record with the selected first-priority reason; setup-only cancellation
+has no fabricated event. Already-latched limits emit no second event. A trading-day
+reset removes only `DAILY_LOSS_LIMIT`, preserving canonical order. Semantic replay
+emits none and leaves both state and event counters byte-identical.
 
 At `entry_cutoff_at`, cancel entries/setups and block new ones. At
 `liquidation_start_at`, cancel entry state and first inspect the position. If flat,
@@ -1695,7 +1784,7 @@ The code, sole public message, and condition are:
 | INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. |
 | EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. |
 | BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. |
-| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset, calendar, mode, random seed, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. |
+| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset identity/coverage, calendar, mode, random seed, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. |
 | UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. |
 | UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. |
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
@@ -1835,6 +1924,9 @@ The named boundary and replay tests are:
 - `test_fill_interval_must_equal_strategy_version_without_state_creation`
 - `test_fill_and_mark_evidence_provenance_pairs_source_ids_exactly`
 - `test_run_event_nullable_fencing_token_round_trips_but_engine_emits_positive`
+- `test_simultaneous_risk_latches_have_canonical_state_event_hash_and_replay_order`
+- `test_backtest_dataset_revision_cross_fields_and_coverage_reject_without_state`
+- `test_quantity_level_commission_cap_1_005_qty2_long_short_and_policy_matrix`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
