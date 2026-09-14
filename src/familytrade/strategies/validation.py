@@ -472,7 +472,7 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         }[node.value_type]
         if node.unit not in allowed_units:
             issues.append(
-                _issue(path, ValidationIssueCode.UNIT_MISMATCH, "Constant type and unit disagree.")
+                _issue(f"/nodes/{index}/unit", ValidationIssueCode.UNIT_MISMATCH, "Constant type and unit disagree.")
             )
         decimal_types = {"decimal", "price", "volume", "level"}
         if node.value_type in decimal_types:
