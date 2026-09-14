@@ -292,18 +292,23 @@ class StrategyRepository:
     ) -> StrategyVersion:
         with self.engine.begin() as connection:
             self._authorise(connection, context, "strategy:write")
+            replay = self._replay(connection, context, "strategy.edit", idempotency_key, value)
+            if replay is not None:
+                return replay
             try:
                 parsed = StrategyDraftEditInput.model_validate(value)
             except Exception as error:
                 raise self._validation() from error
             source = (
                 connection.execute(
-                    select(strategy_versions).where(
+                    select(strategy_versions)
+                    .where(
                         and_(
                             strategy_versions.c.owner_user_id == context.user_id,
                             strategy_versions.c.strategy_version_id == parsed.draft_id,
                         )
                     )
+                    .with_for_update()
                 )
                 .mappings()
                 .one_or_none()
@@ -312,6 +317,8 @@ class StrategyRepository:
                 raise not_found()
             if source["record_version"] != parsed.expected_version:
                 raise stale_version(parsed.expected_version, cast(int, source["record_version"]))
+            if source["status"] != "draft":
+                raise AccessError(ErrorCode.CONFLICT, "Only draft versions may be edited.", 409)
             if parsed.name != parsed.definition.name:
                 raise self._validation(
                     [
@@ -322,7 +329,9 @@ class StrategyRepository:
                         }
                     ]
                 )
-            return self._insert(connection, context, parsed, parsed.draft_id)
+            result = self._insert(connection, context, parsed, parsed.draft_id)
+            self._save_replay(connection, context, "strategy.edit", idempotency_key, value, result)
+            return result
 
     def validate_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
