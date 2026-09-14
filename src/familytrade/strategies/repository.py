@@ -511,7 +511,7 @@ class StrategyRepository:
                 connection,
                 context,
                 StrategyDraftEditInput.model_validate(
-                    {
+                    _as_model_input({
                         "schema_version": "v1",
                         "draft_id": stored.strategy_version_id,
                         "expected_version": 1,
@@ -521,7 +521,7 @@ class StrategyRepository:
                         "catalogue_version": stored.catalogue_version,
                         "execution_interval_seconds": stored.execution_interval_seconds,
                         "fill_interval_seconds": stored.fill_interval_seconds,
-                    }
+                    })
                 ),
             )
             if not checked.valid:
