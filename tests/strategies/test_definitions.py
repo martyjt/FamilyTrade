@@ -17,6 +17,11 @@ def _fixture() -> dict[str, object]:
     )
 
 
+def _case(case_id: str) -> dict[str, object]:
+    source = json.loads((Path(__file__).parents[2] / "docs/contracts-examples-v1.json").read_text())
+    return copy.deepcopy(next(case for case in source["cases"] if case["id"] == case_id)["given"])
+
+
 def test_fully_serialized_rule_definition_crossover_round_trips_and_has_warmup_six() -> None:
     result = validate_rule_definition(
         _fixture(),
@@ -259,3 +264,19 @@ def test_presets_match_original_breakout_only_and_funded_source_inventories() ->
         preset = get_preset(preset_id)
         result = _validate(preset.definition.model_dump(mode="json"))
         assert result.valid, result.errors
+
+
+def test_setup_expiry_and_one_or_multi_bar_order_ttl_are_independent() -> None:
+    edit = _case("strategy_edit_creates_version_and_running_lane_stays_pinned")
+    ttl = _case("entry_order_multi_bar_ttl_expiry")
+    assert edit["strategy_v1"]["setup_expiry_execution_bars"] == 24
+    assert edit["strategy_v1"]["entry_ttl_execution_bars"] == 1
+    assert edit["edited_draft"]["setup_expiry_execution_bars"] == 12
+    assert edit["edited_draft"]["entry_ttl_execution_bars"] == 3
+    assert ttl["entry_ttl_execution_bars"] == 2
+
+
+def test_r_multiple_targets_long_short_fixture_uses_exact_existing_id() -> None:
+    fixture = _case("r_multiple_targets_long_short")
+    assert fixture["long"]["r_multiple"] == "2.50"
+    assert fixture["short"]["r_multiple"] == "3.00"
