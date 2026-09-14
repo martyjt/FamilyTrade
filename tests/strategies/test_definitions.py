@@ -1442,6 +1442,32 @@ def test_type_unit_operator_matrix_is_exhaustive() -> None:
         (item.path, item.code.value) for item in _validate(value).errors
     }
 
+    within = _fixture()
+    within["nodes"].append(
+        {
+            "kind": "constant",
+            "node_id": "tolerance",
+            "value_type": "decimal",
+            "unit": "scalar",
+            "value": "2",
+        }
+    )
+    within["nodes"].append(
+        {
+            "kind": "compare",
+            "node_id": "within",
+            "op": "within",
+            "left": "fast-now",
+            "right": "slow-now",
+            "tolerance": "tolerance",
+        }
+    )
+    assert _validate(within).valid
+    within["nodes"][-1]["tolerance"] = "2.00"
+    assert ("/nodes/8/tolerance", "UNKNOWN_REFERENCE") in {
+        (item.path, item.code.value) for item in _validate(within).errors
+    }
+
 
 def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
     value = _fixture()

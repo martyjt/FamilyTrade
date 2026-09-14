@@ -565,11 +565,13 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
             left, right = signature(node.left), signature(node.right)
             if left is not None and right is not None:
                 if node.op == "within":
-                    tolerance_ok = (
-                        node.tolerance is not None
-                        and _decimal(node.tolerance)
-                        and Decimal(node.tolerance) >= 0
+                    tolerance_signature = (
+                        signature(node.tolerance) if node.tolerance in nodes else None
                     )
+                    tolerance_ok = tolerance_signature in {
+                        ("decimal", "scalar"),
+                        ("integer", "count"),
+                    }
                     if left[0] not in numeric or left != right:
                         issues.append(
                             _issue(
@@ -584,8 +586,10 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                         issues.append(
                             _issue(
                                 f"/nodes/{index}/tolerance",
-                                ValidationIssueCode.INVALID_DECIMAL,
-                                "Tolerance must be a nonnegative decimal.",
+                                ValidationIssueCode.UNKNOWN_REFERENCE
+                                if node.tolerance not in nodes
+                                else ValidationIssueCode.TYPE_MISMATCH,
+                                "Tolerance must reference a scalar-compatible node.",
                             )
                         )
                 elif left != right:
