@@ -3,7 +3,11 @@ import json
 from pathlib import Path
 
 from familytrade.strategies.presets import get_preset
-from familytrade.strategies.validation import validate_rule_definition
+from familytrade.strategies.validation import (
+    canonical_definition_bytes,
+    canonical_definition_sha256,
+    validate_rule_definition,
+)
 
 
 def _fixture() -> dict[str, object]:
@@ -59,6 +63,45 @@ def test_invalid_rule_definition_fixture_returns_all_three_typed_errors() -> Non
         ("/order_policy/limit_price_source", "REQUIRED_FOR_LIMIT"),
         ("/nodes/7/args", "UNIT_MISMATCH"),
     ]
+
+
+def test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings() -> None:
+    value = _fixture()
+    result = _validate(value)
+    assert result.definition is not None
+    first = canonical_definition_sha256(result.definition)
+    reordered = json.loads(json.dumps(value, sort_keys=True))
+    second = _validate(reordered)
+    assert second.definition is not None
+    assert first == canonical_definition_sha256(second.definition)
+    assert canonical_definition_bytes(result.definition) == canonical_definition_bytes(
+        second.definition
+    )
+
+
+def test_canonical_hash_preserves_array_order_and_excludes_version_metadata() -> None:
+    first = _validate(_fixture())
+    assert first.definition is not None
+    reordered = _fixture()
+    features = reordered["features"]
+    assert isinstance(features, list)
+    features.reverse()
+    second = _validate(reordered)
+    assert second.definition is not None
+    assert canonical_definition_sha256(first.definition) != canonical_definition_sha256(
+        second.definition
+    )
+
+
+def test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues() -> None:
+    value = _fixture()
+    value["unknown"] = True
+    value["order_policy"]["entry_ttl_execution_bars"] = True
+    result = _validate(value)
+    assert {
+        ("/unknown", "UNKNOWN_FIELD"),
+        ("/order_policy/entry_ttl_execution_bars", "INVALID_TYPE"),
+    } <= {(item.path, item.code.value) for item in result.errors}
 
 
 def test_presets_return_fresh_frozen_models() -> None:
