@@ -1542,18 +1542,36 @@ def test_every_feature_has_deterministic_numeric_warmup() -> None:
 def test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two() -> None:
     value = _fixture()
     features = value["features"]
-    assert isinstance(features, list)
-    features[0].update(
+    nodes = value["nodes"]
+    assert isinstance(features, list) and isinstance(nodes, list)
+    features.append(
         {
-            "name": "swing_regime_v1",
+            "feature_id": "swing",
             "kind": "structure",
+            "name": "swing_regime_v1",
             "output_type": "regime",
             "unit": "regime",
+            "interval_seconds": 900,
             "parameters": {"left": 2, "right": 3},
         }
     )
+    nodes.extend(
+        [
+            {"kind": "feature", "node_id": "swing-now", "feature_id": "swing", "offset": 0},
+            {"kind": "feature", "node_id": "swing-prior", "feature_id": "swing", "offset": 0},
+            {
+                "kind": "compare",
+                "node_id": "swing-eq",
+                "op": "eq",
+                "left": "swing-now",
+                "right": "swing-prior",
+                "tolerance": None,
+            },
+        ]
+    )
+    value["entry_rules"]["long_root"] = "swing-eq"
     result = _validate(value)
-    assert ("/nodes/2", "TYPE_MISMATCH") in {(item.path, item.code.value) for item in result.errors}
+    assert result.valid and result.required_warmup_bars == 10
 
 
 def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warmup() -> None:
