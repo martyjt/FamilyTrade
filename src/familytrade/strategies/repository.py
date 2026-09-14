@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import unicodedata
 from collections.abc import Mapping
 from datetime import datetime
 from typing import cast
@@ -168,6 +169,20 @@ strategy_idempotency_records = Table(
 class StrategyRepository:
     def __init__(self, engine: Engine, *, access_repository: AccessRepository) -> None:
         self.engine, self.access_repository = engine, access_repository
+
+    @staticmethod
+    def _normalize_names(value: dict[str, object]) -> dict[str, object]:
+        """Apply the public NFC name contract without touching tagged-union fields."""
+        normalized = dict(value)
+        if isinstance(normalized.get("name"), str):
+            normalized["name"] = unicodedata.normalize("NFC", cast(str, normalized["name"]))
+        definition = normalized.get("definition")
+        if isinstance(definition, dict):
+            definition = dict(definition)
+            if isinstance(definition.get("name"), str):
+                definition["name"] = unicodedata.normalize("NFC", cast(str, definition["name"]))
+            normalized["definition"] = definition
+        return normalized
 
     def _authorise(self, connection: Connection, context: UserContext, scope: str) -> None:
         if not self.access_repository.context_is_current_on_connection(connection, context):
@@ -443,6 +458,7 @@ class StrategyRepository:
     def create_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
+        value = self._normalize_names(value)
         result: StrategyVersion | None = None
         public_error: AccessError | None = None
         with self.engine.begin() as connection:
@@ -477,6 +493,7 @@ class StrategyRepository:
     def _create_draft(
         self, connection: Connection, context: UserContext, value: dict[str, object]
     ) -> StrategyVersion:
+        value = self._normalize_names(value)
         try:
             parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
         except ValidationError:
@@ -537,6 +554,7 @@ class StrategyRepository:
     def edit_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
+        value = self._normalize_names(value)
         result: StrategyVersion | None = None
         public_error: AccessError | None = None
         with self.engine.begin() as connection:
@@ -571,6 +589,7 @@ class StrategyRepository:
     def _edit_draft(
         self, connection: Connection, context: UserContext, value: dict[str, object]
     ) -> StrategyVersion:
+        value = self._normalize_names(value)
         try:
             parsed = StrategyDraftEditInput.model_validate(_as_model_input(value))
         except ValidationError as error:
