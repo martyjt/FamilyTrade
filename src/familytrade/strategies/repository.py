@@ -61,6 +61,7 @@ from familytrade.strategies.definitions import (
 )
 from familytrade.strategies.validation import (
     _as_model_input,
+    _nonfinite_issues,
     canonical_definition_sha256,
     canonical_operation_request_bytes,
     validate_rule_definition,
@@ -208,6 +209,13 @@ class StrategyRepository:
         try:
             digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
         except (TypeError, ValueError) as error:
+            nonfinite = _nonfinite_issues(value)
+            if nonfinite:
+                errors = [item.model_dump(mode="json") for item in nonfinite]
+                for item in errors:
+                    if item["path"].startswith("/definition/"):
+                        item["path"] = item["path"][11:]
+                raise self._validation(errors) from error
             code = (
                 "DUPLICATE_KEY"
                 if "duplicate normalized object key" in str(error)

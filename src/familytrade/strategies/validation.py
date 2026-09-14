@@ -285,6 +285,8 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                 if kind == "extra_forbidden"
                 else ValidationIssueCode.REQUIRED
                 if kind == "missing"
+                else ValidationIssueCode.REQUIRED
+                if "tag_not_found" in kind
                 else ValidationIssueCode.INVALID_ENUM
                 if "literal" in kind or "tag" in kind
                 else ValidationIssueCode.NONFINITE
@@ -682,18 +684,6 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                     tolerance_node = (
                         nodes.get(node.tolerance) if node.tolerance is not None else None
                     )
-                    if (
-                        tolerance_node is not None
-                        and tolerance_node.kind == "constant"
-                        and not _decimal(tolerance_node.value)
-                    ):
-                        issues.append(
-                            _issue(
-                                f"/nodes/{index}/tolerance",
-                                ValidationIssueCode.INVALID_DECIMAL,
-                                "Tolerance constant must be a decimal.",
-                            )
-                        )
                     if (
                         tolerance_node is not None
                         and tolerance_node.kind == "constant"
@@ -1289,6 +1279,12 @@ def validate_rule_definition(
         )
     issues = _nonfinite_issues(value)
     issues.extend(_pydantic_issues(value))
+    nonfinite_paths = {item.path for item in issues if item.code is ValidationIssueCode.NONFINITE}
+    issues = [
+        item
+        for item in issues
+        if item.code is not ValidationIssueCode.INVALID_TYPE or item.path not in nonfinite_paths
+    ]
     issues.extend(_independent_raw_rules(value))
     try:
         raw_size = len(_bytes(value))
