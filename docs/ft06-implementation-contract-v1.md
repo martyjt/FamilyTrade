@@ -64,7 +64,7 @@ models:
 - StrategyDraftFromDefinitionInput, StrategyDraftFromVersionInput,
   StrategyDraftCreateInput, StrategyDraftEditInput,
   StrategyDraftValidateInput, StrategyListInput, StrategyVersion,
-  StrategyListItem, StrategyPage, ValidationIssue,
+  StrategyListItem, StrategyPage, ValidationIssueCode, ValidationIssue,
   DefinitionValidationResult, and StrategyValidationResult.
 
 Every model uses extra="forbid", strict types, and hidden input values in
@@ -186,7 +186,89 @@ Pydantic error normalization is exact:
 | non-finite value | NONFINITE |
 
 Union wrapper locations and internal model class names are never included in
-paths or messages. Paths address only the submitted operation document.
+paths or messages. validate_rule_definition paths are relative to its supplied
+RuleDefinition mapping, preserving the frozen /nodes and /order_policy paths.
+create/edit retain those definition-relative paths in details.errors. Structural
+issues in the outer operation mapping use outer paths such as /name or /draft_id.
+
+The stable ValidationIssue code and path inventory is closed:
+
+| code | condition | issue path |
+| --- | --- | --- |
+| UNKNOWN_FIELD | field is not in the exact record shape | exact unknown field |
+| INVALID_TYPE | wrong JSON primitive or forbidden value representation | exact field/value |
+| REQUIRED | required field/discriminator is absent | exact missing field |
+| MUTUALLY_EXCLUSIVE | fields cannot be supplied/enabled together | lexically first conflicting field |
+| INVALID_ENUM | discriminator or enum value is unknown | exact discriminator/enum field |
+| OUT_OF_RANGE | scalar/string/list cardinality is outside its inclusive bound | exact bounded field |
+| INVALID_DECIMAL | decimal string violates canonical grammar | exact value field |
+| NONFINITE | a non-finite raw numeric value is supplied | exact value field |
+| DUPLICATE_KEY | an exact decoded key repeats or distinct object keys normalize to the same NFC key | containing object |
+| DUPLICATE_ID | repeated feature_id or node_id | later duplicate ID field |
+| UNKNOWN_REFERENCE | referenced feature/node/root is absent | exact reference field or indexed array member |
+| CYCLE | node dependency graph has a strongly connected component | node_id field of the lexically smallest node ID in that component |
+| ROOT_NOT_BOOLEAN | an entry, exit, or filter root resolves to a non-boolean pair | exact root field |
+| TYPE_MISMATCH | operator/declared result uses incompatible value types | operator argument field, or result_type when only the declaration differs |
+| UNIT_MISMATCH | types match but units/operator unit algebra do not | operator argument field, tolerance field, or unit when only the declaration differs |
+| UNSUPPORTED_FEATURE | feature name is outside feature-catalogue-v1 | exact feature name |
+| UNSUPPORTED_PARAMETER | parameter name is not legal for that supported feature | exact parameter key |
+| INVALID_INTERVAL | interval is outside the finite allowed set or larger than execution interval | exact interval field |
+| INTERVAL_NOT_DIVISIBLE | smaller interval does not divide execution interval | exact interval field |
+| REQUIRED_FOR_LIMIT | limit order omits its price source | /order_policy/limit_price_source |
+| FORBIDDEN_FOR_MARKET | market order supplies a limit price source | /order_policy/limit_price_source |
+| INVALID_SIDE_ROOT | disabled-side root is non-null or enabled side lacks the required root | exact entry/exit side root |
+| INVALID_MODULE_COMBINATION | setup kind/cardinality/dependency or entry-combination requirement is invalid | exact paths enumerated below |
+| INVALID_WINDOW | local/calendar/segment rule fails for a structurally valid window | /constraints/entry_windows/{index} |
+| SIZE_LIMIT | raw/canonical bytes, JSON node count, list/argument count, or graph depth exceeds a bound | smallest containing collection; root / for operation/definition byte or node limit |
+| ISSUE_LIMIT | more distinct issues exist than the public result limit | root /; always the final returned issue |
+| LOOKBACK_LIMIT | derived historical span or declared historical lookback exceeds 2,000 execution bars | root / |
+| NAME_MISMATCH | operation name and definition.name differ after NFC | /definition/name |
+
+Feature parameter values with a supported name use INVALID_TYPE, INVALID_ENUM,
+OUT_OF_RANGE, or INVALID_DECIMAL rather than UNSUPPORTED_PARAMETER. A missing
+required parameter is REQUIRED at /features/{index}/parameters/{name}. Duplicate
+setup kinds are INVALID_MODULE_COMBINATION at the later
+/setup_modules/{index}/kind. A missing required zones or one-position dependency is
+INVALID_MODULE_COMBINATION at /setup_modules. A rules_only, setups_only,
+setup_and_rules, or setup_or_rules violation is INVALID_MODULE_COMBINATION at
+/entry_combination. An unbacked setup-price source is INVALID_MODULE_COMBINATION at
+the complete consuming source record: /order_policy/limit_price_source,
+/exit_policy/stop, or /exit_policy/target. Unknown references in args/children use
+the indexed path; multiple references each produce their own issue.
+
+The transport and direct-Mapping safety gate is exact: at most 524,288 raw UTF-8
+JSON bytes when transport bytes exist; at most 8,192 JSON nodes; and maximum
+container nesting depth 64 with the root mapping at depth 1. A JSON node is the
+root plus every object key, object value, and array item, including container and
+scalar values. Exceeding any safety-gate bound returns a non-cached
+VALIDATION_ERROR containing exactly one SIZE_LIMIT issue at root / and creates no
+request hash or idempotency row. The streaming transport decoder applies the byte,
+node, depth, and exact-duplicate-key gates before materializing an unbounded value.
+
+Inside that safety envelope the raw operation validation limits are: canonical
+request bytes at most 262,144; at most 4,096 JSON nodes by the same counting rule;
+and maximum container nesting depth 32. Exceeding any produces SIZE_LIMIT at root
+/, skips later semantic phases, and is cached when canonical request identity was
+successfully created.
+
+RuleDefinition retains its separate 65,536-byte canonical limit, 32 features, 128
+nodes, 64 condition leaves, 16 args/children, group depth 4, arithmetic depth 4,
+and historical lookback 2,000 execution bars. Collection/cardinality issues point
+to /features, /nodes, or the exact args/children collection. Group/arithmetic
+depth issues point to the first over-depth node in lexical node-ID order after
+graph resolution. The condition-leaf and total-node limits point to /nodes; feature
+and setup cardinality limits point to /features and /setup_modules respectively.
+
+At most 256 issues are returned. The implementation derives and sorts all distinct
+issues within the bounded walk. If more than 256 exist, it returns the first 255
+by phase/path/code and appends {path:"/",code:"ISSUE_LIMIT",
+message:"Additional validation issues were truncated."}. Messages for all other
+codes are fixed constants keyed by code and must not include submitted values,
+cross-owner IDs, Pydantic internals, or exception text.
+
+ValidationIssueCode is a Literal union containing exactly the codes in this table;
+ValidationIssue.code has that type. No implementation-private exception or
+Pydantic code may appear in public output.
 
 ValidationIssue is exactly
 {path: JSON-Pointer, code: stable-code, message: string}.
@@ -263,6 +345,12 @@ StrategyValidationResult(valid=False, errors=..., strategy_version=None) if a
 previously stored draft defensively fails definition validation. Invalid
 validate/list operation envelopes themselves raise VALIDATION_ERROR.
 
+edit_draft returns the newly inserted StrategyVersion(status="draft"), not its
+source. StrategyDraftEditInput.draft_id and expected_version identify the owned
+source snapshot; they are never the output ID/version. create_draft and edit_draft
+start their inserted rows at record_version 1. validate_draft returns the same
+target ID at record_version 2 on success.
+
 Expected operation failures use familytrade.access.models.AccessError and
 ErrorCode: UNAUTHENTICATED, INSUFFICIENT_SCOPE, NOT_FOUND, VALIDATION_ERROR,
 CONFLICT, IDEMPOTENCY_CONFLICT, and STALE_VERSION. Cross-owner opaque strategy,
@@ -305,8 +393,11 @@ shape says null is allowed.
 
 The fixed limits are: 64 KiB canonical definition JSON, 32 feature instances, 128
 nodes, 64 condition leaves, 16 arguments or children, group depth 4, arithmetic
-depth 4, and 2,000 derived execution bars. IDs are unique; references are acyclic;
-offset is integer 0..2000. All roots and filter roots resolve to boolean.
+depth 4, and 2,000 execution bars of declared historical lookback. IDs are unique;
+references are acyclic; offset is integer 0..2000. All roots and filter roots
+resolve to boolean. Stateful repeated-touch readiness may produce a larger
+required_warmup_bars under section 5 without authorizing a larger historical
+lookback.
 
 Entry, exit, price-source, stop, target, setup-module, side, combination, order,
 sizing, and risk records retain the exact shapes and bounds in contracts-v1
@@ -322,6 +413,9 @@ sections 5 and 13. In particular:
 - Every position is protected by bracket_exit_v1. Exit roots supplement it.
 - measured_move, next_zone, and r_multiple are supported for both sides.
 - Setup-price fields require an enabled setup that emits that field.
+- Each setup kind appears at most once. Disabled modules remain serialized and emit
+  nothing. Any enabled reversal or breakout module requires exactly one
+  confirmed_pivot_zones_v1 and exactly one one_position_v1 module.
 - Runtime target selection, tick rounding, fills, risk calculation, and target
   failure outcomes are FT-07 and are not implemented here.
 
@@ -376,8 +470,8 @@ An operand pair means both value type and unit.
 | operation | accepted operands | derived result |
 | --- | --- | --- |
 | add, subtract, min, max | two or more identical numeric pairs | that same pair |
-| multiply | exactly two operands, at least one decimal/scalar, and the other numeric | the non-scalar pair, or decimal/scalar |
-| divide | exactly two operands; denominator decimal/scalar | numerator pair |
+| multiply | exactly two operands, at least one decimal/scalar, and the other decimal/scalar, price, volume, or level | the non-scalar pair, or decimal/scalar |
+| divide | exactly two operands; denominator decimal/scalar and numerator decimal/scalar, price, volume, or level | numerator pair |
 | divide | exactly two identical numeric pairs | decimal/scalar |
 | eq | two identical pairs of any value type | boolean/boolean |
 | lt, lte, gte, gt | two identical numeric pairs, or two timestamp/utc_timestamp | boolean/boolean |
@@ -385,8 +479,11 @@ An operand pair means both value type and unit.
 | crosses_above, crosses_below | two offset-zero FeatureNodes with identical numeric pairs | boolean/boolean |
 | all, any, none | one to sixteen boolean/boolean children | boolean/boolean |
 
-multiply with zero or more than one non-scalar pair is UNIT_MISMATCH. divide with
-any other arity or denominator is TYPE_MISMATCH or UNIT_MISMATCH at args.
+multiply with zero or more than one non-scalar pair is UNIT_MISMATCH. integer/count
+multiplied by or divided by decimal/scalar is TYPE_MISMATCH; no rounding, coercion,
+or fractional integer exists. Dividing integer/count by integer/count remains valid
+and derives decimal/scalar under the equal-unit division rule. divide with any
+other arity or denominator is TYPE_MISMATCH or UNIT_MISMATCH at args.
 Arithmetic on boolean, timestamp, side, or regime is TYPE_MISMATCH. Ordered
 comparison on boolean, side, or regime is TYPE_MISMATCH. A mismatch of value type
 is TYPE_MISMATCH; when types match but units differ it is UNIT_MISMATCH.
@@ -436,8 +533,10 @@ validated but do not inflate warm-up.
 Enabled setup modules add:
 
 - confirmed_pivot_zones_v1:
-  max(atr_length times zone interval when use_atr is true, otherwise one zone
-  interval; (pivot_left+pivot_right+1) times zone interval).
+  the maximum of (a) atr_length times zone interval when use_atr is true,
+  otherwise one zone interval, and (b)
+  (pivot_left+pivot_right+1+
+  (minimum_touches-1)*(pivot_right+1)) times zone interval.
 - reversal_setup_v1:
   one execution interval; two when require_directional_approach is true; and
   peak_lookback execution intervals when recent_peak_stop is true.
@@ -445,9 +544,18 @@ Enabled setup modules add:
   one execution interval in beyond mode and two in strict_cross mode.
 - one_position_v1: zero.
 
+The repeated-touch term is the earliest possible sequence of confirmed same-kind
+pivots: after the first L+R+1 bars, each further same-kind pivot can first be
+confirmed R+1 zone bars later. For L=1, R=1, and minimum_touches=2 the numerical
+minimum is therefore five zone bars. Actual equal-price merging, touch
+qualification, and zone retention remain data dependent.
+
 The maximum reachable span is converted once as
-ceil(span_seconds / execution_interval_seconds). The result must be 0..2000;
-otherwise LOOKBACK_LIMIT. This ordering avoids repeated ceiling inflation across
+ceil(span_seconds / execution_interval_seconds). Historical feature/node spans
+must remain at most 2,000 execution bars or yield LOOKBACK_LIMIT. The persisted
+required_warmup_bars may be larger only because of the stateful repeated-touch
+term and is bounded 0..5,100,050, the catalogue maximum at L=R=50 and
+minimum_touches=100,000. This ordering avoids repeated ceiling inflation across
 mixed intervals. The frozen crossover fixture derives six bars: slow SMA span five
 execution bars plus one slow-feature interval for temporal comparison.
 
@@ -538,9 +646,9 @@ bytes. It excludes owner, IDs, status, timestamps, record version, catalogue
 version, and interval columns. PostgreSQL JSONB key ordering does not change it;
 readback reconstructs the typed definition and rechecks the hash.
 
-Duplicate JSON object keys are rejected by the transport decoder before repository
-entry and have no idempotent outcome. A direct Python Mapping cannot represent
-duplicates.
+Duplicate JSON object keys are rejected by the transport decoder as DUPLICATE_KEY
+at the containing object before repository entry and have no idempotent outcome.
+A direct Python Mapping cannot represent exact duplicate keys.
 
 canonical_operation_request_bytes handles the raw, duplicate-free JSON value graph
 before strict model construction. It requires string object keys and only null,
@@ -551,9 +659,12 @@ allow_nan=False, encoded as UTF-8. This request canonicalization does not make a
 float valid in a decimal-string field; it only gives invalid but JSON-shaped input
 a deterministic idempotency identity.
 
-Invalid JSON, duplicate keys, non-string mapping keys, non-finite numbers,
-non-JSON Python objects, excessive raw nesting, and an invalid idempotency UUID
-fail the hashability/key gate with VALIDATION_ERROR and are not stored or replayed.
+Invalid JSON, exact duplicate decoded keys, NFC-normalized duplicate object keys,
+non-string mapping keys, non-finite numbers, non-JSON Python objects, safety-gate
+excesses, and an invalid idempotency UUID fail the hashability/key gate with
+VALIDATION_ERROR and are not stored or replayed. Before sorting any mapping,
+canonicalization NFC-normalizes every key and rejects a collision as DUPLICATE_KEY
+at the containing object; it never chooses one value or creates canonical bytes.
 Where a repository Mapping supplies a path-addressable non-finite or non-JSON
 value, details.errors contains the corresponding NONFINITE or INVALID_TYPE
 ValidationIssue even though that pre-identity failure is not cached.
@@ -562,17 +673,26 @@ idempotency lock and are stored and replayed as described below.
 
 ## 8. Lifecycle, ownership, idempotency, and concurrency
 
-Create and edit validate the complete raw input before changing a strategy row.
-A draft is a valid mutable snapshot. Edit retains its ID, replaces the complete
-editable snapshot, recomputes definition hash and warm-up, and increments
-record_version. Editing a validated row is CONFLICT.
+Create and edit validate the complete raw input before inserting a strategy row.
+Every stored StrategyVersion snapshot is append-only except for its exact
+draft-to-validated transition. edit_draft locks the owned source draft, checks
+expected_version and status="draft", and inserts a new draft with a server UUIDv7,
+record_version=1, created_from_version_id equal to the source draft ID, and the
+complete replacement definition/name/catalogue/interval snapshot. The source row,
+definition bytes, hash, warm-up, status, and record_version remain unchanged.
+Calling edit_draft on a validated source is CONFLICT; cloning an owned validated
+version uses create_draft(kind="source_version") and also inserts a new draft ID.
+After the owner-scoped source row is locked, edit compares expected_version before
+status: a validated source at record_version 2 with expected_version 1 is
+STALE_VERSION, while expected_version 2 is CONFLICT. A missing or cross-owner
+source is always NOT_FOUND before either comparison.
 
-Creating from an owned validated source produces a new draft ID and same-owner
-created_from_version_id. Validate re-runs validation and atomically changes only
-status, record_version, and internal updated_at. Successful validation makes the
-same ID immutable. Defensive validation failure leaves the draft unchanged and
-returns StrategyValidationResult(valid=False). Running lanes remain pinned to old
-IDs; FT-06 neither queries nor mutates a lane.
+Validate re-runs validation and atomically changes only status from draft to
+validated, record_version from 1 to 2, and internal updated_at. Successful
+validation makes that same successor ID immutable. Defensive validation failure
+leaves the draft unchanged and returns
+StrategyValidationResult(valid=False). Running lanes remain pinned to old IDs;
+FT-06 neither queries nor mutates a lane.
 
 ### 8.1 Same-connection FT-04 seam
 
@@ -625,11 +745,12 @@ Each mutation uses one engine.begin connection for its entire attempt:
    hash is IDEMPOTENCY_CONFLICT.
 6. With no row, begin a savepoint. Parse raw input and, when structurally possible,
    load owner calendars on this same connection.
-7. For edit/validate, lock the owner-scoped strategy row FOR UPDATE, then recheck
+7. For edit/validate, lock the owner-scoped source strategy row FOR UPDATE, then recheck
    context and scope on the same connection after that wait, before inspecting
    expected_version or mutating.
-8. Apply the domain mutation. Insert exactly one complete result row before outer
-   commit.
+8. Apply the domain mutation. Edit inserts one successor row without updating its
+   source; validate performs only the exact transition. Insert exactly one complete
+   result row before outer commit.
 9. For a safe operation error, roll back the savepoint, insert one complete error
    row in the outer transaction, commit, and raise only after commit.
 
@@ -645,10 +766,13 @@ STALE_VERSION. IDEMPOTENCY_CONFLICT preserves the existing outcome. Internal and
 dependency failures are not cached. validate_draft valid=False is a normal result
 and is cached as that result.
 
-Same key/request replays the original success or stored safe failure. Same key with
-different request bytes is IDEMPOTENCY_CONFLICT. Two different keys editing the
-same expected version yield one success and one stored STALE_VERSION. A crash before
-outer commit leaves neither domain effect nor idempotency row.
+Same key/request replays the original success or stored safe failure, including
+the exact successor ID inserted by an edit. Same key with different request bytes
+is IDEMPOTENCY_CONFLICT. Different keys may intentionally create distinct
+successor drafts from the same unchanged source and expected_version; lineage is
+not unique. STALE_VERSION occurs only when the locked source record_version differs,
+including when validation of that source committed first. A crash before outer
+commit leaves neither inserted successor/domain effect nor idempotency row.
 
 Tests must run mutation waits with a QueuePool configured pool_size=1 and
 max_overflow=0. No path may check out a second connection while holding the first.
@@ -683,7 +807,8 @@ The composite primary key is owner_user_id plus strategy_version_id. Every
 owner-bearing table has a direct FK using users.c.user_id. created_from uses an
 owner/source composite FK. Named checks enforce v1/status/record version/name,
 lowercase SHA-256, allowed/divisible intervals, definition JSON object, warm-up
-0..2000, and lowercase UUIDv7 IDs. The keyset index is
+0..5,100,050, lowercase UUIDv7 IDs, and exactly record_version 1 for draft or 2
+for validated. The keyset index is
 ix_strategy_versions_owner_status_created_id on
 (owner_user_id, status, created_at DESC, strategy_version_id DESC). Definition
 hash is not unique.
@@ -701,7 +826,9 @@ migrations/versions/20260914_0003_ft06_strategy_definitions.py, revision
 20260914_0003, down_revision 20260913_0002. It creates only the two strategy
 tables, named constraints/index, strategy_version_immutability_guard(), and trigger
 strategy_versions_immutability. The trigger permits only the exact draft-to-
-validated transition fields and rejects every delete or later validated update.
+validated transition from record_version 1 to 2, changing status, record_version,
+and updated_at only. It rejects every other UPDATE and every DELETE, including an
+attempt to edit a draft row in place.
 Downgrade removes trigger/function and strategy tables in dependency order while
 preserving all FT-04/FT-05 tables and rows. Upgrade-downgrade-upgrade must have no
 metadata drift.
@@ -768,6 +895,9 @@ All named tests in tests/strategies/test_definitions.py:
 - test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings
 - test_canonical_hash_preserves_array_order_and_excludes_version_metadata
 - test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues
+- test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
+- test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash
+- test_raw_byte_node_depth_and_definition_limits_use_exact_boundaries
 - test_raw_hashable_structural_validation_failure_is_idempotently_replayed
 - test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row
 - test_invalid_rule_definition_fixture_returns_all_three_typed_errors
@@ -775,9 +905,11 @@ All named tests in tests/strategies/test_definitions.py:
 - test_node_feature_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive
 - test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive
 - test_type_unit_operator_matrix_is_exhaustive
+- test_integer_count_times_or_divided_by_scalar_is_type_mismatch
 - test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero
 - test_every_feature_has_deterministic_numeric_warmup
 - test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two
+- test_confirmed_pivot_zones_warmup_includes_minimum_touch_spacing_boundaries
 - test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warmup
 - test_mixed_feature_intervals_convert_once_without_ceiling_inflation
 - test_feature_and_fill_intervals_divide_execution_interval
@@ -798,7 +930,7 @@ All named tests in tests/strategies/test_definitions.py:
 - test_create_draft_derives_owner_uuid_time_hash_and_warmup
 - test_create_or_edit_invalid_definition_changes_no_strategy_row
 - test_clone_requires_owned_validated_source_and_sets_same_owner_lineage
-- test_edit_draft_replaces_snapshot_and_increments_record_version
+- test_edit_draft_inserts_new_successor_and_preserves_source_row_hash_and_version
 - test_validate_transitions_same_id_and_database_prevents_later_update_or_delete
 - test_strategy_edit_fixture_preserves_original_and_separate_ttls
 - test_same_idempotency_key_same_raw_request_replays_success_and_safe_failure
@@ -808,14 +940,15 @@ All named tests in tests/strategies/test_definitions.py:
 - test_context_and_scope_are_rechecked_after_advisory_and_row_lock_waits
 - test_pool_size_one_mutations_never_checkout_a_second_connection
 - test_revocation_expiry_credential_and_scope_change_during_wait_are_unauthenticated
-- test_concurrent_edits_with_same_expected_version_have_one_success_one_stale
+- test_different_keys_may_create_distinct_successors_from_same_unchanged_source
+- test_edit_validated_source_expected_one_is_stale_and_expected_two_is_conflict
 - test_read_and_write_scopes_are_enforced_for_every_operation
 - test_cross_user_clone_edit_validate_get_and_cursor_are_not_found
 - test_list_is_owner_scoped_stably_ordered_bounded_and_cursor_bound
 - test_strategy_metadata_owner_fks_bind_exact_access_users_column_object
 - test_strategy_migration_upgrade_downgrade_upgrade_preserves_ft04_ft05_rows
 - test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_drift
-- test_validated_row_trigger_allows_only_exact_draft_to_validated_transition
+- test_trigger_allows_only_exact_draft_to_validated_transition_and_no_other_update
 
 The narrow dependency regressions are:
 
