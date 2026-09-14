@@ -310,7 +310,9 @@ class StrategyRepository:
                 try:
                     source_input = StrategyDraftFromVersionInput.model_validate(value)
                 except Exception:
-                    raise self._validation() from error
+                    safe = self._validation()
+                    self._save_safe_error(connection, context, "strategy.create", idempotency_key, value, safe)
+                    raise safe from error
                 source = (
                     connection.execute(
                         select(strategy_versions).where(
