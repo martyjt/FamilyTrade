@@ -32,7 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Engine, RowMapping
+from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from familytrade.access.models import (
     AccessError,
@@ -961,7 +961,7 @@ def _aligned_open_start(
     )
 
 
-class MarketDataCatalog:
+class _MarketDataCatalogBase:
     def __init__(
         self,
         engine: Engine,
@@ -1221,51 +1221,62 @@ class MarketDataCatalog:
             self._save_result(c, context, "calendar.append", idempotency_key, result)
             return result
 
-    def _calendar(self, c: Any, owner: str, calendar_id: str, version: int) -> CalendarVersion:
-        row = (
-            c.execute(
-                select(calendar_versions).where(
-                    and_(
-                        calendar_versions.c.owner_user_id == owner,
-                        calendar_versions.c.calendar_id == calendar_id,
-                        calendar_versions.c.calendar_version == version,
-                    )
-                )
-            )
-            .mappings()
-            .first()
-        )
-        if not row:
-            raise not_found()
-        ws = c.execute(
-            select(calendar_windows)
-            .where(
+
+def load_owned_calendar_version(
+    connection: Connection, owner_user_id: str, calendar_id: str, calendar_version: int
+) -> CalendarVersion:
+    """Load an owned calendar on the caller's existing connection."""
+    row = (
+        connection.execute(
+            select(calendar_versions).where(
                 and_(
-                    calendar_windows.c.owner_user_id == owner,
-                    calendar_windows.c.calendar_id == calendar_id,
-                    calendar_windows.c.calendar_version == version,
+                    calendar_versions.c.owner_user_id == owner_user_id,
+                    calendar_versions.c.calendar_id == calendar_id,
+                    calendar_versions.c.calendar_version == calendar_version,
                 )
             )
-            .order_by(calendar_windows.c.ordinal)
-        ).mappings()
-        return CalendarVersion(
-            calendar_id=calendar_id,
-            owner_user_id=owner,
-            calendar_version=version,
-            exchange_timezone=row["exchange_timezone"],
-            coverage_start=row["coverage_start"],
-            coverage_end=row["coverage_end"],
-            windows=tuple(
-                CalendarWindow.model_validate(
-                    {name: w[name] for name in CalendarWindow.model_fields}
-                )
-                for w in ws
-            ),
-            metadata_as_of=row["metadata_as_of"],
-            provenance_ref=row["provenance_ref"],
-            created_at=row["created_at"],
-            record_version=row["record_version"],
         )
+        .mappings()
+        .first()
+    )
+    if not row:
+        raise not_found()
+    rows = connection.execute(
+        select(calendar_windows)
+        .where(
+            and_(
+                calendar_windows.c.owner_user_id == owner_user_id,
+                calendar_windows.c.calendar_id == calendar_id,
+                calendar_windows.c.calendar_version == calendar_version,
+            )
+        )
+        .order_by(calendar_windows.c.ordinal)
+    ).mappings()
+    return CalendarVersion(
+        calendar_id=calendar_id,
+        owner_user_id=owner_user_id,
+        calendar_version=calendar_version,
+        exchange_timezone=row["exchange_timezone"],
+        coverage_start=row["coverage_start"],
+        coverage_end=row["coverage_end"],
+        windows=tuple(
+            CalendarWindow.model_validate(
+                {name: item[name] for name in CalendarWindow.model_fields}
+            )
+            for item in rows
+        ),
+        metadata_as_of=row["metadata_as_of"],
+        provenance_ref=row["provenance_ref"],
+        created_at=row["created_at"],
+        record_version=row["record_version"],
+    )
+
+
+class MarketDataCatalog(_MarketDataCatalogBase):
+    def _calendar(
+        self, connection: Connection, owner: str, calendar_id: str, version: int
+    ) -> CalendarVersion:
+        return load_owned_calendar_version(connection, owner, calendar_id, version)
 
     def register_contract(
         self, context: UserContext, value: FuturesContractInput, *, idempotency_key: str

@@ -1,0 +1,633 @@
+"""Bounded raw parsing and static validation for FT-06 definitions."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import unicodedata
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
+
+from pydantic import ValidationError
+
+from familytrade.market_data.models import CalendarVersion
+from familytrade.strategies.definitions import (
+    DefinitionValidationResult,
+    RuleDefinition,
+    ValidationIssue,
+    ValidationIssueCode,
+)
+
+CalendarKey = tuple[str, int]
+_DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_FEATURES: dict[str, tuple[str, str, set[str]]] = {
+    **{
+        name: ("price", "contract_price", set())
+        for name in ("open", "high", "low", "close", "hl2", "typical")
+    },
+    "volume": ("volume", "contract_volume", set()),
+    "sma_v1": ("variable", "variable", {"n", "input"}),
+    "ema_v1": ("variable", "variable", {"n", "input"}),
+    "rsi_wilder_v1": ("decimal", "ratio_0_100", {"n", "input"}),
+    "atr_wilder_v1": ("price", "contract_price", {"n"}),
+    "relative_volume_v1": ("decimal", "ratio", {"n"}),
+    "session_vwap_v1": ("price", "contract_price", set()),
+    "confirmed_pivot_v1": ("level", "contract_price", {"pivot_kind", "left", "right"}),
+    "swing_regime_v1": ("regime", "regime", {"left", "right"}),
+    "prior_session_high_v1": ("level", "contract_price", set()),
+    "prior_session_low_v1": ("level", "contract_price", set()),
+    "rolling_high_v1": ("level", "contract_price", {"n"}),
+    "rolling_low_v1": ("level", "contract_price", {"n"}),
+    "level_touch_v1": ("boolean", "boolean", {"level_feature_id", "tolerance_ticks"}),
+    "level_cross": ("boolean", "boolean", {"level_feature_id", "direction"}),
+}
+
+
+def _pointer(parts: tuple[object, ...]) -> str:
+    return "/" + "/".join(str(part).replace("~", "~0").replace("/", "~1") for part in parts)
+
+
+def _issue(path: str, code: ValidationIssueCode, message: str) -> ValidationIssue:
+    return ValidationIssue(path=path, code=code, message=message)
+
+
+def _issue_sort_key(issue: ValidationIssue) -> tuple[int, str, str]:
+    if issue.code in {
+        ValidationIssueCode.REQUIRED_FOR_LIMIT,
+        ValidationIssueCode.FORBIDDEN_FOR_MARKET,
+        ValidationIssueCode.NAME_MISMATCH,
+        ValidationIssueCode.INVALID_SIDE_ROOT,
+    }:
+        return (2, issue.path, issue.code.value)
+    if issue.code in {
+        ValidationIssueCode.SIZE_LIMIT,
+        ValidationIssueCode.LOOKBACK_LIMIT,
+        ValidationIssueCode.INVALID_MODULE_COMBINATION,
+        ValidationIssueCode.ISSUE_LIMIT,
+    }:
+        return (4, issue.path, issue.code.value)
+    return (
+        1
+        if issue.code
+        in {
+            ValidationIssueCode.UNKNOWN_FIELD,
+            ValidationIssueCode.INVALID_TYPE,
+            ValidationIssueCode.REQUIRED,
+            ValidationIssueCode.INVALID_ENUM,
+            ValidationIssueCode.OUT_OF_RANGE,
+            ValidationIssueCode.INVALID_DECIMAL,
+            ValidationIssueCode.NONFINITE,
+            ValidationIssueCode.DUPLICATE_KEY,
+        }
+        else 3,
+        issue.path,
+        issue.code.value,
+    )
+
+
+def _canonical(value: object, *, definition: bool = False) -> object:
+    if isinstance(value, str):
+        text = unicodedata.normalize("NFC", value)
+        if definition and _DECIMAL.fullmatch(text):
+            decimal = Decimal(text)
+            if not decimal.is_finite():
+                raise ValueError("non-finite decimal")
+            text = format(decimal.normalize(), "f")
+            if text in ("-0", "-0.0"):
+                text = "0"
+            if "." in text:
+                text = text.rstrip("0").rstrip(".")
+            return text or "0"
+        return text
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for raw_key, raw_value in value.items():
+            if not isinstance(raw_key, str):
+                raise TypeError("object keys must be strings")
+            key = unicodedata.normalize("NFC", raw_key)
+            if key in normalized:
+                raise ValueError("duplicate normalized object key")
+            normalized[key] = _canonical(raw_value, definition=definition)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item, definition=definition) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite number")
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    raise TypeError("not a JSON value")
+
+
+def _bytes(value: object, *, definition: bool = False) -> bytes:
+    return json.dumps(
+        _canonical(value, definition=definition),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_operation_request_bytes(value: Mapping[str, object]) -> bytes:
+    return _bytes(value)
+
+
+def canonical_definition_bytes(definition: RuleDefinition) -> bytes:
+    return _bytes(definition.model_dump(mode="json"), definition=True)
+
+
+def canonical_definition_sha256(definition: RuleDefinition) -> str:
+    return hashlib.sha256(canonical_definition_bytes(definition)).hexdigest()
+
+
+def _as_model_input(value: object) -> object:
+    """JSON arrays are represented as tuples by the immutable public models."""
+    if isinstance(value, Mapping):
+        return {key: _as_model_input(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return tuple(_as_model_input(item) for item in value)
+    return value
+
+
+def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
+    try:
+        RuleDefinition.model_validate(_as_model_input(value))
+    except ValidationError as exc:
+        result: list[ValidationIssue] = []
+        for error in exc.errors(include_input=False):
+            kind = str(error["type"])
+            code = (
+                ValidationIssueCode.UNKNOWN_FIELD
+                if kind == "extra_forbidden"
+                else ValidationIssueCode.REQUIRED
+                if kind == "missing"
+                else ValidationIssueCode.INVALID_ENUM
+                if "literal" in kind or "tag" in kind
+                else ValidationIssueCode.INVALID_TYPE
+                if kind.endswith("_type")
+                else ValidationIssueCode.OUT_OF_RANGE
+            )
+            loc = tuple(
+                part
+                for part in error["loc"]
+                if not isinstance(part, str)
+                or part
+                not in {"feature", "constant", "arithmetic", "compare", "temporal_compare", "group"}
+            )
+            result.append(_issue(_pointer(loc), code, "Invalid strategy definition field."))
+        return result
+    return []
+
+
+def _decimal(value: object) -> bool:
+    if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
+        return False
+    try:
+        return Decimal(value).is_finite()
+    except InvalidOperation:
+        return False
+
+
+def _independent_raw_rules(value: Mapping[str, object]) -> list[ValidationIssue]:
+    """Rules whose operands remain observable despite unrelated shape errors."""
+    issues: list[ValidationIssue] = []
+    policy = value.get("order_policy")
+    if (
+        isinstance(policy, Mapping)
+        and policy.get("entry_type") == "limit"
+        and policy.get("limit_price_source") is None
+    ):
+        issues.append(
+            _issue(
+                "/order_policy/limit_price_source",
+                ValidationIssueCode.REQUIRED_FOR_LIMIT,
+                "Limit orders require a price source.",
+            )
+        )
+    features = value.get("features")
+    signatures: dict[str, tuple[object, object]] = {}
+    if isinstance(features, list):
+        for feature in features:
+            if isinstance(feature, Mapping) and isinstance(feature.get("feature_id"), str):
+                signatures[feature["feature_id"]] = (
+                    feature.get("output_type"),
+                    feature.get("unit"),
+                )
+    nodes = value.get("nodes")
+    feature_nodes: dict[str, str] = {}
+    if isinstance(nodes, list):
+        for node in nodes:
+            if (
+                isinstance(node, Mapping)
+                and node.get("kind") == "feature"
+                and isinstance(node.get("node_id"), str)
+                and isinstance(node.get("feature_id"), str)
+            ):
+                feature_nodes[node["node_id"]] = node["feature_id"]
+        for index, node in enumerate(nodes):
+            if (
+                not isinstance(node, Mapping)
+                or node.get("kind") != "arithmetic"
+                or node.get("op") not in {"add", "subtract", "min", "max"}
+            ):
+                continue
+            args = node.get("args")
+            if isinstance(args, list):
+                pairs = [
+                    signatures[feature_nodes[arg]]
+                    for arg in args
+                    if isinstance(arg, str)
+                    and arg in feature_nodes
+                    and feature_nodes[arg] in signatures
+                ]
+                if len(set(pairs)) > 1:
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}/args",
+                            ValidationIssueCode.UNIT_MISMATCH,
+                            "Arithmetic units must match.",
+                        )
+                    )
+    return issues
+
+
+def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
+    spans: dict[str, int] = {}
+    for feature in definition.features:
+        params = feature.parameters
+        n = params.get("n", 1)
+        n_int = n if isinstance(n, int) and not isinstance(n, bool) else 1
+        bars = n_int
+        if feature.name in {
+            "rsi_wilder_v1",
+            "relative_volume_v1",
+            "rolling_high_v1",
+            "rolling_low_v1",
+        }:
+            bars += 1
+        if feature.name == "swing_regime_v1":
+            left, right = params.get("left", 1), params.get("right", 1)
+            bars = (
+                (left if isinstance(left, int) else 1)
+                + 2 * (right if isinstance(right, int) else 1)
+                + 2
+            )
+        elif feature.name == "confirmed_pivot_v1":
+            left, right = params.get("left", 1), params.get("right", 1)
+            bars = (
+                (left if isinstance(left, int) else 1)
+                + (right if isinstance(right, int) else 1)
+                + 1
+            )
+        spans[feature.feature_id] = bars * feature.interval_seconds
+    nodes = {node.node_id: node for node in definition.nodes}
+    cache: dict[str, int] = {}
+
+    def span(node_id: str) -> int:
+        if node_id in cache:
+            return cache[node_id]
+        node = nodes[node_id]
+        if node.kind == "feature":
+            answer = spans.get(node.feature_id, 0) + node.offset * next(
+                f.interval_seconds for f in definition.features if f.feature_id == node.feature_id
+            )
+        elif node.kind == "constant":
+            answer = 0
+        elif node.kind == "temporal_compare":
+            left_node, right_node = nodes.get(node.left_feature), nodes.get(node.right_feature)
+            if (
+                left_node is None
+                or right_node is None
+                or left_node.kind != "feature"
+                or right_node.kind != "feature"
+            ):
+                return 0
+            answer = max(span(node.left_feature), span(node.right_feature)) + max(
+                next(
+                    f.interval_seconds
+                    for f in definition.features
+                    if f.feature_id == left_node.feature_id
+                ),
+                next(
+                    f.interval_seconds
+                    for f in definition.features
+                    if f.feature_id == right_node.feature_id
+                ),
+            )
+        else:
+            refs = (
+                node.args
+                if node.kind == "arithmetic"
+                else node.children
+                if node.kind == "group"
+                else (node.left, node.right)
+                if node.kind == "compare"
+                else ()
+            )
+            answer = max((span(ref) for ref in refs if ref in nodes), default=0)
+        cache[node_id] = answer
+        return answer
+
+    roots = [
+        root
+        for pair in (definition.entry_rules, definition.exit_rules)
+        for root in (pair.long_root, pair.short_root)
+        if root in nodes
+    ]
+    return max((math.ceil(span(root) / execution_interval_seconds) for root in roots), default=0)
+
+
+def validate_rule_definition(
+    value: Mapping[str, object],
+    *,
+    owner_user_id: str,
+    execution_interval_seconds: int,
+    fill_interval_seconds: int,
+    calendar_versions: Mapping[CalendarKey, CalendarVersion],
+) -> DefinitionValidationResult:
+    """Validate configuration statically; this intentionally never evaluates it."""
+    issues = _pydantic_issues(value)
+    issues.extend(_independent_raw_rules(value))
+    try:
+        raw_size = len(_bytes(value))
+    except TypeError, ValueError:
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=(_issue("/", ValidationIssueCode.INVALID_TYPE, "Input is not JSON."),),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
+    if raw_size > 65536:
+        issues.append(
+            _issue("/", ValidationIssueCode.SIZE_LIMIT, "Definition exceeds its byte limit.")
+        )
+    if issues:
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=tuple(
+                sorted(
+                    {(x.path, x.code.value): x for x in issues}.values(),
+                    key=_issue_sort_key,
+                )
+            ),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
+    definition = RuleDefinition.model_validate(_as_model_input(value))
+    if definition.name != unicodedata.normalize("NFC", definition.name):
+        issues.append(
+            _issue("/name", ValidationIssueCode.OUT_OF_RANGE, "Name must be NFC normalized.")
+        )
+    if not (
+        fill_interval_seconds > 0
+        and fill_interval_seconds <= execution_interval_seconds
+        and execution_interval_seconds % fill_interval_seconds == 0
+    ):
+        issues.append(
+            _issue(
+                "/",
+                ValidationIssueCode.INTERVAL_NOT_DIVISIBLE,
+                "Fill interval must divide execution interval.",
+            )
+        )
+    features = {item.feature_id: item for item in definition.features}
+    for index, item in enumerate(definition.features):
+        path = f"/features/{index}"
+        expected = _FEATURES.get(item.name)
+        if expected is None:
+            issues.append(
+                _issue(
+                    path + "/name",
+                    ValidationIssueCode.UNSUPPORTED_FEATURE,
+                    "Feature is unsupported.",
+                )
+            )
+            continue
+        expected_type, expected_unit, allowed = expected
+        if expected_type != "variable" and (
+            item.output_type != expected_type or item.unit != expected_unit
+        ):
+            issues.append(
+                _issue(
+                    path + "/output_type",
+                    ValidationIssueCode.TYPE_MISMATCH,
+                    "Feature signature differs from catalogue.",
+                )
+            )
+        if item.name in {"sma_v1", "ema_v1"}:
+            input_name = item.parameters.get("input")
+            wanted = "volume" if input_name == "volume" else "price"
+            unit = "contract_volume" if input_name == "volume" else "contract_price"
+            if item.output_type != wanted or item.unit != unit:
+                issues.append(
+                    _issue(
+                        path + "/output_type",
+                        ValidationIssueCode.TYPE_MISMATCH,
+                        "Feature signature differs from input.",
+                    )
+                )
+        for parameter in item.parameters:
+            if parameter not in allowed:
+                issues.append(
+                    _issue(
+                        path + "/parameters/" + parameter,
+                        ValidationIssueCode.UNSUPPORTED_PARAMETER,
+                        "Parameter is unsupported.",
+                    )
+                )
+        if (
+            item.interval_seconds not in {60, 300, 900, 1800, 3600}
+            or item.interval_seconds > execution_interval_seconds
+        ):
+            issues.append(
+                _issue(
+                    path + "/interval_seconds",
+                    ValidationIssueCode.INVALID_INTERVAL,
+                    "Feature interval is invalid.",
+                )
+            )
+        elif execution_interval_seconds % item.interval_seconds:
+            issues.append(
+                _issue(
+                    path + "/interval_seconds",
+                    ValidationIssueCode.INTERVAL_NOT_DIVISIBLE,
+                    "Feature interval does not divide execution interval.",
+                )
+            )
+    if len(features) != len(definition.features):
+        seen: set[str] = set()
+        for index, feature in enumerate(definition.features):
+            if feature.feature_id in seen:
+                issues.append(
+                    _issue(
+                        f"/features/{index}/feature_id",
+                        ValidationIssueCode.DUPLICATE_ID,
+                        "Feature ID is duplicated.",
+                    )
+                )
+            seen.add(feature.feature_id)
+    nodes = {node.node_id: node for node in definition.nodes}
+    if len(nodes) != len(definition.nodes):
+        seen_nodes: set[str] = set()
+        for index, node in enumerate(definition.nodes):
+            if node.node_id in seen_nodes:
+                issues.append(
+                    _issue(
+                        f"/nodes/{index}/node_id",
+                        ValidationIssueCode.DUPLICATE_ID,
+                        "Node ID is duplicated.",
+                    )
+                )
+            seen_nodes.add(node.node_id)
+    for index, node in enumerate(definition.nodes):
+        path = f"/nodes/{index}"
+        if node.kind == "feature":
+            if not 0 <= node.offset <= 2000:
+                issues.append(
+                    _issue(
+                        path + "/offset",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "Offset is out of range.",
+                    )
+                )
+            if node.feature_id not in features:
+                issues.append(
+                    _issue(
+                        path + "/feature_id",
+                        ValidationIssueCode.UNKNOWN_REFERENCE,
+                        "Feature is unknown.",
+                    )
+                )
+        elif node.kind == "arithmetic":
+            if not 2 <= len(node.args) <= 16:
+                issues.append(
+                    _issue(
+                        path + "/args",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "Arithmetic arity is invalid.",
+                    )
+                )
+            for arg_index, ref in enumerate(node.args):
+                if ref not in nodes:
+                    issues.append(
+                        _issue(
+                            f"{path}/args/{arg_index}",
+                            ValidationIssueCode.UNKNOWN_REFERENCE,
+                            "Node is unknown.",
+                        )
+                    )
+        elif node.kind == "group":
+            if not 1 <= len(node.children) <= 16:
+                issues.append(
+                    _issue(
+                        path + "/children",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "Group arity is invalid.",
+                    )
+                )
+        elif node.kind == "compare":
+            for field, ref in (("left", node.left), ("right", node.right)):
+                if ref not in nodes:
+                    issues.append(
+                        _issue(
+                            f"{path}/{field}",
+                            ValidationIssueCode.UNKNOWN_REFERENCE,
+                            "Node is unknown.",
+                        )
+                    )
+    if (
+        definition.order_policy.entry_type == "limit"
+        and definition.order_policy.limit_price_source is None
+    ):
+        issues.append(
+            _issue(
+                "/order_policy/limit_price_source",
+                ValidationIssueCode.REQUIRED_FOR_LIMIT,
+                "Limit orders require a price source.",
+            )
+        )
+    if (
+        definition.order_policy.entry_type == "market"
+        and definition.order_policy.limit_price_source is not None
+    ):
+        issues.append(
+            _issue(
+                "/order_policy/limit_price_source",
+                ValidationIssueCode.FORBIDDEN_FOR_MARKET,
+                "Market orders do not use a limit source.",
+            )
+        )
+    if len(definition.features) > 32 or len(definition.nodes) > 128:
+        issues.append(
+            _issue("/", ValidationIssueCode.SIZE_LIMIT, "Definition count limit exceeded.")
+        )
+    # The fixture's incompatible add is the normative observable unit mismatch.
+    for index, node in enumerate(definition.nodes):
+        if (
+            node.kind == "arithmetic"
+            and node.op in {"add", "subtract", "min", "max"}
+            and len(node.args) >= 2
+        ):
+            pairs: list[tuple[str, str]] = []
+            for ref in node.args:
+                candidate = nodes.get(ref)
+                if (
+                    candidate is not None
+                    and candidate.kind == "feature"
+                    and candidate.feature_id in features
+                ):
+                    f = features[candidate.feature_id]
+                    pairs.append((f.output_type, f.unit))
+            if len(set(pairs)) > 1:
+                issues.append(
+                    _issue(
+                        f"/nodes/{index}/args",
+                        ValidationIssueCode.UNIT_MISMATCH,
+                        "Arithmetic units must match.",
+                    )
+                )
+    if issues:
+        ordered = tuple(
+            sorted(
+                {(x.path, x.code.value): x for x in issues}.values(),
+                key=_issue_sort_key,
+            )
+        )
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=ordered[:255]
+            + (
+                (
+                    _issue(
+                        "/",
+                        ValidationIssueCode.ISSUE_LIMIT,
+                        "Additional validation issues were truncated.",
+                    ),
+                )
+                if len(ordered) > 256
+                else ()
+            ),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
+    warmup = _warmup(definition, execution_interval_seconds)
+    if warmup > 2000:
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=(_issue("/", ValidationIssueCode.LOOKBACK_LIMIT, "Lookback limit exceeded."),),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
+    return DefinitionValidationResult(
+        valid=True,
+        definition=definition,
+        errors=(),
+        canonical_definition_sha256=canonical_definition_sha256(definition),
+        required_warmup_bars=warmup,
+    )
