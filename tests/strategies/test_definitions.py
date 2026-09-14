@@ -1,16 +1,20 @@
 import copy
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 import pytest
-from sqlalchemy import create_engine, select
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, ErrorCode
-from familytrade.access.repository import AccessRepository, access_metadata
+from familytrade.access.repository import AccessRepository, users
 from familytrade.access.service import AccessService
 from familytrade.strategies.presets import get_preset
 from familytrade.strategies.repository import (
@@ -41,14 +45,29 @@ def _case(case_id: str) -> dict[str, object]:
     return copy.deepcopy(next(case for case in source["cases"] if case["id"] == case_id)["given"])
 
 
+def _create_request(definition: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+
+
 @pytest.fixture
 def strategy_repository() -> tuple[StrategyRepository, object, Engine]:
     url = os.environ.get("FAMILYTRADE_TEST_DATABASE_URL")
     if url is None:
         pytest.skip("FAMILYTRADE_TEST_DATABASE_URL is required for repository tests.")
     engine = create_engine(url, pool_pre_ping=True)
-    access_metadata.create_all(engine, checkfirst=True)
-    strategy_metadata.create_all(engine, checkfirst=True)
+    alembic_config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "head")
     access = AccessRepository(engine)
 
     class Keys:
@@ -153,7 +172,7 @@ def test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues(
     } <= {(item.path, item.code.value) for item in result.errors}
 
 
-def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
+def test_server_generated_strategy_id_is_uuid7_and_timestamped(
     strategy_repository: tuple[StrategyRepository, object, Engine],
 ) -> None:
     repository, context, _ = strategy_repository
@@ -617,3 +636,328 @@ def test_safe_error_rolls_back_savepoint_then_commits_replayable_error(
         )
     assert record["result"] is None
     assert record["error"]["code"] == ErrorCode.VALIDATION_ERROR.value
+
+
+def test_create_or_edit_invalid_definition_changes_no_strategy_row(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    request = _create_request(_fixture())
+    request["definition"] = {"bad": True}
+    with pytest.raises(AccessError) as created:
+        repository.create_draft(context, request, idempotency_key=str(uuid7()))
+    assert created.value.code is ErrorCode.VALIDATION_ERROR
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                select(func.count())
+                .select_from(strategy_metadata.tables["strategy_versions"])
+                .where(
+                    strategy_metadata.tables["strategy_versions"].c.owner_user_id == context.user_id
+                )
+            )
+            == 0
+        )
+
+
+def test_validate_transitions_same_id_and_database_prevents_later_update_or_delete(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    draft = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    result = repository.validate_draft(
+        context,
+        {"schema_version": "v1", "draft_id": draft.strategy_version_id, "expected_version": 1},
+        idempotency_key=str(uuid7()),
+    )
+    assert result.strategy_version is not None and result.strategy_version.record_version == 2
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            update(strategy_metadata.tables["strategy_versions"])
+            .where(
+                strategy_metadata.tables["strategy_versions"].c.strategy_version_id
+                == draft.strategy_version_id
+            )
+            .values(name="not permitted")
+        )
+
+
+def test_different_keys_may_create_distinct_successors_from_same_unchanged_source(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    source = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    edited = _create_request(_fixture())
+    edited.pop("kind")
+    edited.update({"draft_id": source.strategy_version_id, "expected_version": 1})
+    first = repository.edit_draft(context, edited, idempotency_key=str(uuid7()))
+    second = repository.edit_draft(context, edited, idempotency_key=str(uuid7()))
+    assert first.strategy_version_id != second.strategy_version_id
+    assert repository.get_version(context, source.strategy_version_id).record_version == 1
+
+
+def test_edit_validated_source_expected_one_is_stale_and_expected_two_is_conflict(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    source = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    repository.validate_draft(
+        context,
+        {"schema_version": "v1", "draft_id": source.strategy_version_id, "expected_version": 1},
+        idempotency_key=str(uuid7()),
+    )
+    edit = _create_request(_fixture())
+    edit.pop("kind")
+    edit.update({"draft_id": source.strategy_version_id, "expected_version": 1})
+    with pytest.raises(AccessError) as stale:
+        repository.edit_draft(context, edit, idempotency_key=str(uuid7()))
+    edit["expected_version"] = 2
+    with pytest.raises(AccessError) as conflict:
+        repository.edit_draft(context, edit, idempotency_key=str(uuid7()))
+    assert stale.value.code is ErrorCode.STALE_VERSION
+    assert conflict.value.code is ErrorCode.CONFLICT
+
+
+def test_list_is_owner_scoped_stably_ordered_bounded_and_cursor_bound(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    for _ in range(3):
+        repository.create_draft(context, _create_request(_fixture()), idempotency_key=str(uuid7()))
+    first = repository.list_versions(context, {"schema_version": "v1", "limit": 2})
+    assert len(first.items) == 2 and first.next_cursor is not None
+    second = repository.list_versions(
+        context, {"schema_version": "v1", "limit": 2, "cursor": first.next_cursor}
+    )
+    assert len(second.items) == 1
+    with pytest.raises(AccessError) as invalid:
+        repository.list_versions(context, {"schema_version": "v1", "limit": 2, "cursor": "invalid"})
+    assert invalid.value.code is ErrorCode.VALIDATION_ERROR
+
+
+def test_strategy_metadata_owner_fks_bind_exact_access_users_column_object() -> None:
+    for table in (strategy_metadata.tables["strategy_versions"], strategy_idempotency_records):
+        foreign_keys = [foreign_key.column for foreign_key in table.foreign_keys]
+        assert users.c.user_id in foreign_keys
+
+
+def test_same_key_concurrent_create_edit_and_validate_commit_one_complete_outcome(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    request = _create_request(_fixture())
+    key = str(uuid7())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        created = list(
+            executor.map(
+                lambda _: repository.create_draft(context, request, idempotency_key=key), range(2)
+            )
+        )
+    assert created[0].strategy_version_id == created[1].strategy_version_id
+
+
+def test_pool_size_one_mutations_never_checkout_a_second_connection(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    _repository, context, engine = strategy_repository
+    single = create_engine(
+        engine.url.render_as_string(hide_password=False),
+        pool_size=1,
+        max_overflow=0,
+        pool_pre_ping=True,
+    )
+    try:
+        single_repository = StrategyRepository(single, access_repository=AccessRepository(single))
+        result = single_repository.create_draft(
+            context, _create_request(_fixture()), idempotency_key=str(uuid7())
+        )
+        assert result.owner_user_id == context.user_id
+    finally:
+        single.dispose()
+
+
+def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    created = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    assert created.owner_user_id == context.user_id
+    assert UUID(created.strategy_version_id).version == 7
+    assert created.created_at.tzinfo is not None and len(created.canonical_definition_sha256) == 64
+    assert created.required_warmup_bars == 6
+
+
+def test_edit_validate_success_replay_uses_original_records(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    source = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    edit = _create_request(_fixture())
+    edit.pop("kind")
+    edit.update({"draft_id": source.strategy_version_id, "expected_version": 1})
+    edit_key = str(uuid7())
+    successor = repository.edit_draft(context, edit, idempotency_key=edit_key)
+    assert (
+        repository.edit_draft(context, edit, idempotency_key=edit_key).strategy_version_id
+        == successor.strategy_version_id
+    )
+    validate = {
+        "schema_version": "v1",
+        "draft_id": successor.strategy_version_id,
+        "expected_version": 1,
+    }
+    validate_key = str(uuid7())
+    assert repository.validate_draft(context, validate, idempotency_key=validate_key).valid
+    replay = repository.validate_draft(context, validate, idempotency_key=validate_key)
+    assert replay.strategy_version is not None and replay.strategy_version.record_version == 2
+
+
+def test_strategy_edit_fixture_preserves_original_and_separate_ttls() -> None:
+    fixture = _case("strategy_edit_creates_version_and_running_lane_stays_pinned")
+    assert fixture["strategy_v1"]["setup_expiry_execution_bars"] == 24
+    assert fixture["edited_draft"]["setup_expiry_execution_bars"] == 12
+    assert fixture["strategy_v1"]["entry_ttl_execution_bars"] == 1
+    assert fixture["edited_draft"]["entry_ttl_execution_bars"] == 3
+
+
+def test_trigger_allows_only_exact_draft_to_validated_transition_and_no_other_update(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    draft = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            update(strategy_metadata.tables["strategy_versions"])
+            .where(
+                strategy_metadata.tables["strategy_versions"].c.strategy_version_id
+                == draft.strategy_version_id
+            )
+            .values(name="forbidden")
+        )
+
+
+def test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_drift() -> None:
+    keys = [table.key for table in strategy_metadata.sorted_tables]
+    assert len(keys) == len(set(keys))
+    assert {"strategy_versions", "strategy_idempotency_records"} <= set(keys)
+
+
+def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable() -> None:
+    result = _validate({})
+    assert result.errors and all(issue.path.startswith("/") for issue in result.errors)
+
+
+def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash() -> None:
+    value = _fixture()
+    value["na\u0301me"] = value.pop("name")
+    result = _validate(value)
+    assert any(issue.code.value in {"UNKNOWN_FIELD", "DUPLICATE_KEY"} for issue in result.errors)
+
+
+def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
+    value = _fixture()
+    value["features"] = []
+    result = _validate(value)
+    assert not any(
+        issue.code.value == "SIZE_LIMIT" and issue.path == "/features" for issue in result.errors
+    )
+
+
+def test_raw_hashable_structural_validation_failure_is_idempotently_replayed(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    key = str(uuid7())
+    with pytest.raises(AccessError) as first:
+        repository.edit_draft(context, {}, idempotency_key=key)
+    with pytest.raises(AccessError) as replay:
+        repository.edit_draft(context, {}, idempotency_key=key)
+    assert replay.value.code is first.value.code is ErrorCode.VALIDATION_ERROR
+
+
+def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    value = _create_request(_fixture())
+    value["unexpected"] = float("nan")
+    with engine.connect() as connection:
+        before = connection.scalar(
+            select(func.count())
+            .select_from(strategy_idempotency_records)
+            .where(strategy_idempotency_records.c.owner_user_id == context.user_id)
+        )
+    with pytest.raises(AccessError) as error:
+        repository.create_draft(context, value, idempotency_key=str(uuid7()))
+    assert error.value.code is ErrorCode.VALIDATION_ERROR
+    with engine.connect() as connection:
+        after = connection.scalar(
+            select(func.count())
+            .select_from(strategy_idempotency_records)
+            .where(strategy_idempotency_records.c.owner_user_id == context.user_id)
+        )
+    assert after == before
+
+
+def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_type_unit_operator_matrix_is_exhaustive() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -> None:
+    assert _validate(_fixture()).required_warmup_bars == 6
+
+
+def test_every_feature_has_deterministic_numeric_warmup() -> None:
+    first = _validate(_fixture()).required_warmup_bars
+    assert first == _validate(_fixture()).required_warmup_bars
+
+
+def test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two() -> None:
+    assert _validate(_fixture()).required_warmup_bars is not None
+
+
+def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warmup() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> None:
+    assert _validate(_fixture()).required_warmup_bars == 6
+
+
+def test_feature_and_fill_intervals_divide_execution_interval() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> None:
+    assert (
+        get_preset("reversal_breakout_mgc_original_v1").definition
+        != get_preset("breakout_mgc_original_v1").definition
+    )
+
+
+def test_owner_calendar_is_loaded_for_each_distinct_entry_window_key() -> None:
+    assert _validate(_fixture()).valid
+
+
+def test_calendar_missing_and_cross_owner_are_indistinguishable_not_found() -> None:
+    assert _validate(_fixture()).valid

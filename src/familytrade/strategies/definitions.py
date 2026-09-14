@@ -349,8 +349,8 @@ class StrategyDraftValidateInput(FrozenModel):
 
 class StrategyListInput(FrozenModel):
     schema_version: Literal["v1"]
-    status: Literal["draft", "validated"] | None
-    cursor: str | None
+    status: Literal["draft", "validated"] | None = None
+    cursor: str | None = None
     limit: int = 50
 
 

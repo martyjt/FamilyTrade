@@ -188,7 +188,10 @@ class StrategyRepository:
         """Authorize and serialize one caller/operation/key outcome on this connection."""
         self._authorise(connection, context, "strategy:write")
         key = self._normalize_idempotency_key(idempotency_key)
-        digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
+        try:
+            digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
+        except (TypeError, ValueError) as error:
+            raise self._validation() from error
         lock_key = int.from_bytes(
             hashlib.sha256(
                 json.dumps(
