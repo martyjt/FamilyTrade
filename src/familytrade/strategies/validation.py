@@ -78,6 +78,33 @@ _FEATURE_PARAMETER_RULES: dict[str, dict[str, tuple[str, object]]] = {
     },
 }
 
+_FEATURE_KINDS: dict[str, str] = {
+    **{name: "input" for name in ("open", "high", "low", "close", "hl2", "typical", "volume")},
+    **{
+        name: "indicator"
+        for name in (
+            "sma_v1",
+            "ema_v1",
+            "rsi_wilder_v1",
+            "atr_wilder_v1",
+            "relative_volume_v1",
+            "session_vwap_v1",
+        )
+    },
+    **{name: "structure" for name in ("confirmed_pivot_v1", "swing_regime_v1")},
+    **{
+        name: "level"
+        for name in (
+            "prior_session_high_v1",
+            "prior_session_low_v1",
+            "rolling_high_v1",
+            "rolling_low_v1",
+            "level_touch_v1",
+            "level_cross",
+        )
+    },
+}
+
 
 def _pointer(parts: tuple[object, ...]) -> str:
     return "/" + "/".join(str(part).replace("~", "~0").replace("/", "~1") for part in parts)
@@ -1144,6 +1171,14 @@ def validate_rule_definition(
             )
             continue
         expected_type, expected_unit, allowed = expected
+        if item.kind != _FEATURE_KINDS[item.name]:
+            issues.append(
+                _issue(
+                    path + "/kind",
+                    ValidationIssueCode.TYPE_MISMATCH,
+                    "Feature kind differs from catalogue.",
+                )
+            )
         if expected_type != "variable" and (
             item.output_type != expected_type or item.unit != expected_unit
         ):
