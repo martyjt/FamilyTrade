@@ -242,6 +242,25 @@ class StrategyRepository:
 
     @staticmethod
     def _validation(errors: object = ()) -> AccessError:
+        if isinstance(errors, ValidationError):
+            normalized: list[dict[str, str]] = []
+            for item in errors.errors(include_input=False):
+                loc = item["loc"]
+                path = "/" + "/".join(str(part) for part in loc)
+                kind = str(item["type"])
+                code = (
+                    "UNKNOWN_FIELD"
+                    if kind == "extra_forbidden"
+                    else "REQUIRED"
+                    if kind == "missing"
+                    else "OUT_OF_RANGE"
+                    if kind in {"greater_than_equal", "less_than_equal", "string_pattern_mismatch"}
+                    else "INVALID_TYPE"
+                )
+                normalized.append(
+                    {"path": path, "code": code, "message": "Invalid operation input."}
+                )
+            errors = normalized
         return AccessError(
             ErrorCode.VALIDATION_ERROR,
             "Invalid strategy definition.",
@@ -464,7 +483,7 @@ class StrategyRepository:
             try:
                 source_input = StrategyDraftFromVersionInput.model_validate(value)
             except ValidationError as error:
-                raise self._validation() from error
+                raise self._validation(error) from error
             source = (
                 connection.execute(
                     select(strategy_versions).where(
@@ -555,7 +574,7 @@ class StrategyRepository:
         try:
             parsed = StrategyDraftEditInput.model_validate(_as_model_input(value))
         except ValidationError as error:
-            raise self._validation() from error
+            raise self._validation(error) from error
         source = (
             connection.execute(
                 select(strategy_versions)
@@ -638,7 +657,7 @@ class StrategyRepository:
         try:
             parsed = StrategyDraftValidateInput.model_validate(value)
         except ValidationError as error:
-            raise self._validation() from error
+            raise self._validation(error) from error
         row = (
             connection.execute(
                 select(strategy_versions)
@@ -798,7 +817,7 @@ class StrategyRepository:
         try:
             parsed = StrategyListInput.model_validate(value)
         except ValidationError as error:
-            raise self._validation() from error
+            raise self._validation(error) from error
         with self.engine.connect() as connection:
             self._authorise(connection, context, "strategy:read")
             query = select(strategy_versions).where(
