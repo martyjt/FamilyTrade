@@ -25,6 +25,7 @@ from sqlalchemy import (
     and_,
     func,
     insert,
+    null,
     or_,
     select,
     update,
@@ -56,6 +57,7 @@ from familytrade.strategies.definitions import (
     StrategyVersion,
 )
 from familytrade.strategies.validation import (
+    _as_model_input,
     canonical_definition_sha256,
     canonical_operation_request_bytes,
     validate_rule_definition,
@@ -244,7 +246,9 @@ class StrategyRepository:
             created_at=now,
             record_version=1,
         )
-        connection.execute(insert(strategy_versions).values(**version.model_dump(mode="json")))
+        connection.execute(
+            insert(strategy_versions).values(**version.model_dump(mode="json"), updated_at=now)
+        )
         return version
 
     def _replay(
@@ -301,7 +305,7 @@ class StrategyRepository:
                 idempotency_key=key,
                 request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
                 result=result.model_dump(mode="json"),
-                error=None,
+                error=null(),
                 created_at=func.clock_timestamp(),
             )
         )
@@ -321,7 +325,7 @@ class StrategyRepository:
                 operation=operation,
                 idempotency_key=key,
                 request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
-                result=None,
+                result=null(),
                 error={
                     "code": error.code.value,
                     "message": error.message,
@@ -342,7 +346,7 @@ class StrategyRepository:
             if replay is not None:
                 return replay
             try:
-                parsed = StrategyDraftFromDefinitionInput.model_validate(value)
+                parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
             except ValidationError as error:
                 try:
                     source_input = StrategyDraftFromVersionInput.model_validate(value)

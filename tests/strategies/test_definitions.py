@@ -1,8 +1,18 @@
 import copy
 import json
+import os
 from pathlib import Path
+from uuid import uuid7
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+
+from familytrade.access.credentials import EnvelopeCipher
+from familytrade.access.repository import AccessRepository, access_metadata
+from familytrade.access.service import AccessService
 from familytrade.strategies.presets import get_preset
+from familytrade.strategies.repository import StrategyRepository, strategy_metadata
 from familytrade.strategies.validation import (
     canonical_definition_bytes,
     canonical_definition_sha256,
@@ -24,6 +34,40 @@ def _fixture() -> dict[str, object]:
 def _case(case_id: str) -> dict[str, object]:
     source = json.loads((Path(__file__).parents[2] / "docs/contracts-examples-v1.json").read_text())
     return copy.deepcopy(next(case for case in source["cases"] if case["id"] == case_id)["given"])
+
+
+@pytest.fixture
+def strategy_repository() -> tuple[StrategyRepository, object, Engine]:
+    url = os.environ.get("FAMILYTRADE_TEST_DATABASE_URL")
+    if url is None:
+        pytest.skip("FAMILYTRADE_TEST_DATABASE_URL is required for repository tests.")
+    engine = create_engine(url, pool_pre_ping=True)
+    access_metadata.create_all(engine, checkfirst=True)
+    strategy_metadata.create_all(engine, checkfirst=True)
+    access = AccessRepository(engine)
+
+    class Keys:
+        active_version = "test-v1"
+
+        def key(self, version: str) -> bytes:
+            assert version == "test-v1"
+            return b"K" * 32
+
+    service = AccessService(
+        access, EnvelopeCipher(Keys()), allowed_origins={"https://familytrade.test"}
+    )
+    email = f"strategy-{uuid7()}@example.test"
+    service.invite_user(
+        email, "test-password-A!", {"strategy:read", "strategy:write"}, is_administrator=True
+    )
+    login = service.login(email, "test-password-A!")
+    context = service.authenticate_browser(
+        login.session_token, request_id=str(uuid7()), required_scope="strategy:write"
+    )
+    try:
+        yield StrategyRepository(engine, access_repository=access), context, engine
+    finally:
+        engine.dispose()
 
 
 def test_fully_serialized_rule_definition_crossover_round_trips_and_has_warmup_six() -> None:
@@ -102,6 +146,27 @@ def test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues(
         ("/unknown", "UNKNOWN_FIELD"),
         ("/order_policy/entry_ttl_execution_bars", "INVALID_TYPE"),
     } <= {(item.path, item.code.value) for item in result.errors}
+
+
+def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    definition = _fixture()
+    value = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    created = repository.create_draft(context, value, idempotency_key=str(uuid7()))
+    assert created.owner_user_id == context.user_id
+    assert created.status == "draft" and created.record_version == 1
+    assert created.required_warmup_bars == 6 and len(created.canonical_definition_sha256) == 64
 
 
 def test_presets_return_fresh_frozen_models() -> None:
