@@ -613,13 +613,14 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                     )
                 )
 
-    roots: list[tuple[str, str | None]] = [
-        ("/entry_rules/long_root", definition.entry_rules.long_root),
-        ("/entry_rules/short_root", definition.entry_rules.short_root),
-        ("/exit_rules/long_root", definition.exit_rules.long_root),
-        ("/exit_rules/short_root", definition.exit_rules.short_root),
+    entry_roots_required = definition.entry_combination in {"rules_only", "setup_and_rules"}
+    roots: list[tuple[str, str | None, bool]] = [
+        ("/entry_rules/long_root", definition.entry_rules.long_root, entry_roots_required),
+        ("/entry_rules/short_root", definition.entry_rules.short_root, entry_roots_required),
+        ("/exit_rules/long_root", definition.exit_rules.long_root, False),
+        ("/exit_rules/short_root", definition.exit_rules.short_root, False),
     ]
-    for path, root in roots:
+    for path, root, required in roots:
         side = "long" if "/long_" in path else "short"
         if definition.side_policy != "both" and definition.side_policy != side:
             if root is not None:
@@ -630,17 +631,17 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                         "Disabled side root must be null.",
                     )
                 )
-        elif root is None:
+        elif root is None and required:
             issues.append(
                 _issue(
                     path, ValidationIssueCode.INVALID_SIDE_ROOT, "Enabled side root is required."
                 )
             )
-        elif root not in nodes:
+        elif root is not None and root not in nodes:
             issues.append(
                 _issue(path, ValidationIssueCode.UNKNOWN_REFERENCE, "Root node is unknown.")
             )
-        elif signature(root) != ("boolean", "boolean"):
+        elif root is not None and signature(root) != ("boolean", "boolean"):
             issues.append(
                 _issue(path, ValidationIssueCode.ROOT_NOT_BOOLEAN, "Root must resolve to boolean.")
             )

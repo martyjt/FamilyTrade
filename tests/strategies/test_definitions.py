@@ -248,3 +248,14 @@ def test_confirmed_pivot_zones_warmup_includes_minimum_touch_spacing_boundaries(
     )
     result = _validate(value)
     assert result.valid and result.required_warmup_bars == 21
+
+
+def test_presets_match_original_breakout_only_and_funded_source_inventories() -> None:
+    for preset_id in (
+        "reversal_breakout_mgc_original_v1",
+        "breakout_mgc_original_v1",
+        "reversal_breakout_funded_v2_reference_v1",
+    ):
+        preset = get_preset(preset_id)
+        result = _validate(preset.definition.model_dump(mode="json"))
+        assert result.valid, result.errors
