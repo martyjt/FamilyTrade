@@ -193,7 +193,16 @@ class StrategyRepository:
         try:
             digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
         except (TypeError, ValueError) as error:
-            raise self._validation() from error
+            code = (
+                "DUPLICATE_KEY"
+                if "duplicate normalized object key" in str(error)
+                else "NONFINITE"
+                if "non-finite" in str(error)
+                else "INVALID_TYPE"
+            )
+            raise self._validation(
+                [{"path": "/", "code": code, "message": "Invalid operation input."}]
+            ) from error
         lock_key = int.from_bytes(
             hashlib.sha256(
                 json.dumps(

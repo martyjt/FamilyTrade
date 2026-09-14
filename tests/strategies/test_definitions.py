@@ -1066,9 +1066,15 @@ def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
         StrategyListInput.model_validate({"schema_version": "v1", "limit": 0})
 
 
-def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash() -> None:
+def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
     with pytest.raises(ValueError, match="duplicate normalized object key"):
         canonical_operation_request_bytes({"é": 1, "e\u0301": 2})
+    repository, context, _ = strategy_repository
+    with pytest.raises(AccessError) as error:
+        repository.create_draft(context, {"é": 1, "e\u0301": 2}, idempotency_key=str(uuid7()))
+    assert error.value.details["errors"][0]["code"] == "DUPLICATE_KEY"
 
 
 def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
@@ -1109,6 +1115,9 @@ def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
     with pytest.raises(AccessError) as error:
         repository.create_draft(context, value, idempotency_key=str(uuid7()))
     assert error.value.code is ErrorCode.VALIDATION_ERROR
+    assert error.value.details["errors"] == [
+        {"path": "/", "code": "NONFINITE", "message": "Invalid operation input."}
+    ]
     with engine.connect() as connection:
         after = connection.scalar(
             select(func.count())
