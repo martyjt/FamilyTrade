@@ -1236,7 +1236,8 @@ def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> Non
         "feature_id": features[0]["feature_id"],
         "offset_ticks": 0,
     }
-    assert _validate(value).required_warmup_bars >= 500
+    result = _validate(value)
+    assert result.valid and result.required_warmup_bars >= 500
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:
