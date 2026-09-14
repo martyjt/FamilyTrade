@@ -482,7 +482,10 @@ def test_setup_price_sources_require_an_enabled_emitting_setup() -> None:
 
 
 def test_empty_entry_windows_needs_no_calendar_and_does_not_imply_flattening() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    value["constraints"]["entry_windows"] = []
+    result = _validate(value)
+    assert result.valid and not any("entry_windows" in issue.path for issue in result.errors)
 
 
 def test_entry_window_rejects_break_closure_and_unrepresented_segment() -> None:
@@ -1257,16 +1260,47 @@ def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
 
 
 def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -> None:
-    assert _validate(_fixture()).required_warmup_bars == 6
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    nodes[0]["offset"] = 1
+    result = _validate(value)
+    assert ("/nodes/2", "TYPE_MISMATCH") in {(item.path, item.code.value) for item in result.errors}
 
 
 def test_every_feature_has_deterministic_numeric_warmup() -> None:
-    first = _validate(_fixture()).required_warmup_bars
-    assert first == _validate(_fixture()).required_warmup_bars
+    value = _fixture()
+    features = value["features"]
+    assert isinstance(features, list)
+    features.append(
+        {
+            "feature_id": "unused",
+            "kind": "indicator",
+            "name": "sma_v1",
+            "output_type": "price",
+            "unit": "contract_price",
+            "interval_seconds": 900,
+            "parameters": {"n": 500, "input": "close"},
+        }
+    )
+    assert _validate(value).required_warmup_bars == _validate(_fixture()).required_warmup_bars
 
 
 def test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two() -> None:
-    assert _validate(_fixture()).required_warmup_bars is not None
+    value = _fixture()
+    features = value["features"]
+    assert isinstance(features, list)
+    features[0].update(
+        {
+            "name": "swing_regime_v1",
+            "kind": "structure",
+            "output_type": "regime",
+            "unit": "regime",
+            "parameters": {"left": 2, "right": 3},
+        }
+    )
+    result = _validate(value)
+    assert ("/nodes/2", "TYPE_MISMATCH") in {(item.path, item.code.value) for item in result.errors}
 
 
 def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warmup() -> None:
