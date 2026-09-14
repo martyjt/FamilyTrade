@@ -1550,6 +1550,31 @@ class MarketDataCatalog:
                     )
                 lock_connection.commit()
 
+    @contextmanager
+    def _retention_bar_locks(
+        self, owner_user_id: str, bar_record_ids: tuple[str, ...]
+    ) -> Iterator[None]:
+        keys = tuple(
+            f"market-data-retention|{owner_user_id}|{bar_record_id}"
+            for bar_record_id in sorted(set(bar_record_ids))
+        )
+        with self.engine.connect() as lock_connection:
+            for key in keys:
+                lock_connection.execute(
+                    text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"),
+                    {"key": key},
+                )
+            lock_connection.commit()
+            try:
+                yield
+            finally:
+                for key in reversed(keys):
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                        {"key": key},
+                    )
+                lock_connection.commit()
+
     def record_completed_batch(
         self, context: UserContext, value: RecordBatchInput, *, idempotency_key: str
     ) -> RecordBatchResult:
@@ -2268,7 +2293,7 @@ class MarketDataCatalog:
             raise MarketDataError(
                 MarketDataCode.VALIDATION_ERROR, "Only lane causal retention is supported.", 422
             )
-        with self.engine.begin() as c:
+        with self._retention_bar_locks(context.user_id, (bar_record_id,)), self.engine.begin() as c:
             replay = self._idempotent(
                 c,
                 context,
@@ -2301,6 +2326,14 @@ class MarketDataCatalog:
                         == revision_bars.c.dataset_revision_id,
                     ),
                 )
+                .outerjoin(
+                    publication_revisions,
+                    and_(
+                        publication_revisions.c.owner_user_id == revision_bars.c.owner_user_id,
+                        publication_revisions.c.dataset_revision_id
+                        == revision_bars.c.dataset_revision_id,
+                    ),
+                )
                 .where(
                     and_(
                         revision_bars.c.owner_user_id == context.user_id,
@@ -2308,7 +2341,11 @@ class MarketDataCatalog:
                         dataset_revisions.c.status == "published",
                     )
                 )
-                .order_by(dataset_revisions.c.published_at)
+                .order_by(
+                    dataset_revisions.c.published_at,
+                    publication_revisions.c.ordinal.asc().nulls_last(),
+                    dataset_revisions.c.dataset_revision_id,
+                )
             ).scalar()
             now = self._now()
             if found:
