@@ -42,6 +42,7 @@ from familytrade.strategies.definitions import (
     DefinitionValidationResult,
     StrategyDraftEditInput,
     StrategyDraftFromDefinitionInput,
+    StrategyDraftFromVersionInput,
     StrategyDraftValidateInput,
     StrategyListInput,
     StrategyListItem,
@@ -270,7 +271,52 @@ class StrategyRepository:
             try:
                 parsed = StrategyDraftFromDefinitionInput.model_validate(value)
             except Exception as error:
-                raise self._validation() from error
+                try:
+                    source_input = StrategyDraftFromVersionInput.model_validate(value)
+                except Exception:
+                    raise self._validation() from error
+                source = (
+                    connection.execute(
+                        select(strategy_versions).where(
+                            and_(
+                                strategy_versions.c.owner_user_id == context.user_id,
+                                strategy_versions.c.strategy_version_id
+                                == source_input.source_version_id,
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if source is None:
+                    raise not_found()
+                if source["status"] != "validated":
+                    raise AccessError(
+                        ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
+                    )
+                stored = StrategyVersion.model_validate(
+                    {key: item for key, item in dict(source).items() if key != "updated_at"}
+                )
+                parsed = StrategyDraftFromDefinitionInput.model_validate(
+                    {
+                        "kind": "definition",
+                        "schema_version": "v1",
+                        "name": source_input.name,
+                        "definition_schema_version": stored.definition_schema_version,
+                        "definition": {
+                            **stored.definition.model_dump(mode="json"),
+                            "name": source_input.name,
+                        },
+                        "catalogue_version": stored.catalogue_version,
+                        "execution_interval_seconds": stored.execution_interval_seconds,
+                        "fill_interval_seconds": stored.fill_interval_seconds,
+                    }
+                )
+                result = self._insert(connection, context, parsed, source_input.source_version_id)
+                self._save_replay(
+                    connection, context, "strategy.create", idempotency_key, value, result
+                )
+                return result
             if parsed.name != parsed.definition.name:
                 raise self._validation(
                     [
