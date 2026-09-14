@@ -25,6 +25,7 @@ from familytrade.strategies.repository import (
 from familytrade.strategies.validation import (
     canonical_definition_bytes,
     canonical_definition_sha256,
+    canonical_operation_request_bytes,
     validate_rule_definition,
 )
 
@@ -847,10 +848,8 @@ def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
 
 
 def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash() -> None:
-    value = _fixture()
-    value["na\u0301me"] = value.pop("name")
-    result = _validate(value)
-    assert any(issue.code.value in {"UNKNOWN_FIELD", "DUPLICATE_KEY"} for issue in result.errors)
+    with pytest.raises(ValueError, match="duplicate normalized object key"):
+        canonical_operation_request_bytes({"é": 1, "e\u0301": 2})
 
 
 def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
@@ -880,6 +879,8 @@ def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
     repository, context, engine = strategy_repository
     value = _create_request(_fixture())
     value["unexpected"] = float("nan")
+    with pytest.raises(ValueError, match="non-finite number"):
+        canonical_operation_request_bytes(value)
     with engine.connect() as connection:
         before = connection.scalar(
             select(func.count())
