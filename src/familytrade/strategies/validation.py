@@ -183,6 +183,15 @@ def _canonical(value: object, *, definition: bool = False) -> object:
                     item = item.rstrip("0").rstrip(".")
                 if item in {"", "-0"}:
                     item = "0"
+            if (
+                definition
+                and key == "value"
+                and raw_value is not None
+                and value.get("value_type") in {"decimal", "price", "volume", "level"}
+                and _decimal(item)
+            ):
+                decimal = Decimal(cast(str, item))
+                item = format(decimal.normalize(), "f").rstrip("0").rstrip(".") or "0"
             normalized[key] = item
         return normalized
     if isinstance(value, (list, tuple)):
