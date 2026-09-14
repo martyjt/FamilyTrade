@@ -89,6 +89,7 @@ base-10 strings. The public records are:
 - `EngineConfig`, `EmissionContext`, `CompletedBarEvent`, `DataQualityEvent`,
   `FinishRunEvent`, and `EngineInputEvent`.
 - `FeatureValue`, `FeatureRuntimeState`, `RuleResult`, `IntervalBucket`,
+  `AccumulatorPoint`, every `FeatureAccumulator`, `IntervalIndex`,
   `ZoneState`, `SetupSnapshot`, `SetupState`, `OrderState`,
   `ProtectiveOrderState`, `ProtectiveBracketState`, `PositionState`, `RiskState`,
   `EngineState`, and `EngineCheckpoint`.
@@ -139,25 +140,62 @@ FeatureValue = {
   source_bar_record_ids:tuple[string,...], known_at:UTC timestamp
 }
 
+AccumulatorPoint = {
+  evaluation_bar_end:UTC timestamp, known_at:UTC timestamp, value:Decimal,
+  source_bar_record_ids:tuple[string,...]
+}
+
+FeatureAccumulator = exactly one of {
+  {kind:"none_v1"},
+  {kind:"rolling_window_v1",points:tuple[AccumulatorPoint,...],sum:Decimal},
+  {kind:"ema_v1",seed_points:tuple[AccumulatorPoint,...],seed_sum:Decimal,
+    ema:Decimal|null},
+  {kind:"rsi_wilder_v1",previous_close:AccumulatorPoint|null,
+    delta_count:int,seed_gain_sum:Decimal,seed_loss_sum:Decimal,
+    average_gain:Decimal|null,average_loss:Decimal|null},
+  {kind:"atr_wilder_v1",previous_close:AccumulatorPoint|null,
+    true_range_count:int,seed_true_range_sum:Decimal,
+    average_true_range:Decimal|null},
+  {kind:"relative_volume_v1",prior_volumes:tuple[AccumulatorPoint,...],
+    prior_volume_sum:Decimal},
+  {kind:"session_vwap_v1",trading_day:date|null,
+    typical_volume_numerator:Decimal,volume_denominator:Decimal},
+  {kind:"pivot_v1",candidate_bars:tuple[BarSelection,...],
+    confirmed_highs:tuple[AccumulatorPoint,...],
+    confirmed_lows:tuple[AccumulatorPoint,...]},
+  {kind:"session_level_v1",current_trading_day:date|null,
+    current_high:Decimal|null,current_low:Decimal|null,current_complete:bool,
+    previous_trading_day:date|null,previous_high:Decimal|null,
+    previous_low:Decimal|null,previous_complete:bool,
+    current_source_bar_record_ids:tuple[string,...],
+    previous_source_bar_record_ids:tuple[string,...]},
+  {kind:"dependency_v1",dependency_feature_ids:tuple[string,...],
+    previous_values:tuple[FeatureValue,...]}
+}
+
 FeatureRuntimeState = {
-  feature_id, recurrent_value:Decimal|null, consecutive_bars:int,
-  history:tuple[FeatureValue,...], session_trading_day:date|null
+  feature_id, feature_name, consecutive_bars:int,
+  accumulator:FeatureAccumulator,
+  history:tuple[FeatureValue,...], session_trading_day:date|null,
+  continuity_status:"clean"|"broken_until_reseed"|"broken_until_session"
 }
 
 RuleResult = {
   node_id, result:"PASS"|"FAIL"|"UNKNOWN",
-  value:Decimal|int|bool|string|null, value_type, unit,
+  value:Decimal|bool|string|null, unit,
   source_bar_record_ids:tuple[string,...], known_at:UTC timestamp,
   reason_code:string
 }
 
 IntervalBucket = {
-  interval_seconds, start_at, end_at,
+  interval_seconds, slot_index:int, start_at, end_at,
   selections:tuple[BarSelection,...],
   published_base_revision_ids:tuple[lowercase UUIDv7|null,...],
   expected_component_count:int,
   status:"building"|"complete"|"broken"
 }
+
+IntervalIndex = {interval_seconds:int,last_slot_index:int|null}
 
 ZoneState = {
   zone_id:lowercase UUIDv7, kind:"support"|"resistance", low, high,
@@ -208,7 +246,7 @@ OrderState = {
   order_sequence:int,
   status:"PENDING"|"ACTIVE"|"FILLED"|"EXPIRED"|"CANCELLED",
   status_reason:string|null, activated_at:UTC timestamp|null,
-  fill_sequence:int, source_setup_id:string|null
+  fill_sequence:int|null, source_setup_id:string|null
 }
 
 PositionState = {
@@ -228,7 +266,7 @@ ProtectiveOrderState = {
   active_from:UTC timestamp, filled_at:UTC timestamp|null,
   cancelled_at:UTC timestamp|null, status_reason:string|null,
   entry_order_id:lowercase UUIDv7, entry_fill_id:lowercase UUIDv7,
-  order_sequence:int, fill_sequence:int
+  order_sequence:int, fill_sequence:int|null
 }
 
 ProtectiveBracketState = {
@@ -298,11 +336,40 @@ have `schema_version:"v1"`, `owner_user_id`, `created_at`, and
 `record_version:1`; domain record times determine `created_at` as shown rather than
 an implicit clock.
 Nullable fields are nullable only where the frozen contract says `|null`.
-`Decision.evidence` is the frozen
-`{evaluation_stage,results:tuple[RuleResult,...],selected_setup:SetupSnapshot|null}`
-projection plus the required `historical|contemporaneous|reconstructed_after_outage`
-evidence label. The result tuple is lexical by node ID. `idempotency_key` is the
+`Decision.evidence` is exactly
+`{evaluation_stage:"entry_rule"|"exit_rule"|"arm"|"entry_intent",
+evidence_mode:"historical"|"contemporaneous"|"reconstructed_after_outage",
+results:tuple[RuleResult,...],selected_setup:SetupSnapshot|null}`. `evidence_mode`
+is the single named key that realizes the otherwise unnamed required label in
+frozen section 13.3; no other evidence metadata key is allowed. `RuleResult` has
+exactly the frozen fields above: it has no `value_type`, and an integer-valued node
+is projected as an exact integral Decimal (for example `Decimal("3")`), never a
+JSON integer. The result tuple is lexical by node ID. `idempotency_key` is the
 deterministic UUIDv7 derived for the decision identity; it is not caller-supplied.
+
+Accumulator selection is closed by feature name: direct bar inputs use `none_v1`;
+SMA and rolling high/low use `rolling_window_v1`; EMA, Wilder RSI, Wilder ATR,
+relative volume, and session VWAP use their same-named variants; confirmed pivots
+and swing regime use `pivot_v1`; prior-session high/low use `session_level_v1`;
+level touch/cross use `dependency_v1`. Every configured length, ordered seed/window
+point, previous close, quantized recurrent average, sum, numerator, denominator,
+current/previous session completeness flag, pivot candidate, dependency previous
+value, and source ID required for the next output is therefore present in canonical
+state. Missing/invalid quality resets bounded rolling/Wilder/EMA seeds and marks
+them `broken_until_reseed`; a broken session VWAP or prior-session accumulator is
+`broken_until_session` until the next stored trading-day start. Checkpoint restore
+does not recompute any accumulator from unavailable earlier inputs.
+
+`fill_sequence` is null for every pending, active, expired, or cancelled regular or
+protective order. On a committed Fill, the order snapshot receives the current
+global `next_fill_sequence`, the Fill uses that same integer, and state increments
+`next_fill_sequence` by one. A sibling OCO cancellation retains null. Rejection,
+cancellation, expiry, exact replay, and prospective fill evaluation consume no fill
+sequence.
+`activated_at`, `filled_at`, and `cancelled_at` are modeled transition times derived
+from the eligible bar/boundary, never persistence times. Durable record timing is
+carried only by Decision/OrderIntent/Fill/RunEvent under the explicit section 4
+rules.
 
 `EngineState` is exactly:
 
@@ -318,12 +385,17 @@ deterministic UUIDv7 derived for the decision identity; it is not caller-supplie
   last_bar_payload_hash:string|null, last_availability_at:UTC timestamp|null,
   last_recorded_at:UTC timestamp|null, last_input_sha256:string|null,
   last_published_base_revision_id:lowercase UUIDv7|null,
+  canonical_bar_count:int,
+  last_source_slot_index:int|null,
+  last_fill_slot_index:int|null,
+  last_execution_slot_index:int|null,
+  zone_slot_indexes:tuple[IntervalIndex,...],
   interval_buckets:tuple[IntervalBucket,...],
   feature_values:tuple[FeatureValue,...],
   feature_runtime:tuple[FeatureRuntimeState,...],
   zones:tuple[ZoneState,...], setups:tuple[SetupState,...],
   pending_entry:OrderState|null, position:PositionState|null,
-  close_intent:OrderState|null,
+  close_intent:OrderState|null, scheduled_force_close:OrderState|null,
   cash, equity, fees, realized_pnl, unrealized_pnl,
   exposure_seconds:int, last_mark:Decimal|null,
   last_mark_bar_record_id:string|null,
@@ -333,6 +405,7 @@ deterministic UUIDv7 derived for the decision identity; it is not caller-supplie
   next_fill_sequence:int, next_event_sequence:int,
   next_zone_sequence:int, next_setup_sequence:int,
   next_correlation_sequence:int,
+  force_close_state:"not_applicable"|"waiting"|"pending"|"completed"|"blocked",
   finished_reason:string|null
 }
 ~~~
@@ -342,6 +415,17 @@ feature/node need plus one prior value for temporal comparisons. No unordered se
 or implementation object may enter state bytes. Zones sort by creation sequence
 then ID; setup states sort by module kind; buckets and feature values sort by
 interval/end/ID.
+
+All slot indexes begin at zero on the first represented scheduled slot and advance
+once per subsequent expected slot, including explicit missing/invalid open slots.
+`last_source_slot_index` is the canonical minute cursor;
+`last_fill_slot_index` and `last_execution_slot_index` advance at their configured
+full-bar boundaries even when the bucket is broken. `zone_slot_indexes` has one
+entry for each enabled zone interval, sorted by interval. `IntervalBucket.slot_index`
+is the index it will complete. Setup arm/signal/expiry and cooldown use only the
+stored execution index; zone creation/touch/age use only the matching stored zone
+index. These indexes, all in-progress buckets, and every accumulator above are
+checkpointed and hashed, so chunking or restore cannot reset an expiry or cooldown.
 
 `status:"CLOSING"` is the nonterminal status whenever `position != null` and
 `close_intent != null`, whether the close was caused by an exit rule, liquidation,
@@ -410,6 +494,16 @@ activation across a DST fold, gap, maintenance interval, or `scheduled_closed`
 span. Window close cancels a pending entry and setup; it never closes an open
 position or cancels protection.
 
+Entry-window eligibility applies to the entire configured fill bar, not only its
+opening instant. The half-open fill interval `[bar.start_at,bar.end_at)` must be
+contained in one stored open segment and in one window from each non-empty run and
+strategy tuple. If an effective window opens or closes inside that fill bar, the
+bar is ineligible. An internal close boundary cancels the pending entry before any
+gap/touch evaluation; an internal open boundary permits no retroactive fill and the
+pending entry may wait for the next wholly contained bar subject to its unchanged
+TTL. This conservative causal rule needs no implicit intrabar/window ordering and
+leaves protective exits eligible.
+
 All config owner IDs agree. The validated strategy definition/hash/catalogue,
 contract ID/version, contract calendar ID/version, and supplied calendar ID/version
 must agree. Contract tick size and multiplier are positive. Every executable price
@@ -427,7 +521,11 @@ value fails `UNSUPPORTED_FILL_INTERVAL` before state creation. It does not weake
 FT-06 validation or claim sub-minute source data.
 
 Backtest requires one owned, published `DatasetRevision`, a finite `end_at`, and
-modeled bar availability at each bar end. Forward paper requires a null pinned
+modeled bar availability at each bar end. Its half-open `[start_at,end_at)` span is
+at most five calendar years: the maximum end is the same UTC month/day/time five
+years later, with February 29 clipped to February 28 when the fifth year is not a
+leap year. Equality is allowed; a larger span is `UNSUPPORTED_CONFIGURATION`
+before state creation. Forward paper requires a null pinned
 revision, null `end_at`, `end_policy:"mark_open"`, and causal-latest selections.
 `force_close` is backtest-only and requires explicit `force_close_at`, the start of
 the last selected valid fill bar whose end is at or before `end_at`. `mark_open`
@@ -436,21 +534,30 @@ the canonical config fingerprint in state enforces that boundary.
 
 `max_canonical_bars` is the run-level resource cap. Its default is `500000`, its
 valid range is `1..2000000`, and `2000000` is an absolute v1 ceiling that no config
-may override. Before creating a new state or stepping a supplied initial state,
-`run_engine` preflights the whole input tuple. The count is one for each
-`CompletedBarEvent`, plus the number of canonical 60-second slots represented by
-each `DataQualityEvent`; duplicate inputs still count. `FinishRunEvent` counts
-zero. A count above the configured cap raises `BATCH_LIMIT_EXCEEDED` before any
-state, decision, fill, event, or checkpoint is produced; a supplied initial state
-remains byte-identical. A configured cap above the absolute ceiling is
-`UNSUPPORTED_CONFIGURATION` before state creation. `step_engine` processes one
-event and has no hidden batch counter.
+may override. `EngineState.canonical_bar_count` is cumulative across every
+`step_engine`, `run_engine`, caller chunk, and checkpoint restore. A valid completed
+bar counts one; each missing/invalid quality interval counts its expected open
+canonical 60-second slots; closed quality and finish count zero. Exact replay counts
+zero. Before a step, or before any batch item is applied, the engine checks current
+state count plus the accepted non-replay delta. Exceeding the configured cap raises
+`BATCH_LIMIT_EXCEEDED` before that input/batch creates state, decision, fill, event,
+or checkpoint; supplied state remains byte-identical. `run_engine` deduplicates
+only its allowed adjacent exact replay before this cumulative preflight, so splitting
+the same run into chunks cannot bypass either limit. A configured cap above the
+absolute ceiling is `UNSUPPORTED_CONFIGURATION` before state creation.
+Pre-start warm-up bars count identically; warm-up is not a cap bypass.
 
 `EmissionContext` is
-`{attempt_id:lowercase UUIDv7|null,fencing_token:positive int}`. It is opaque output
-metadata supplied by the caller. The pure engine does not claim, acquire, renew, or
-validate a lease and does not persist the token. This closes the required Fill and
-RunEvent fields without implementing FT-08/FT-10/FT-11 ownership behavior.
+`{attempt_id:lowercase UUIDv7|null,fencing_token:positive int,
+order_submitted_at:UTC timestamp,output_recorded_at:UTC timestamp}`. All values are
+explicit pure-call inputs. `attempt_id` and `fencing_token` are opaque output
+metadata; the pure engine does not claim, acquire, renew, validate, or persist a
+lease. `order_submitted_at` binds any order created by this input and
+`output_recorded_at` binds every resulting Fill/RunEvent record. In forward paper,
+`event.recorded_at <= order_submitted_at <= output_recorded_at`; in backtest all
+three are equal. Inputs that create no order still carry the fields for one strict
+event shape, but no order timestamp is emitted. This closes required record times
+without an implicit clock or FT-08/FT-10/FT-11 behavior.
 
 `CompletedBarEvent` is exactly:
 
@@ -524,7 +631,9 @@ engine does not impose a symmetric pre-start rejection.
 `FinishRunEvent` is exactly
 `{kind:"finish_run_v1",effective_at:UTC timestamp,recorded_at:UTC timestamp,
 emission_context:EmissionContext}`.
-It is valid only for a backtest, exactly once, with `effective_at=config.end_at` and
+It is valid only for a backtest that has not already reached the separate
+actual-contract `STOPPED`/expiry-blocked terminal path, exactly once, with
+`effective_at=config.end_at` and
 `recorded_at>=effective_at`. Every expected open minute from `start_at` through the
 finish boundary must already be accounted for by a valid completed bar or explicit
 missing/invalid quality event; otherwise it is `VALIDATION_ERROR` with detail
@@ -535,7 +644,9 @@ FT-07 input.
 
 `initialize_engine` sets cash, equity, high-water, and the applicable stored
 trading-day baseline to starting cash; zeros fees, P&L, exposure, drawdown,
-counters, and sequences; and creates no position, order, setup, or feature value.
+cumulative canonical-bar counter, and sequences; sets all last-slot indexes null;
+sets `force_close_state` to `waiting` only for force-close and `not_applicable`
+otherwise; and creates no position, order, setup, or feature value.
 Canonical events whose bar end is at or before `config.start_at` are warm-up only:
 they update buckets, indicators, pivots, zones, and session state but emit no entry,
 exit, order, Fill, cash change, exposure, or trading decision. The first entry
@@ -553,11 +664,16 @@ applicable, payload hash, availability/control time, and input hash. An exact
 replay of the immediately preceding input returns the unchanged state and
 `replayed:true`. A different input overlapping a consumed logical interval is
 `DUPLICATE_CONFLICT`; any older nonidentical input is `EVENT_OUT_OF_ORDER`.
-`run_engine` removes adjacent exact duplicates before stepping, after the resource
-preflight count. Incremental chunks may overlap by their last event, so batch and
+`run_engine` removes its allowed adjacent exact replay before the cumulative
+resource preflight. Incremental chunks may overlap by their last event, so batch and
 incremental results are identical across a caller-boundary duplicate. Arbitrary
 old-event lookup and durable deduplication belong to later persistence, not this
 bounded checkpoint.
+
+`last_recorded_at` is the accepted input's `output_recorded_at`. Every subsequent
+non-replay input requires `event.recorded_at >= last_recorded_at`; its explicit
+submission/output times then satisfy section 3. A regression is
+`EVENT_OUT_OF_ORDER` with no state or sequence change.
 
 The engine identifies every expected canonical minute from materialized open
 calendar segments but never guesses why a minute is absent. Open gaps are advanced
@@ -579,15 +695,34 @@ explicit research partial policy. For target intervals supported by
 match that integrated function exactly. Other valid minute-multiple fill intervals
 use the same first/max/min/last/sum and segment-anchor rule.
 
+For any derived fill bar, use the integrated
+`AggregatedFullBar.source_bar_record_ids` tuple in its existing timestamp order. The
+singular frozen `Fill.bar_record_id` is the
+first ordered source ID for an opening-gap fill because it supplies the modeled
+open; it is the last ordered source ID for an intrabar touch/both-hit fill because
+the model becomes determined at aggregate end. `MARK_RECORDED.bar_record_id` and
+`EngineState.last_mark_bar_record_id` are always the last ordered source ID because
+they represent the derived close. A 60-second fill bar has the same first/last ID.
+No synthetic aggregate ID is substituted, source order is never lexicalized, and
+no extra source-tuple field is added to the frozen Fill or MARK payload.
+
 A derived bar's causal availability is the maximum availability of all its source
 minutes. At execution-bar end `T`, zone bars newly complete at or before `T` are
 processed oldest first, then features and setups are evaluated once for that full
 execution bar. Backtest `effective_at=T`. Forward `effective_at` is the maximum
 causal availability of every cited source; `decided_at` is the input `recorded_at`
-and is never earlier. A resulting order activates on the first full configured fill
-bar whose start is at or after modeled effective time in backtest, or at or after
-the forward submitted/recorded time. A close-based signal therefore never fills in
-its signal bar, and delayed delivery never reaches back into an already-open bar.
+and is never earlier. `Decision.created_at=decided_at`.
+`OrderIntent.submitted_at=EmissionContext.order_submitted_at`. Its `active_from` is
+the first full configured fill-bar start at or after `effective_at` in backtest and
+at or after `order_submitted_at` in forward paper, also subject to the whole-bar
+entry-window rule. `Fill.created_at=EmissionContext.output_recorded_at` on the input
+that determines the fill, while `Fill.model_time` remains the frozen fill-bar start
+for an opening gap and end for an intrabar touch. Every RunEvent caused by the input
+uses `recorded_at=created_at=output_recorded_at`. Thus the delayed fixture binds
+Decision `10:15:02.100000Z`, close submission `10:15:02.200000Z`, activation
+`10:16:00Z`, and no fill in the already-open 10:15 bar without an implicit clock.
+A close-based signal therefore never fills in its signal bar, and delayed delivery
+never reaches back into an already-open bar.
 For forward evidence, a Decision uses null `dataset_revision_id` when any cited
 selection is active or the cited minutes do not share one non-null published base;
 otherwise it uses that shared published base. A backtest always uses its pinned
@@ -630,8 +765,9 @@ covered by checkpoint/state hashes. Rejection and exact replay consume no counte
 creation sequence then lexical zone ID; it is never iteration order. Null optional
 identity fields remain explicit null tuple members.
 `input_sha256` is the section 13.1 canonical hash of the complete typed input with
-only `emission_context` excluded. Thus a retry fence/attempt cannot change domain
-identity, while modeled `recorded_at` remains replay-significant.
+only `emission_context.attempt_id` and `.fencing_token` excluded. Thus a retry
+fence/attempt cannot change domain identity, while `recorded_at`,
+`order_submitted_at`, and `output_recorded_at` remain replay-significant.
 
 These canonical vectors are normative:
 
@@ -639,7 +775,7 @@ These canonical vectors are normative:
 | --- | --- | --- |
 | `correlation` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"completed_bar_v1","2026-01-02T03:04:00Z","2026-01-02T03:05:00Z","0000000000000000000000000000000000000000000000000000000000000000"]` | `019b7caa-6360-7464-861e-19052358e1e7` |
 | `decision` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"018f4c00-0000-7000-8000-000000000002","2026-01-02T03:05:00Z","ENTRY","long","018f4c00-0000-7000-8000-000000000003","0000000000000000000000000000000000000000000000000000000000000000","019b7caa-6360-7464-861e-19052358e1e7"]` | `019b7caa-6360-740c-8624-091a15fdd2b9` |
-| `protective-stop-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,1,"018f4c00-0000-7000-8000-000000000010","018f4c00-0000-7000-8000-000000000011","sell","1","1999.8"]` | `019b7cab-4dc0-7ce0-8903-f7b4f08cbabc` |
+| `protective-stop-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,1,"018f4c00-0000-7000-8000-000000000010","018f4c00-0000-7000-8000-000000000011","sell",1,"1999.8"]` | `019b7cab-4dc0-7d0e-b4c8-ad805426627d` |
 
 The table and vectors, not host UUID or clock APIs, are the cross-platform oracle.
 
@@ -839,12 +975,20 @@ state transition. Rejection reason codes are exactly `RISK_SIZE_ZERO`,
 `ENTRY_GEOMETRY_GAP`, `RISK_GAP`, `DAILY_LOSS_LIMIT`, `DAILY_ENTRY_LIMIT`, and
 `CUMULATIVE_DRAWDOWN_LIMIT`.
 
+The effective daily-entry cap is
+`min(strategy_version.definition.constraints.max_entries_per_trading_day,
+config.risk_policy.max_entries_per_trading_day)`. The strategy constraint and the
+run/account risk policy are both authoritative ceilings; neither can widen the
+other. The atomic entry fill is allowed only while
+`filled_entries_in_trading_day < effective_daily_entry_cap`; equality rejects with
+`DAILY_ENTRY_LIMIT` before commission, Fill, or counter advancement.
+
 At a stored trading-day boundary, the last marked prior-day equity becomes
 `daily_start_equity`; daily loss and entry count reset, and session VWAP resets.
 Position basis, cash, high-water, cumulative drawdown, bracket, setup-independent
 order state, and open-position lifetime carry. Daily loss and cumulative drawdown
 limits latch inclusively at `>=`; daily entries are allowed only while count is
-strictly below its limit. Latches cancel entry/setup state but preserve exits. A
+strictly below the effective limit above. Latches cancel entry/setup state but preserve exits. A
 later recovery in equity does not clear a same-day daily-loss latch.
 
 At `entry_cutoff_at`, cancel entries/setups and block new ones. At
@@ -859,15 +1003,48 @@ checkpoint, or event naming a different contract ID or record version is
 `UNSUPPORTED_CONTRACT_CHANGE`; the engine never stitches, rolls, or transfers a
 position.
 
+The immutable `contract_expiry_close_and_no_roll` fixture crosses an FT-07/FT-11
+wording boundary. Its complete FT-07 projection is nevertheless asserted: cutoff
+cancels pending/new entries; liquidation creates a `CONTRACT_LIQUIDATION` close
+intent, keeps protection active, sets `CLOSING`, and creates no stale fill; the
+first later eligible bar fills at `1997.90` with realized P&L `-21.00` and exit
+commission `1.25`; final engine status is `STOPPED`; new-contract position count is
+zero; and automatic roll is false. The phrase `operator intent CLOSE_AND_STOP` is
+the FT-11 persistence/control context surrounding that pure projection. FT-07's
+test loads the whole expected object, explicitly classifies that phrase as
+`external_ft11_context`, and asserts that EngineConfig/state/input/output contain no
+operator-intent or control field. It is neither silently skipped nor implemented.
+
 `mark_open` finishes with the actual open position, pending entry/setup,
 close intent, bracket, cash, latest mark/status, realized and unrealized P&L
 visible. It creates no
-synthetic exit. `force_close` blocks entries that could outlive `force_close_at`,
-creates a close intent at that precomputed bar start, and must close on that bar
-before end. Creation sets `CLOSING`; a successful force close moves to `FINISHED`,
-while the actual-contract liquidation path moves to `STOPPED`. If the selected bar
-is absent/invalid or the close cannot occur, status
-is `BLOCKED_UNCLOSED`; it never backdates from end. Forward paper cannot force-close.
+synthetic exit. For `force_close`, initialize `force_close_state:"waiting"` and
+block any entry whose lifetime could reach `force_close_at`. Atomically with any
+earlier entry fill, create `scheduled_force_close` as a frozen market-close
+`OrderState` with `effective_at=active_from=force_close_at`, the entry input's
+explicit `submitted_at`, status `PENDING`, reason `FORCE_CLOSE`, and no bracket.
+It is separate from `close_intent`, so it neither sets `CLOSING` early nor competes
+with protection. A prior ordinary/protective close cancels it and returns
+`force_close_state` to `waiting`, allowing a later pre-boundary entry to receive its
+own schedule. At the force-close
+bar start, activate and move it to `close_intent`, cancel entry state, set `CLOSING`
+and `force_close_state:"pending"`, then apply normal opening-gap/bracket/market-close
+precedence. Because the scheduled order existed before the bar, its opening Fill is
+never backdated from an end-of-bar decision. A
+successful close or protective exit cancels its sibling/close as applicable, sets
+`force_close_state:"completed"`, keeps entry creation blocked, and returns the
+nonterminal engine status to `ACTIVE` while awaiting the required finish input. A
+flat position at the boundary moves directly to `completed`.
+
+Only the exactly-once `FinishRunEvent` creates `RUN_FINISHED` and terminal
+`FINISHED` for a successful `mark_open` or completed force-close run. If the force
+bar was missing/invalid or the position/close remains unresolved, that finish
+atomically sets `force_close_state:"blocked"` and `BLOCKED_UNCLOSED`; it never
+backdates a fill. Replaying the byte-identical FinishRunEvent returns unchanged
+terminal state with `replayed:true` and emits no second terminal event. Every
+nonidentical post-terminal input is `RUN_FINISHED`. Forward paper cannot
+force-close. Actual-contract liquidation remains the separate `STOPPED`/
+`BLOCKED_EXPIRY_UNRESOLVED` path above and does not wait for a run finish event.
 
 FT-07 returns the state needed by later analysis but does not implement FT-12
 metrics. It must expose cash, equity, fees, realized/unrealized P&L, position,
@@ -952,9 +1129,9 @@ these immutable records atomically but may not reinterpret them.
 - In-progress interval buckets; quantized feature recurrence/history sufficient for
   the validated maximum lookback; confirmed pivots/zones; setup state and frozen
   candidate snapshots.
-- Pending entry, position, protective bracket, close intent, cash, equity, marks,
-  fees, realized/unrealized P&L, exposure, high-water/drawdown, trading-day baseline,
-  counters, and risk latches.
+- Pending entry, position, protective bracket, close intent, scheduled force close,
+  cash, equity, marks, fees, realized/unrealized P&L, exposure,
+  high-water/drawdown, trading-day baseline, counters, and risk latches.
 - Finished/blocked status and last stable error/reason. It contains no credential,
   database handle, path, provider payload, clock, lease, fence, outbox, or job state.
 
@@ -988,8 +1165,8 @@ The code, sole public message, and condition are:
 | VALIDATION_ERROR | Engine input is invalid. | A typed cross-field invariant not assigned a narrower code fails. |
 | INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. |
 | EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. |
-| BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | The preflight canonical-slot count exceeds `max_canonical_bars`. |
-| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset, calendar, mode, random seed, or policy is unsupported/inconsistent. |
+| BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. |
+| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset, calendar, mode, random seed, five-year span, absolute bar ceiling, or policy is unsupported/inconsistent. |
 | UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. |
 | UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. |
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
@@ -1091,6 +1268,17 @@ The named boundary and replay tests are:
 - `test_effective_entry_windows_intersect_run_and_strategy_without_flattening`
 - `test_usd_commission_pnl_and_risk_rounding_pipeline_boundary_examples`
 - `test_batch_default_and_absolute_bar_limits_fail_before_state_creation`
+- `test_uuid_vector_integer_quantity_matches_normative_value`
+- `test_cumulative_bar_caps_across_steps_chunks_restore_and_five_calendar_year_span`
+- `test_checkpoint_restores_accumulators_and_runtime_indexes_byte_exactly`
+- `test_aggregated_fill_and_mark_choose_first_or_last_ordered_source_id`
+- `test_forward_decided_submitted_active_and_created_times_match_delayed_fixture`
+- `test_effective_daily_entry_cap_is_minimum_of_strategy_and_risk_policy`
+- `test_entry_window_boundary_inside_fill_bar_cancels_before_fill`
+- `test_force_close_waits_for_exactly_once_finish_before_finished`
+- `test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state`
+- `test_rule_result_and_decision_evidence_match_frozen_schema_exactly`
+- `test_order_fill_sequence_is_null_until_fill_and_advances_only_on_commit`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
