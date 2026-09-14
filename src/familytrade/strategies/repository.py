@@ -269,6 +269,33 @@ class StrategyRepository:
             )
         )
 
+    def _save_safe_error(
+        self,
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        key: str,
+        value: dict[str, object],
+        error: AccessError,
+    ) -> None:
+        connection.execute(
+            insert(strategy_idempotency_records).values(
+                owner_user_id=context.user_id,
+                operation=operation,
+                idempotency_key=key,
+                request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
+                result=None,
+                error={
+                    "code": error.code.value,
+                    "message": error.message,
+                    "http_status": error.http_status,
+                    "retryable": error.retryable,
+                    "details": error.details,
+                },
+                created_at=func.clock_timestamp(),
+            )
+        )
+
     def create_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
