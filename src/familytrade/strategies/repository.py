@@ -12,6 +12,7 @@ from uuid import UUID, uuid7
 
 from pydantic import ValidationError
 from sqlalchemy import (
+    CHAR,
     CheckConstraint,
     Column,
     DateTime,
@@ -55,6 +56,7 @@ from familytrade.strategies.definitions import (
     StrategyPage,
     StrategyValidationResult,
     StrategyVersion,
+    ValidationIssue,
 )
 from familytrade.strategies.validation import (
     _as_model_input,
@@ -77,7 +79,7 @@ strategy_versions = Table(
     Column("status", String(16), nullable=False),
     Column("definition_schema_version", String(64), nullable=False),
     Column("definition", JSONB, nullable=False),
-    Column("canonical_definition_sha256", String(64), nullable=False),
+    Column("canonical_definition_sha256", CHAR(64), nullable=False),
     Column("catalogue_version", String(64), nullable=False),
     Column("execution_interval_seconds", Integer, nullable=False),
     Column("fill_interval_seconds", Integer, nullable=False),
@@ -140,7 +142,7 @@ strategy_idempotency_records = Table(
     Column("owner_user_id", String(36), ForeignKey(users.c.user_id), primary_key=True),
     Column("operation", String(40), primary_key=True),
     Column("idempotency_key", String(36), primary_key=True),
-    Column("request_sha256", String(64), nullable=False),
+    Column("request_sha256", CHAR(64), nullable=False),
     Column("result", JSONB),
     Column("error", JSONB),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -301,7 +303,7 @@ class StrategyRepository:
         operation: str,
         key: str,
         digest: str,
-    ) -> StrategyVersion | AccessError | None:
+    ) -> StrategyVersion | StrategyValidationResult | AccessError | None:
         row = (
             connection.execute(
                 select(strategy_idempotency_records)
@@ -326,6 +328,8 @@ class StrategyRepository:
                 409,
             )
         if row["result"] is not None:
+            if "validation_result" in row["result"]:
+                return StrategyValidationResult.model_validate(row["result"]["validation_result"])
             return StrategyVersion.model_validate_json(json.dumps(row["result"]))
         return self._error_from_record(cast(dict[str, object], row["error"]))
 
@@ -346,7 +350,7 @@ class StrategyRepository:
         operation: str,
         key: str,
         digest: str,
-        result: StrategyVersion,
+        result: StrategyVersion | StrategyValidationResult,
     ) -> None:
         connection.execute(
             insert(strategy_idempotency_records).values(
@@ -354,7 +358,11 @@ class StrategyRepository:
                 operation=operation,
                 idempotency_key=key,
                 request_sha256=digest,
-                result=result.model_dump(mode="json"),
+                result=(
+                    result.model_dump(mode="json")
+                    if isinstance(result, StrategyVersion)
+                    else {"validation_result": result.model_dump(mode="json")}
+                ),
                 error=null(),
                 created_at=func.clock_timestamp(),
             )
@@ -406,6 +414,7 @@ class StrategyRepository:
             if isinstance(replay, AccessError):
                 public_error = replay
             elif replay is not None:
+                assert isinstance(replay, StrategyVersion)
                 result = replay
             else:
                 savepoint = connection.begin_nested()
@@ -503,6 +512,7 @@ class StrategyRepository:
             if isinstance(replay, AccessError):
                 public_error = replay
             elif replay is not None:
+                assert isinstance(replay, StrategyVersion)
                 result = replay
             else:
                 savepoint = connection.begin_nested()
@@ -575,7 +585,10 @@ class StrategyRepository:
             replay = self._replay(connection, context, "strategy.validate", key, digest)
             if isinstance(replay, AccessError):
                 public_error = replay
+            elif isinstance(replay, StrategyValidationResult):
+                result = replay
             elif replay is not None:
+                assert isinstance(replay, StrategyVersion)
                 result = StrategyValidationResult(valid=True, strategy_version=replay, errors=())
             else:
                 savepoint = connection.begin_nested()
@@ -590,14 +603,13 @@ class StrategyRepository:
                     )
                 else:
                     savepoint.commit()
-                    assert result.strategy_version is not None
                     self._save_replay(
                         connection,
                         context,
                         "strategy.validate",
                         key,
                         digest,
-                        result.strategy_version,
+                        result,
                     )
         if public_error is not None:
             raise public_error
@@ -635,25 +647,35 @@ class StrategyRepository:
         stored = StrategyVersion.model_validate(
             _as_model_input({key: item for key, item in dict(row).items() if key != "updated_at"})
         )
-        checked = self._check(
-            connection,
-            context,
-            StrategyDraftEditInput.model_validate(
-                _as_model_input(
-                    {
-                        "schema_version": "v1",
-                        "draft_id": stored.strategy_version_id,
-                        "expected_version": 1,
-                        "name": stored.name,
-                        "definition_schema_version": stored.definition_schema_version,
-                        "definition": stored.definition.model_dump(mode="json"),
-                        "catalogue_version": stored.catalogue_version,
-                        "execution_interval_seconds": stored.execution_interval_seconds,
-                        "fill_interval_seconds": stored.fill_interval_seconds,
-                    }
-                )
-            ),
-        )
+        try:
+            checked = self._check(
+                connection,
+                context,
+                StrategyDraftEditInput.model_validate(
+                    _as_model_input(
+                        {
+                            "schema_version": "v1",
+                            "draft_id": stored.strategy_version_id,
+                            "expected_version": 1,
+                            "name": stored.name,
+                            "definition_schema_version": stored.definition_schema_version,
+                            "definition": stored.definition.model_dump(mode="json"),
+                            "catalogue_version": stored.catalogue_version,
+                            "execution_interval_seconds": stored.execution_interval_seconds,
+                            "fill_interval_seconds": stored.fill_interval_seconds,
+                        }
+                    )
+                ),
+            )
+        except AccessError as error:
+            if error.code is not ErrorCode.VALIDATION_ERROR:
+                raise
+            raw_errors = cast(list[dict[str, object]], error.details.get("errors", []))
+            return StrategyValidationResult(
+                valid=False,
+                strategy_version=None,
+                errors=tuple(ValidationIssue.model_validate(item) for item in raw_errors),
+            )
         assert checked.valid
         connection.execute(
             update(strategy_versions)

@@ -123,18 +123,7 @@ def _issue_sort_key(issue: ValidationIssue) -> tuple[int, str, str]:
 
 def _canonical(value: object, *, definition: bool = False) -> object:
     if isinstance(value, str):
-        text = unicodedata.normalize("NFC", value)
-        if definition and _DECIMAL.fullmatch(text):
-            decimal = Decimal(text)
-            if not decimal.is_finite():
-                raise ValueError("non-finite decimal")
-            text = format(decimal.normalize(), "f")
-            if text in ("-0", "-0.0"):
-                text = "0"
-            if "." in text:
-                text = text.rstrip("0").rstrip(".")
-            return text or "0"
-        return text
+        return unicodedata.normalize("NFC", value)
     if isinstance(value, Mapping):
         normalized: dict[str, object] = {}
         for raw_key, raw_value in value.items():
@@ -1169,10 +1158,10 @@ def validate_rule_definition(
                 "Market orders do not use a limit source.",
             )
         )
-    if len(definition.features) > 32 or len(definition.nodes) > 128:
-        issues.append(
-            _issue("/", ValidationIssueCode.SIZE_LIMIT, "Definition count limit exceeded.")
-        )
+    if len(definition.features) > 32:
+        issues.append(_issue("/features", ValidationIssueCode.OUT_OF_RANGE, "Too many features."))
+    if len(definition.nodes) > 128:
+        issues.append(_issue("/nodes", ValidationIssueCode.OUT_OF_RANGE, "Too many nodes."))
     # The fixture's incompatible add is the normative observable unit mismatch.
     for index, node in enumerate(definition.nodes):
         if (
