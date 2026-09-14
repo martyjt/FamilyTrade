@@ -1246,7 +1246,10 @@ def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
         for _ in range(8)
     ]
     window_pairs = {(item.path, item.code.value) for item in _validate(windows).errors}
-    assert not any(path == "/constraints/entry_windows" and code == "OUT_OF_RANGE" for path, code in window_pairs)
+    assert not any(
+        path == "/constraints/entry_windows" and code == "OUT_OF_RANGE"
+        for path, code in window_pairs
+    )
     assert any(path.startswith("/constraints/entry_windows/") for path, _code in window_pairs)
 
 
@@ -1386,24 +1389,57 @@ def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_incl
 
 
 def test_type_unit_operator_matrix_is_exhaustive() -> None:
+    for op in ("add", "subtract", "min", "max"):
+        value = _fixture()
+        value["nodes"].append(
+            {
+                "kind": "arithmetic",
+                "node_id": op,
+                "op": op,
+                "args": ["fast-now", "slow-now"],
+                "result_type": "price",
+                "unit": "contract_price",
+            }
+        )
+        assert _validate(value).valid
+    for op, result_type, unit in (
+        ("multiply", "price", "contract_price"),
+        ("divide", "price", "contract_price"),
+    ):
+        value = _fixture()
+        value["nodes"].append(
+            {
+                "kind": "constant",
+                "node_id": "scalar",
+                "value_type": "decimal",
+                "unit": "scalar",
+                "value": "2",
+            }
+        )
+        value["nodes"].append(
+            {
+                "kind": "arithmetic",
+                "node_id": op,
+                "op": op,
+                "args": ["fast-now", "scalar"],
+                "result_type": result_type,
+                "unit": unit,
+            }
+        )
+        assert _validate(value).valid
     value = _fixture()
-    nodes = value["nodes"]
-    assert isinstance(nodes, list)
-    nodes.append(
+    value["nodes"].append(
         {
             "kind": "arithmetic",
-            "node_id": "valid-price-sum",
+            "node_id": "bad",
             "op": "add",
-            "args": ["fast-now", "slow-now"],
+            "args": ["fast-now", "volume-now"],
             "result_type": "price",
             "unit": "contract_price",
         }
     )
-    assert _validate(value).valid
-    nodes[-1]["args"] = ["fast-now", "volume-now"]
-    invalid = _validate(value)
     assert ("/nodes/7/args", "UNIT_MISMATCH") in {
-        (item.path, item.code.value) for item in invalid.errors
+        (item.path, item.code.value) for item in _validate(value).errors
     }
 
 
