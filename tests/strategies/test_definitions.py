@@ -580,9 +580,33 @@ def test_setup_expiry_and_one_or_multi_bar_order_ttl_are_independent() -> None:
 
 
 def test_r_multiple_rejects_absent_nonpositive_or_out_of_range_without_fixture_alias() -> None:
-    fixture = _case("r_multiple_targets_long_short")
-    assert fixture["long"]["r_multiple"] == "2.50"
-    assert fixture["short"]["r_multiple"] == "3.00"
+    module = {
+        "kind": "reversal_setup_v1",
+        "enabled": False,
+        "sides": "long",
+        "approach_multiple": "1",
+        "require_directional_approach": False,
+        "stop_buffer_multiple": "1",
+        "recent_peak_stop": False,
+        "peak_lookback": 1,
+        "target_mode": "r_multiple",
+        "measured_move_multiple": "1",
+        "r_multiple": "2",
+        "filter_root": None,
+    }
+    for invalid in ("0", "-1", "100.01"):
+        value = _fixture()
+        value["setup_modules"].append({**module, "r_multiple": invalid})
+        assert ("/setup_modules/1/r_multiple", "OUT_OF_RANGE") in {
+            (item.path, item.code.value) for item in _validate(value).errors
+        }
+    missing = _fixture()
+    missing_module = dict(module)
+    del missing_module["r_multiple"]
+    missing["setup_modules"].append(missing_module)
+    assert ("/setup_modules/1/reversal_setup_v1/r_multiple", "REQUIRED") in {
+        (item.path, item.code.value) for item in _validate(missing).errors
+    }
 
 
 def test_generic_market_relative_bracket_fixture_is_valid_without_resolving_prices() -> None:
@@ -1374,10 +1398,60 @@ def test_feature_and_fill_intervals_divide_execution_interval() -> None:
 
 
 def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> None:
-    assert (
-        get_preset("reversal_breakout_mgc_original_v1").definition
-        != get_preset("breakout_mgc_original_v1").definition
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    nodes.extend(
+        [
+            {"kind": "group", "node_id": "arm", "op": "all", "children": ["cross-up"]},
+            {
+                "kind": "group",
+                "node_id": "entry-filter",
+                "op": "all",
+                "children": ["fast-below-slow"],
+            },
+        ]
     )
+    value["setup_modules"].extend(
+        [
+            {
+                "kind": "confirmed_pivot_zones_v1",
+                "zone_interval_seconds": 900,
+                "use_atr": False,
+                "atr_length": 2,
+                "pivot_left": 1,
+                "pivot_right": 1,
+                "merge_multiple": "1",
+                "max_width_multiple": "1",
+                "minimum_touches": 1,
+                "max_zones": 2,
+                "zone_max_age_bars": 1,
+                "cooldown_execution_bars": 0,
+            },
+            {
+                "kind": "breakout_retest_v1",
+                "enabled": True,
+                "sides": "long",
+                "confirmation_mode": "beyond",
+                "break_multiple": "1",
+                "pullback_multiple": "1",
+                "setup_expiry_execution_bars": 1,
+                "stop_buffer_multiple": "1",
+                "use_vwap_stop": False,
+                "target_mode": "r_multiple",
+                "measured_move_multiple": "1",
+                "r_multiple": "2",
+                "arm_filter_root": "arm",
+                "entry_filter_root": "entry-filter",
+            },
+        ]
+    )
+    value["entry_combination"] = "setup_and_rules"
+    assert _validate(value).valid
+    value["setup_modules"][2]["entry_filter_root"] = "fast-now"
+    assert ("/setup_modules/2/entry_filter_root", "ROOT_NOT_BOOLEAN") in {
+        (item.path, item.code.value) for item in _validate(value).errors
+    }
 
 
 def test_owner_calendar_is_loaded_for_each_distinct_entry_window_key() -> None:
