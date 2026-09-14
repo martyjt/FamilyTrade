@@ -12,6 +12,7 @@ from uuid import uuid7
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import and_, func, insert, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 from familytrade.access.models import AccessError
 from familytrade.market_data.archive import DatasetPublisher, MarketDataReader
@@ -844,7 +845,7 @@ def _scenario_corruption_closure_pages_every_descendant_without_total_count_cuto
 ) -> None:
     context = contexts[0]
     _, contract = seed(catalog, context)
-    first = catalog.record_completed_batch(
+    catalog.record_completed_batch(
         context,
         RecordBatchInput(bars=(bar_input(contract.contract_id),)),
         idempotency_key=str(uuid7()),
@@ -857,48 +858,115 @@ def _scenario_corruption_closure_pages_every_descendant_without_total_count_cuto
     )
     start = bar_input(contract.contract_id).start_at
     publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
-    revisions = [
-        publisher.publish(
-            context,
-            PublicationRequest(
-                series_key=key,
-                coverage_start=start,
-                coverage_end=start + timedelta(minutes=1),
-            ),
-            idempotency_key=str(uuid7()),
+    root = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    root_id = root.dataset_revision.dataset_revision_id
+    with catalog.engine.begin() as connection:
+        root_row = dict(
+            connection.execute(
+                select(dataset_revisions).where(dataset_revisions.c.dataset_revision_id == root_id)
+            )
+            .mappings()
+            .one()
         )
-    ]
-    prior_id = first.inserted_bar_record_ids[0]
-    for source_revision in range(2, 7):
-        recorded = catalog.record_completed_batch(
-            context,
-            RecordBatchInput(
-                bars=(
-                    bar_input(
-                        contract.contract_id,
-                        source_revision,
-                        prior_id,
-                        "SOURCE_CORRECTION",
+        root_object = dict(
+            connection.execute(
+                select(archive_objects)
+                .join(
+                    revision_partitions,
+                    and_(
+                        revision_partitions.c.owner_user_id == archive_objects.c.owner_user_id,
+                        revision_partitions.c.object_id == archive_objects.c.object_id,
                     ),
                 )
-            ),
-            idempotency_key=str(uuid7()),
-        )
-        prior_id = recorded.inserted_bar_record_ids[0]
-        revisions.append(
-            publisher.publish(
-                context,
-                PublicationRequest(
-                    series_key=key,
-                    coverage_start=start,
-                    coverage_end=start + timedelta(minutes=1),
-                    expected_parent_revision_id=revisions[-1].dataset_revision.dataset_revision_id,
-                ),
-                idempotency_key=str(uuid7()),
+                .where(revision_partitions.c.dataset_revision_id == root_id)
             )
+            .mappings()
+            .one()
         )
+        root_selected = dict(
+            connection.execute(
+                select(revision_bars).where(revision_bars.c.dataset_revision_id == root_id)
+            )
+            .mappings()
+            .one()
+        )
+        object_rows: list[dict[str, object]] = []
+        revision_rows: list[dict[str, object]] = []
+        partition_rows: list[dict[str, object]] = []
+        selected_rows: list[dict[str, object]] = []
+        for index in range(1001):
+            child_id, object_id = str(uuid7()), str(uuid7())
+            object_row = dict(root_object)
+            object_row.update(
+                object_id=object_id,
+                uri=f"ft-archive://object/{object_id}",
+                origin_publication_id=str(uuid7()),
+                publication_id=None,
+                catalog_origin="retained_manifest",
+            )
+            object_rows.append(object_row)
+            child_projection = root.dataset_revision.model_copy(
+                update={
+                    "dataset_revision_id": child_id,
+                    "parent_revision_id": root_id,
+                    "manifest_uri": f"ft-archive://manifest/{child_id}",
+                    "manifest_sha256": hashlib.sha256(child_id.encode()).hexdigest(),
+                    "manifest_byte_length": 1,
+                    "partition_refs": (
+                        root.dataset_revision.partition_refs[0].model_copy(
+                            update={
+                                "object_id": object_id,
+                                "uri": f"ft-archive://object/{object_id}",
+                                "origin_publication_id": object_row["origin_publication_id"],
+                            }
+                        ),
+                    ),
+                    "parent_depth": 1,
+                    "restore_closure_revision_count": 2,
+                    "restore_closure_row_count": 2,
+                    "restore_closure_bytes": root_object["byte_length"] * 2,
+                }
+            )
+            revision_row = dict(root_row)
+            revision_row.update(
+                dataset_revision_id=child_id,
+                projection=child_projection.model_dump(mode="json"),
+                parent_revision_id=root_id,
+                manifest_uri=child_projection.manifest_uri,
+                manifest_sha256=child_projection.manifest_sha256,
+                manifest_byte_length=child_projection.manifest_byte_length,
+                parent_depth=1,
+                restore_closure_revision_count=2,
+                restore_closure_row_count=2,
+                restore_closure_bytes=root_object["byte_length"] * 2,
+                created_at=root_row["created_at"] + timedelta(microseconds=index + 1),
+            )
+            revision_rows.append(revision_row)
+            partition_rows.append(
+                {
+                    "owner_user_id": context.user_id,
+                    "dataset_revision_id": child_id,
+                    "ordinal": 0,
+                    "object_id": object_id,
+                }
+            )
+            selected_row = dict(root_selected)
+            selected_row.update(dataset_revision_id=child_id, object_id=object_id)
+            selected_rows.append(selected_row)
+        connection.execute(insert(archive_objects), object_rows)
+        connection.execute(insert(dataset_revisions), revision_rows)
+        connection.execute(insert(revision_partitions), partition_rows)
+        connection.execute(insert(revision_bars), selected_rows)
     corrupt_path = archive_store.resolve(
-        context.user_id, revisions[0].dataset_revision.partition_refs[0].uri
+        context.user_id, root.dataset_revision.partition_refs[0].uri
     )
     corrupt_path.chmod(0o600)
     corrupt_path.write_bytes(b"corrupt")
@@ -910,21 +978,12 @@ def _scenario_corruption_closure_pages_every_descendant_without_total_count_cuto
                 series_key=key,
                 coverage_start=start,
                 coverage_end=start + timedelta(minutes=1),
-                policy=PinnedRead(
-                    dataset_revision_id=revisions[0].dataset_revision.dataset_revision_id
-                ),
+                policy=PinnedRead(dataset_revision_id=root_id),
             ),
         )
-    revision_ids = [item.dataset_revision.dataset_revision_id for item in revisions]
     with catalog.engine.begin() as c:
-        states = list(
-            c.execute(
-                select(dataset_revisions.c.status)
-                .where(dataset_revisions.c.dataset_revision_id.in_(revision_ids))
-                .order_by(dataset_revisions.c.parent_depth)
-            ).scalars()
-        )
-    assert states == ["quarantined"] * len(revision_ids)
+        states = list(c.execute(select(dataset_revisions.c.status)).scalars())
+    assert states == ["quarantined"] * 1002
 
 
 def _scenario_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(
@@ -3183,7 +3242,19 @@ def test_publish_and_restore_reject_missing_forked_or_hash_mismatched_manifest_c
 
 @pytest.mark.parametrize(
     "injection_point",
-    ("after_recovery_admission_before_snapshot", "during_publish_tx_before_commit"),
+    (
+        "after_recovery_admission_before_snapshot",
+        "before_temp_create",
+        "during_temp_write",
+        "after_file_fsync_before_directory_fsync",
+        "after_all_fsync_before_staged_tx",
+        "during_publish_tx_before_commit",
+        "after_staged_commit_before_rename",
+        "during_object_renames",
+        "after_all_renames_before_directory_fsync",
+        "after_rename_fsync_before_publish_tx",
+        "after_publish_commit_before_cleanup",
+    ),
 )
 def test_recovery_crash_matrix_keeps_quarantined_error_until_one_atomic_healthy_latest_commit(
     catalog, contexts, archive_store, monkeypatch, injection_point
@@ -3235,7 +3306,7 @@ def test_recovery_crash_matrix_keeps_quarantined_error_until_one_atomic_healthy_
     with pytest.raises(RuntimeError, match="recovery crash"):
         publisher.recover_quarantined_latest(context, request, idempotency_key=key)
     with catalog.engine.begin() as c:
-        latest, source_status = c.execute(
+        latest, latest_status = c.execute(
             select(series.c.latest_revision_id, dataset_revisions.c.status)
             .join(
                 dataset_revisions,
@@ -3246,15 +3317,127 @@ def test_recovery_crash_matrix_keeps_quarantined_error_until_one_atomic_healthy_
             )
             .where(series.c.contract_id == contract.contract_id)
         ).one()
-        assert c.execute(select(func.count()).select_from(dataset_revisions)).scalar_one() == 1
-    assert latest == source.dataset_revision.dataset_revision_id
+        source_status = c.execute(
+            select(dataset_revisions.c.status).where(
+                dataset_revisions.c.dataset_revision_id
+                == source.dataset_revision.dataset_revision_id
+            )
+        ).scalar_one()
+        crashed_publications = list(
+            c.execute(
+                select(publications).where(publications.c.operation == "recover_quarantined_latest")
+            ).mappings()
+        )
+        crashed_files = (
+            list(
+                c.execute(
+                    select(publication_files).where(
+                        publication_files.c.publication_id.in_(
+                            [row["publication_id"] for row in crashed_publications]
+                        )
+                    )
+                ).mappings()
+            )
+            if crashed_publications
+            else []
+        )
+        crashed_root = (
+            c.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.recover_quarantined_latest",
+                        idempotency.c.idempotency_key == key,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
     assert source_status == "quarantined"
+    assert crashed_root["state"] in {"started", "succeeded"}
+    post_publish_crash = injection_point in {
+        "after_publish_commit_before_cleanup",
+    }
+    if not post_publish_crash:
+        assert latest == source.dataset_revision.dataset_revision_id
+        assert latest_status == "quarantined"
+    if post_publish_crash:
+        assert latest != source.dataset_revision.dataset_revision_id
+        assert latest_status == "published"
+        assert [row["state"] for row in crashed_publications] == ["published"]
+        assert crashed_files and {row["state"] for row in crashed_files} == {"published"}
+    elif injection_point in {
+        "after_staged_commit_before_rename",
+        "during_object_renames",
+        "after_all_renames_before_directory_fsync",
+        "after_rename_fsync_before_publish_tx",
+    }:
+        assert [row["state"] for row in crashed_publications] == ["staged"]
+        assert crashed_files and {row["state"] for row in crashed_files} == {"temp"}
+    else:
+        assert crashed_publications == []
+        assert crashed_files == []
     recovered = publisher.recover_quarantined_latest(context, request, idempotency_key=key)
     with catalog.engine.begin() as c:
         current = c.execute(
             select(series.c.latest_revision_id).where(series.c.contract_id == contract.contract_id)
         ).scalar_one()
+        revision_states = list(
+            c.execute(
+                select(
+                    dataset_revisions.c.dataset_revision_id, dataset_revisions.c.status
+                ).order_by(dataset_revisions.c.created_at)
+            )
+        )
+        recovery_publication = (
+            c.execute(
+                select(publications).where(publications.c.operation == "recover_quarantined_latest")
+            )
+            .mappings()
+            .one()
+        )
+        final_files = list(
+            c.execute(
+                select(publication_files)
+                .where(publication_files.c.publication_id == recovery_publication["publication_id"])
+                .order_by(publication_files.c.ordinal)
+            ).mappings()
+        )
+        final_root = (
+            c.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.recover_quarantined_latest",
+                        idempotency.c.idempotency_key == key,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
     assert current == recovered.dataset_revision.dataset_revision_id
+    assert revision_states == [
+        (source.dataset_revision.dataset_revision_id, "quarantined"),
+        (recovered.dataset_revision.dataset_revision_id, "published"),
+    ]
+    assert recovery_publication["state"] == "published"
+    assert final_root["state"] == "succeeded"
+    assert final_files and {row["state"] for row in final_files} == {"published"}
+    for row in final_files:
+        payload = archive_store.read_verified(
+            context.user_id, row["final_uri"], row["sha256"], row["byte_length"]
+        )
+        assert len(payload) == row["byte_length"]
+        assert not (
+            archive_store._owner_root(context.user_id) / "staging" / row["temp_name"]
+        ).exists()
+    replay = publisher.recover_quarantined_latest(context, request, idempotency_key=key)
+    assert replay.replayed is True
+    assert replay.publication_id == recovered.publication_id
+    assert (
+        replay.dataset_revision.dataset_revision_id
+        == recovered.dataset_revision.dataset_revision_id
+    )
 
 
 def test_latest_active_greater_wins_archive_tie_same_collapses_tie_different_fails_closed(
@@ -3466,16 +3649,139 @@ def test_retention_before_during_and_after_publish_maps_same_lower_bar_to_first_
 def test_continuation_admitted_before_expiry_blocks_sweep_and_cleanup_until_page_commit(
     postgres_engine, contexts, archive_store
 ) -> None:
-    _scenario_unexpired_read_snapshot_blocks_active_cleanup_then_expiry_sweep_resumes_cleanup(
-        postgres_engine, contexts, archive_store
+    context = contexts[0]
+    now = [datetime(2026, 11, 1, 22, 59, tzinfo=UTC)]
+    catalog = MarketDataCatalog(
+        postgres_engine, context_is_current=lambda _: True, clock=lambda: now[0]
     )
-    with postgres_engine.begin() as connection:
-        expired = connection.execute(
-            select(func.count())
-            .select_from(read_snapshots)
-            .where(read_snapshots.c.state == "expired")
-        ).scalar_one()
-    assert expired == 0
+    _, contract = seed(catalog, context, full_hour=True)
+    first = bar_input(contract.contract_id)
+    inputs = tuple(
+        first.model_copy(
+            update={
+                "start_at": first.start_at + timedelta(minutes=index),
+                "end_at": first.end_at + timedelta(minutes=index),
+                "completed_at": first.completed_at + timedelta(minutes=index),
+            }
+        )
+        for index in range(60)
+    )
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=inputs), idempotency_key=str(uuid7())
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    reader = MarketDataReader(catalog, archive_store, context_is_current=lambda _: True)
+    request = ReadBarsRequest(
+        series_key=key,
+        coverage_start=first.start_at,
+        coverage_end=first.start_at + timedelta(hours=1),
+        policy=LatestRead(),
+        limit=1,
+    )
+    page = reader.read_bars(context, request)
+    assert page.next_cursor is not None
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    publication = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=first.start_at,
+            coverage_end=first.start_at + timedelta(hours=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    admitted, release = Event(), Event()
+    continuation_outcome: list[object] = []
+
+    def pause_after_header(point: str) -> None:
+        if point == "after_continuation_header_lock":
+            admitted.set()
+            assert release.wait(timeout=10)
+
+    reader._inject = pause_after_header
+
+    def continue_page() -> None:
+        try:
+            continuation_outcome.append(
+                reader.read_bars(context, request.model_copy(update={"cursor": page.next_cursor}))
+            )
+        except (AssertionError, DBAPIError, MarketDataError) as error:
+            continuation_outcome.append(error)
+
+    continuation = Thread(target=continue_page, daemon=True)
+    continuation.start()
+    assert admitted.wait(timeout=10)
+    blocked_cleanup = publisher.cleanup_one(publication.publication_id)
+    assert blocked_cleanup.complete is False
+    assert blocked_cleanup.blocked_active_count == 60
+
+    now[0] += timedelta(minutes=16)
+    sweep_started = Event()
+    sweep_outcome: list[object] = []
+
+    def sweep() -> None:
+        sweep_started.set()
+        try:
+            sweep_outcome.append(reader.sweep_expired_snapshots())
+        except (AssertionError, DBAPIError, MarketDataError) as error:
+            sweep_outcome.append(error)
+
+    sweeper = Thread(target=sweep, daemon=True)
+    sweeper.start()
+    assert sweep_started.wait(timeout=5)
+    release.set()
+    continuation.join(timeout=10)
+    sweeper.join(timeout=10)
+    assert not continuation.is_alive() and not sweeper.is_alive()
+    assert len(continuation_outcome) == len(sweep_outcome) == 1
+    assert not isinstance(continuation_outcome[0], Exception), continuation_outcome
+    assert not isinstance(sweep_outcome[0], Exception), sweep_outcome
+    skipped_locked = sweep_outcome[0]
+    assert skipped_locked.expired_snapshot_count == 0
+    assert publication.publication_id in skipped_locked.pending_cleanup_publication_ids
+    swept = reader.sweep_expired_snapshots()
+    assert swept.expired_snapshot_count == 1
+    assert publication.publication_id in swept.pending_cleanup_publication_ids
+    cleanup_publishers = [
+        DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())) for _ in range(2)
+    ]
+    cleanup_locked, release_cleanup = Event(), Event()
+
+    def pause_cleanup(point: str) -> None:
+        if point == "during_cleanup" and not cleanup_locked.is_set():
+            cleanup_locked.set()
+            assert release_cleanup.wait(timeout=10)
+
+    cleanup_publishers[0]._inject = pause_cleanup
+    cleanup_outcomes: dict[int, object] = {}
+
+    def cleanup(index: int) -> None:
+        try:
+            cleanup_outcomes[index] = cleanup_publishers[index].cleanup_one(
+                publication.publication_id
+            )
+        except (AssertionError, DBAPIError, MarketDataError) as error:
+            cleanup_outcomes[index] = error
+
+    cleanup_threads = [Thread(target=cleanup, args=(index,), daemon=True) for index in range(2)]
+    cleanup_threads[0].start()
+    assert cleanup_locked.wait(timeout=10)
+    cleanup_threads[1].start()
+    release_cleanup.set()
+    for thread in cleanup_threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in cleanup_threads)
+    assert len(cleanup_outcomes) == 2
+    assert all(not isinstance(item, Exception) for item in cleanup_outcomes.values())
+    cleanup_results = list(cleanup_outcomes.values())
+    assert all(item.complete for item in cleanup_results)
+    assert sum(item.deleted_active_count for item in cleanup_results) == 60
+    assert sum(bool(item.replayed) for item in cleanup_results) == 1
 
 
 def test_expiry_sweep_winner_makes_waiting_continuation_return_stale_version_without_rows(
@@ -3807,10 +4113,97 @@ def test_cleanup_before_initial_snapshot_commit_conflicts_with_shared_active_loc
 
 
 def test_concurrent_publishers_same_parent_produce_one_latest_and_loser_rebases_or_quarantines(
-    catalog, contexts, archive_store, monkeypatch
+    catalog, contexts, archive_store
 ) -> None:
-    _scenario_post_admission_parent_race_rebases_but_initial_stale_parent_never_does(
-        catalog, contexts, archive_store, monkeypatch
+    context = contexts[0]
+    _, contract = seed(catalog, context)
+    original = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    start = bar_input(contract.contract_id).start_at
+    base = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())).publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    2,
+                    original.inserted_bar_record_ids[0],
+                    "SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    request = PublicationRequest(
+        series_key=key,
+        coverage_start=start,
+        coverage_end=start + timedelta(minutes=1),
+        expected_parent_revision_id=base.dataset_revision.dataset_revision_id,
+    )
+    publishers = [
+        DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())) for _ in range(2)
+    ]
+    idempotency_keys = [str(uuid7()), str(uuid7())]
+    outcomes: dict[int, object] = {}
+    first_admitted, release_first = Event(), Event()
+
+    def run(index: int) -> None:
+        publisher = publishers[index]
+
+        def synchronize(point: str) -> None:
+            if index == 0 and point == "after_stale_takeover_commit_before_snapshot":
+                first_admitted.set()
+                assert release_first.wait(timeout=10)
+
+        publisher._inject = synchronize
+        try:
+            outcomes[index] = publisher.publish(
+                context, request, idempotency_key=idempotency_keys[index]
+            )
+        except (AssertionError, DBAPIError, MarketDataError) as error:
+            outcomes[index] = error
+
+    threads = [Thread(target=run, args=(index,), daemon=True) for index in range(2)]
+    threads[0].start()
+    assert first_admitted.wait(timeout=10)
+    threads[1].start()
+    threads[1].join(timeout=15)
+    release_first.set()
+    threads[0].join(timeout=15)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == 2
+    successes = [item for item in outcomes.values() if not isinstance(item, Exception)]
+    failures = [item for item in outcomes.values() if isinstance(item, Exception)]
+    assert len(successes) == 1, outcomes
+    assert len(failures) == 1, outcomes
+    assert isinstance(failures[0], MarketDataError)
+    assert failures[0].code.value in {"CONFLICT", "STALE_VERSION"}
+
+    loser_index = next(index for index, item in outcomes.items() if isinstance(item, Exception))
+    # The losing durable root remains retryable and rebases from the winning latest.
+    publishers[loser_index]._inject = lambda _: None
+    retry = publishers[loser_index].publish(
+        context,
+        request,
+        idempotency_key=idempotency_keys[loser_index],
     )
     with catalog.engine.begin() as connection:
         latest = connection.execute(select(series.c.latest_revision_id)).scalar_one()
@@ -3819,7 +4212,8 @@ def test_concurrent_publishers_same_parent_produce_one_latest_and_loser_rebases_
             .select_from(dataset_revisions)
             .where(dataset_revisions.c.status == "published")
         ).scalar_one()
-    assert latest is not None and published == 3
+    assert latest == retry.dataset_revision.dataset_revision_id
+    assert published == 3
 
 
 def test_displaced_root_clears_attempt_and_same_key_retry_rebases_without_resurrecting_candidate(
@@ -4051,7 +4445,7 @@ def test_shared_corrupt_object_quarantines_all_parent_and_aggregate_dependents_u
             .select_from(dataset_revisions)
             .where(dataset_revisions.c.status == "quarantined")
         ).scalar_one()
-    assert quarantined == 6
+    assert quarantined == 1002
 
 
 def test_manifest_final_projection_bytes_equal_published_and_recovered_catalog_lifecycle_fields(
@@ -4255,10 +4649,18 @@ def test_run_lane_retention_reference_is_non_authoritative_and_legal_hold_id_is_
 
 
 def test_orphan_temp_sweep_is_singleton_owner_derived_aged_and_never_touches_staged_or_live_prestage_files(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch
 ) -> None:
     context = contexts[0]
     publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    fsynced: list[object] = []
+    original_fsync = archive_store._fsync_directory
+
+    def observe_fsync(path) -> None:
+        fsynced.append(path)
+        original_fsync(path)
+
+    monkeypatch.setattr(archive_store, "_fsync_directory", observe_fsync)
     aged = archive_store.write_temp(context.user_id, b"aged", "orphan")
     fresh = archive_store.write_temp(context.user_id, b"fresh", "orphan")
     old = (catalog._now() - timedelta(hours=25)).timestamp()
@@ -4266,12 +4668,15 @@ def test_orphan_temp_sweep_is_singleton_owner_derived_aged_and_never_touches_sta
     swept = publisher.sweep_orphan_temps()
     assert swept.abandoned_count == swept.quarantined_count == 1
     assert not aged.exists() and fresh.exists()
+    owner_root = archive_store._owner_root(context.user_id)
+    assert owner_root / "staging" in fsynced
+    assert owner_root / "quarantine" in fsynced
     replay = publisher.sweep_orphan_temps()
     assert replay.abandoned_count == 0
 
 
 def test_live_prestage_writer_renewal_excludes_concurrent_orphan_sweep(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch
 ) -> None:
     context = contexts[0]
     _, contract = seed(catalog, context)
@@ -4280,62 +4685,74 @@ def test_live_prestage_writer_renewal_excludes_concurrent_orphan_sweep(
         RecordBatchInput(bars=(bar_input(contract.contract_id),)),
         idempotency_key=str(uuid7()),
     )
-    with catalog.engine.begin() as connection:
-        series_id = connection.execute(
-            select(series.c.series_id).where(series.c.owner_user_id == context.user_id)
-        ).scalar_one()
-    temp_path = archive_store.write_temp(context.user_id, b"live-writer", "renewal")
-    old = (catalog._now() - timedelta(hours=25)).timestamp()
-    os.utime(temp_path, (old, old))
-    root_key, temp_uuid, holder = str(uuid7()), str(uuid7()), str(uuid7())
-    with catalog.engine.begin() as connection:
-        connection.execute(
-            insert(prestage_writes).values(
-                owner_user_id=context.user_id,
-                series_id=series_id,
-                idempotency_key=root_key,
-                temp_uuid=temp_uuid,
-                holder=holder,
-                fencing_token=1,
-                lease_expires_at=catalog._now() - timedelta(seconds=1),
-                expected_temp_names=[temp_path.name],
-                state="writing",
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()), lease_seconds=2)
+    renewals: list[datetime] = []
+    swept_during_write = False
+
+    def observe_production_renewal(point: str) -> None:
+        nonlocal swept_during_write
+        if point == "lease_renewed":
+            with catalog.engine.begin() as connection:
+                lease = connection.execute(
+                    select(prestage_writes.c.lease_expires_at)
+                    .where(prestage_writes.c.owner_user_id == context.user_id)
+                    .order_by(prestage_writes.c.lease_expires_at.desc())
+                ).scalar()
+            if lease is not None:
+                renewals.append(lease)
+        if point == "during_temp_write" and not swept_during_write:
+            with catalog.engine.begin() as connection:
+                journal = (
+                    connection.execute(
+                        select(prestage_writes)
+                        .where(prestage_writes.c.owner_user_id == context.user_id)
+                        .order_by(prestage_writes.c.lease_expires_at.desc())
+                    )
+                    .mappings()
+                    .one()
+                )
+            temp_path = (
+                archive_store._owner_root(context.user_id)
+                / "staging"
+                / journal["expected_temp_names"][0]
             )
-        )
-        renewed_until = catalog._now() + timedelta(seconds=120)
-        connection.execute(
-            update(prestage_writes)
-            .where(prestage_writes.c.temp_uuid == temp_uuid)
-            .values(lease_expires_at=renewed_until)
-        )
-    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
-    live = publisher.sweep_orphan_temps()
-    assert live.scanned_count == live.skipped_live_count == 1
-    assert live.abandoned_count == live.quarantined_count == 0
-    assert temp_path.exists()
+            os.utime(temp_path, ((catalog._now() - timedelta(hours=25)).timestamp(),) * 2)
+            live = DatasetPublisher(
+                catalog, archive_store, worker_id=str(uuid7())
+            ).sweep_orphan_temps()
+            assert live.skipped_live_count >= 1
+            assert live.quarantined_count == 0
+            assert temp_path.exists()
+            swept_during_write = True
+
+    monkeypatch.setattr(publisher, "_inject", observe_production_renewal)
+    start = bar_input(contract.contract_id).start_at
+    published = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=SeriesKey(
+                source="synthetic",
+                price_basis="trades",
+                contract_id=contract.contract_id,
+                interval_seconds=60,
+            ),
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    assert swept_during_write
+    assert len(renewals) >= 2
+    assert renewals == sorted(renewals)
     with catalog.engine.begin() as connection:
         assert (
             connection.execute(
-                select(prestage_writes.c.lease_expires_at).where(
-                    prestage_writes.c.temp_uuid == temp_uuid
+                select(dataset_revisions.c.status).where(
+                    dataset_revisions.c.dataset_revision_id
+                    == published.dataset_revision.dataset_revision_id
                 )
             ).scalar_one()
-            == renewed_until
-        )
-        connection.execute(
-            update(prestage_writes)
-            .where(prestage_writes.c.temp_uuid == temp_uuid)
-            .values(lease_expires_at=catalog._now() - timedelta(seconds=1))
-        )
-    expired = publisher.sweep_orphan_temps()
-    assert expired.abandoned_count == expired.quarantined_count == 1
-    assert not temp_path.exists()
-    with catalog.engine.begin() as connection:
-        assert (
-            connection.execute(
-                select(prestage_writes.c.state).where(prestage_writes.c.temp_uuid == temp_uuid)
-            ).scalar_one()
-            == "abandoned"
+            == "published"
         )
 
 
@@ -5030,7 +5447,7 @@ def test_corruption_closure_pages_every_descendant_without_total_count_cutoff(
             .select_from(dataset_revisions)
             .where(dataset_revisions.c.status == "quarantined")
         ).scalar_one()
-    assert count == 6
+    assert count == 1002
 
 
 def test_append_day_32_reuses_31_parent_objects_writes_one_object_and_publishes_32_object_union(

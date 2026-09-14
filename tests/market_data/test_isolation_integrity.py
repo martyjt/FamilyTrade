@@ -10,9 +10,11 @@ from pathlib import Path
 from uuid import UUID, uuid7
 
 import pytest
+from sqlalchemy import select
 
 from familytrade.access.models import AccessError
 from familytrade.market_data.archive import DatasetPublisher, MarketDataReader
+from familytrade.market_data.catalog import bar_versions, dataset_revisions
 from familytrade.market_data.models import (
     CoverageRequest,
     LatestRead,
@@ -31,6 +33,17 @@ def test_absolute_parent_traversal_separator_symlink_reparse_and_hardlink_escape
     archive_store, tmp_path
 ) -> None:
     owner = str(uuid7())
+    owner_root = archive_store._owner_root(owner)
+    if os.name != "nt":
+        assert owner_root.stat().st_mode & 0o777 == 0o700
+        for directory in ("staging", "objects", "manifests", "quarantine"):
+            assert (owner_root / directory).stat().st_mode & 0o777 == 0o700
+        temp = archive_store.write_temp(owner, b"owner-only", "mode")
+        assert temp.stat().st_mode & 0o777 == 0o600
+        owner_root.chmod(0o755)
+        with pytest.raises(MarketDataError):
+            archive_store._owner_root(owner)
+        owner_root.chmod(0o700)
     for uri in (
         "/absolute",
         "ft-archive://object/../../secret",
@@ -196,9 +209,9 @@ def test_owner_b_cannot_read_publish_retain_restore_or_probe_owner_a_ids(
             call()
 
 
-def test_all_four_fixture_entity_alias_paths_map_to_server_generated_uuidv7_and_relationships_round_trip() -> (
-    None
-):
+def test_all_four_fixture_entity_alias_paths_map_to_server_generated_uuidv7_and_relationships_round_trip(
+    catalog, contexts, archive_store
+) -> None:
     document = json.loads(
         (Path(__file__).resolve().parents[2] / "docs" / "contracts-examples-v1.json").read_text(
             encoding="utf-8"
@@ -218,9 +231,162 @@ def test_all_four_fixture_entity_alias_paths_map_to_server_generated_uuidv7_and_
         "active-bar-b-r1",
         "active-bar-b-r2",
     }
-    mapped = {alias: str(uuid7()) for alias in sorted(aliases)}
+    context = contexts[0]
+    _, contract = seed(catalog, context, full_hour=True)
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    start = bar_input(contract.contract_id).start_at
+    initial_bars = tuple(
+        bar_input(contract.contract_id).model_copy(
+            update={
+                "start_at": start + timedelta(minutes=minute),
+                "end_at": start + timedelta(minutes=minute + 1),
+                "completed_at": start + timedelta(minutes=minute + 1),
+            }
+        )
+        for minute in range(60)
+    )
+    first = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=initial_bars),
+        idempotency_key=str(uuid7()),
+    )
+    revision_one = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(hours=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    second = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    2,
+                    first.inserted_bar_record_ids[0],
+                    "SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    revision_two = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(hours=1),
+            expected_parent_revision_id=revision_one.dataset_revision.dataset_revision_id,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    3,
+                    second.inserted_bar_record_ids[0],
+                    "SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    revision_three = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(hours=1),
+            expected_parent_revision_id=revision_two.dataset_revision.dataset_revision_id,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+
+    active_inputs = []
+    for minute in (1, 2):
+        base = initial_bars[minute]
+        r1 = first.inserted_bar_record_ids[minute]
+        r2 = catalog.record_completed_batch(
+            context,
+            RecordBatchInput(
+                bars=(
+                    base.model_copy(
+                        update={
+                            "close": base.close + 1,
+                            "high": base.high + 1,
+                            "source_revision": 2,
+                            "supersedes_bar_record_id": r1,
+                            "correction_reason": "SOURCE_CORRECTION",
+                        }
+                    ),
+                )
+            ),
+            idempotency_key=str(uuid7()),
+        ).inserted_bar_record_ids[0]
+        active_inputs.append((r1, r2))
+
+    mapped = {
+        "018-user-a": context.user_id,
+        "synthetic-mgc-2026-12": contract.contract_id,
+        "018-rev-1": revision_one.dataset_revision.dataset_revision_id,
+        "018-rev-2": revision_two.dataset_revision.dataset_revision_id,
+        "018-rev-10": revision_three.dataset_revision.dataset_revision_id,
+        "018-bar-r1": first.inserted_bar_record_ids[0],
+        "018-bar-r2": second.inserted_bar_record_ids[0],
+        "active-bar-a-r1": active_inputs[0][0],
+        "active-bar-a-r2": active_inputs[0][1],
+        "active-bar-b-r1": active_inputs[1][0],
+        "active-bar-b-r2": active_inputs[1][1],
+    }
     assert len(set(mapped.values())) == len(aliases)
     assert all(value == value.lower() and UUID(value).version == 7 for value in mapped.values())
+    with catalog.engine.begin() as connection:
+        persisted_bars = {
+            row.bar_record_id: row.supersedes_bar_record_id
+            for row in connection.execute(
+                select(bar_versions.c.bar_record_id, bar_versions.c.supersedes_bar_record_id).where(
+                    bar_versions.c.bar_record_id.in_(
+                        (
+                            mapped["018-bar-r1"],
+                            mapped["018-bar-r2"],
+                            mapped["active-bar-a-r1"],
+                            mapped["active-bar-a-r2"],
+                            mapped["active-bar-b-r1"],
+                            mapped["active-bar-b-r2"],
+                        )
+                    )
+                )
+            )
+        }
+        persisted_revisions = set(
+            connection.execute(
+                select(dataset_revisions.c.dataset_revision_id).where(
+                    dataset_revisions.c.dataset_revision_id.in_(
+                        (mapped["018-rev-1"], mapped["018-rev-2"], mapped["018-rev-10"])
+                    )
+                )
+            ).scalars()
+        )
+    assert persisted_bars[mapped["018-bar-r2"]] == mapped["018-bar-r1"]
+    assert persisted_bars[mapped["active-bar-a-r2"]] == mapped["active-bar-a-r1"]
+    assert persisted_bars[mapped["active-bar-b-r2"]] == mapped["active-bar-b-r1"]
+    assert persisted_revisions == {
+        mapped["018-rev-1"],
+        mapped["018-rev-2"],
+        mapped["018-rev-10"],
+    }
 
     pinned = cases["pinned_revision_survives_correction"]
     assert mapped[pinned["given"]["correction_r2"]["supersedes"]] == mapped["018-bar-r1"]

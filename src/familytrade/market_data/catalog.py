@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 from uuid import UUID, uuid7
@@ -26,6 +27,7 @@ from sqlalchemy import (
     and_,
     insert,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1047,6 +1049,8 @@ class MarketDataCatalog:
             )
         if row["state"] == "failed":
             error = row["error"] or {}
+            if error.get("code") == ErrorCode.NOT_FOUND.value:
+                raise not_found()
             raise MarketDataError(
                 MarketDataCode(error.get("code", MarketDataCode.CONFLICT.value)),
                 error.get("message", "The prior attempt failed."),
@@ -1509,7 +1513,54 @@ class MarketDataCatalog:
             .one(),
         )
 
+    @contextmanager
+    def _logical_bar_locks(self, context: UserContext, value: RecordBatchInput) -> Iterator[None]:
+        keys = tuple(
+            sorted(
+                {
+                    "|".join(
+                        (
+                            context.user_id,
+                            bar.source,
+                            bar.price_basis,
+                            bar.contract_id,
+                            str(bar.interval_seconds),
+                            bar.start_at.isoformat(),
+                            str(bar.source_revision),
+                        )
+                    )
+                    for bar in value.bars
+                }
+            )
+        )
+        with self.engine.connect() as lock_connection:
+            for key in keys:
+                lock_connection.execute(
+                    text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"),
+                    {"key": key},
+                )
+            lock_connection.commit()
+            try:
+                yield
+            finally:
+                for key in reversed(keys):
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                        {"key": key},
+                    )
+                lock_connection.commit()
+
     def record_completed_batch(
+        self, context: UserContext, value: RecordBatchInput, *, idempotency_key: str
+    ) -> RecordBatchResult:
+        self._context(context)
+        self._key(idempotency_key)
+        with self._logical_bar_locks(context, value):
+            return self._record_completed_batch_locked(
+                context, value, idempotency_key=idempotency_key
+            )
+
+    def _record_completed_batch_locked(
         self, context: UserContext, value: RecordBatchInput, *, idempotency_key: str
     ) -> RecordBatchResult:
         self._context(context)

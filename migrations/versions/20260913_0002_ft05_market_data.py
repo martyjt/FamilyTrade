@@ -41,6 +41,90 @@ def upgrade() -> None:
           FOR EACH ROW EXECUTE FUNCTION market_data_reject_mutation();
         CREATE TRIGGER md_retention_refs_additive BEFORE UPDATE OR DELETE ON market_data_retention_refs
           FOR EACH ROW EXECUTE FUNCTION market_data_reject_mutation();
+        CREATE TRIGGER md_publication_revisions_immutable BEFORE UPDATE OR DELETE ON market_data_publication_revisions
+          FOR EACH ROW EXECUTE FUNCTION market_data_reject_mutation();
+
+        CREATE FUNCTION market_data_snapshot_relation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF TG_OP='UPDATE' THEN RAISE EXCEPTION 'immutable snapshot relation'; END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM market_data_read_snapshots snapshot
+             WHERE snapshot.owner_user_id=OLD.owner_user_id
+               AND snapshot.read_snapshot_id=OLD.read_snapshot_id
+               AND snapshot.state='expired'
+          ) THEN RAISE EXCEPTION 'live snapshot relation cannot be deleted'; END IF;
+          RETURN OLD;
+        END $$;
+        CREATE TRIGGER md_snapshot_relation_guard BEFORE UPDATE OR DELETE ON market_data_read_snapshot_bars
+          FOR EACH ROW EXECUTE FUNCTION market_data_snapshot_relation_guard();
+
+        CREATE FUNCTION market_data_publication_file_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF TG_OP='DELETE' THEN RAISE EXCEPTION 'immutable publication file'; END IF;
+          IF NEW IS NOT DISTINCT FROM OLD THEN RETURN NEW; END IF;
+          IF OLD.state='temp' AND NEW.state IN ('renamed','published','quarantined')
+             AND (to_jsonb(NEW)-'state')=(to_jsonb(OLD)-'state') THEN RETURN NEW; END IF;
+          IF OLD.state='renamed' AND NEW.state IN ('published','quarantined')
+             AND (to_jsonb(NEW)-'state')=(to_jsonb(OLD)-'state') THEN RETURN NEW; END IF;
+          IF OLD.state='published' AND NEW.state='quarantined'
+             AND (to_jsonb(NEW)-'state')=(to_jsonb(OLD)-'state') THEN RETURN NEW; END IF;
+          RAISE EXCEPTION 'invalid publication file transition';
+        END $$;
+        CREATE TRIGGER md_publication_file_guard BEFORE UPDATE OR DELETE ON market_data_publication_files
+          FOR EACH ROW EXECUTE FUNCTION market_data_publication_file_guard();
+
+        CREATE FUNCTION market_data_conversion_lifecycle_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF TG_OP='DELETE' THEN RAISE EXCEPTION 'immutable publication conversion'; END IF;
+          IF NEW IS NOT DISTINCT FROM OLD THEN RETURN NEW; END IF;
+          IF OLD.state='planned' AND NEW.state IN ('converted','cancelled')
+             AND (to_jsonb(NEW)-'state')=(to_jsonb(OLD)-'state') THEN RETURN NEW; END IF;
+          RAISE EXCEPTION 'invalid publication conversion transition';
+        END $$;
+        CREATE TRIGGER md_conversion_lifecycle BEFORE UPDATE OR DELETE ON market_data_publication_retention_conversions
+          FOR EACH ROW EXECUTE FUNCTION market_data_conversion_lifecycle_guard();
+
+        CREATE FUNCTION market_data_cleanup_lifecycle_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF TG_OP='DELETE' THEN RAISE EXCEPTION 'immutable publication cleanup row'; END IF;
+          IF NEW IS NOT DISTINCT FROM OLD THEN RETURN NEW; END IF;
+          IF OLD.cleaned_at IS NULL AND NEW.cleaned_at IS NOT NULL
+             AND (to_jsonb(NEW)-'cleaned_at')=(to_jsonb(OLD)-'cleaned_at') THEN RETURN NEW; END IF;
+          RAISE EXCEPTION 'invalid publication cleanup transition';
+        END $$;
+        CREATE TRIGGER md_cleanup_lifecycle BEFORE UPDATE OR DELETE ON market_data_publication_cleanup_bars
+          FOR EACH ROW EXECUTE FUNCTION market_data_cleanup_lifecycle_guard();
+
+        CREATE FUNCTION market_data_uuidv7_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE field record; identifier_value text;
+        BEGIN
+          FOR field IN SELECT item.key,item.value FROM jsonb_each(to_jsonb(NEW)) item LOOP
+            IF field.key <> 'provider_contract_id'
+               AND (right(field.key,3)='_id'
+                OR field.key IN ('idempotency_key','holder','temp_uuid'))
+               AND field.value <> 'null'::jsonb THEN
+              identifier_value := trim(both '"' from field.value::text);
+              IF identifier_value !~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' THEN
+                RAISE EXCEPTION 'identifier % must be canonical lowercase UUIDv7', field.key;
+              END IF;
+            END IF;
+          END LOOP;
+          RETURN NEW;
+        END $$;
+        DO $$
+        DECLARE table_name text;
+        BEGIN
+          FOR table_name IN
+            SELECT tablename FROM pg_tables
+             WHERE schemaname=current_schema() AND tablename LIKE 'market_data_%'
+             ORDER BY tablename
+          LOOP
+            EXECUTE format(
+              'CREATE TRIGGER md_uuidv7_guard BEFORE INSERT OR UPDATE ON %I '
+              'FOR EACH ROW EXECUTE FUNCTION market_data_uuidv7_guard()', table_name
+            );
+          END LOOP;
+        END $$;
 
         CREATE FUNCTION market_data_contract_head_guard() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
@@ -125,6 +209,9 @@ def upgrade() -> None:
         CREATE FUNCTION market_data_active_bar_guard() RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE series_row record; contract_row record;
         BEGIN
+          IF TG_OP='UPDATE' AND NEW IS DISTINCT FROM OLD THEN
+            RAISE EXCEPTION 'active payload identity is immutable';
+          END IF;
           SELECT * INTO series_row FROM market_data_series
            WHERE owner_user_id=NEW.owner_user_id AND series_id=NEW.series_id;
           SELECT * INTO contract_row FROM market_data_contract_versions
@@ -698,4 +785,9 @@ def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS market_data_revision_bar_guard()")
     op.execute("DROP FUNCTION IF EXISTS market_data_active_bar_guard()")
     op.execute("DROP FUNCTION IF EXISTS market_data_calendar_window_guard()")
+    op.execute("DROP FUNCTION IF EXISTS market_data_cleanup_lifecycle_guard()")
+    op.execute("DROP FUNCTION IF EXISTS market_data_conversion_lifecycle_guard()")
+    op.execute("DROP FUNCTION IF EXISTS market_data_publication_file_guard()")
+    op.execute("DROP FUNCTION IF EXISTS market_data_snapshot_relation_guard()")
+    op.execute("DROP FUNCTION IF EXISTS market_data_uuidv7_guard()")
     op.execute("DROP FUNCTION IF EXISTS market_data_reject_mutation()")

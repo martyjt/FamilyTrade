@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier, Thread
 from uuid import UUID, uuid7
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import and_, func, insert, select, text, update
+from sqlalchemy import and_, delete, func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from familytrade.access.models import AccessError
@@ -23,6 +24,8 @@ from familytrade.market_data.catalog import (
     contracts,
     dataset_revisions,
     idempotency,
+    publication_files,
+    publication_revisions,
     publications,
     quality_observations,
     revision_bars,
@@ -287,6 +290,37 @@ def test_direct_sql_constraints_reject_invalid_ohlc_tick_volume_duration_and_own
                 .where(active_bars.c.bar_record_id == bar_record_id)
                 .values(**values)
             )
+    with catalog.engine.begin() as connection:
+        series_id = connection.execute(
+            select(series.c.series_id).where(series.c.owner_user_id == contexts[0].user_id)
+        ).scalar_one()
+    for invalid_id in (str(UUID(int=1)), str(uuid7()).upper(), "not-a-uuid"):
+        with (
+            pytest.raises(DBAPIError, match="canonical lowercase UUIDv7"),
+            catalog.engine.begin() as connection,
+        ):
+            connection.execute(
+                insert(quality_observations).values(
+                    owner_user_id=contexts[0].user_id,
+                    observation_id=invalid_id,
+                    series_id=series_id,
+                    start_at=bar_input(contract.contract_id).start_at,
+                    source_revision=2,
+                    attempted_payload_hash="a" * 64,
+                    quality="invalid",
+                    reason="OHLC",
+                    observed_at=catalog._now(),
+                )
+            )
+    with (
+        pytest.raises(DBAPIError, match="canonical lowercase UUIDv7"),
+        catalog.engine.begin() as connection,
+    ):
+        connection.execute(
+            update(series_fences)
+            .where(series_fences.c.series_id == series_id)
+            .values(holder=str(UUID(int=2)))
+        )
     with catalog.engine.begin() as connection:
         persisted = (
             connection.execute(
@@ -603,7 +637,7 @@ def test_archive_object_catalog_origin_constraint_requires_publication_fk_or_ret
 def test_published_catalog_rows_reject_direct_mutation(catalog, contexts, archive_store) -> None:
     context = contexts[0]
     _, contract = seed(catalog, context)
-    catalog.record_completed_batch(
+    recorded = catalog.record_completed_batch(
         context,
         RecordBatchInput(bars=(bar_input(contract.contract_id),)),
         idempotency_key=str(uuid7()),
@@ -623,6 +657,34 @@ def test_published_catalog_rows_reject_direct_mutation(catalog, contexts, archiv
         ),
         idempotency_key=str(uuid7()),
     )
+    catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar_input(
+                    contract.contract_id,
+                    revision=2,
+                    supersedes=recorded.inserted_bar_record_ids[0],
+                    reason="SOURCE_CORRECTION",
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    MarketDataReader(catalog, archive_store, context_is_current=lambda _: True).read_bars(
+        context,
+        ReadBarsRequest(
+            series_key=SeriesKey(
+                source="synthetic",
+                price_basis="trades",
+                contract_id=contract.contract_id,
+                interval_seconds=60,
+            ),
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=1),
+            policy=LatestRead(),
+        ),
+    )
     with pytest.raises(DBAPIError), catalog.engine.begin() as c:
         c.execute(
             update(dataset_revisions)
@@ -632,6 +694,32 @@ def test_published_catalog_rows_reject_direct_mutation(catalog, contexts, archiv
             )
             .values(parent_depth=10)
         )
+    with pytest.raises(DBAPIError), catalog.engine.begin() as c:
+        c.execute(
+            update(active_bars)
+            .where(active_bars.c.owner_user_id == context.user_id)
+            .values(payload_hash="0" * 64)
+        )
+    with (
+        pytest.raises(DBAPIError, match="protected by read snapshot"),
+        catalog.engine.begin() as c,
+    ):
+        c.execute(delete(active_bars).where(active_bars.c.owner_user_id == context.user_id))
+    with pytest.raises(DBAPIError), catalog.engine.begin() as c:
+        c.execute(
+            update(publication_revisions)
+            .where(
+                publication_revisions.c.dataset_revision_id
+                == published.dataset_revision.dataset_revision_id
+            )
+            .values(ordinal=1)
+        )
+    with pytest.raises(DBAPIError), catalog.engine.begin() as c:
+        c.execute(
+            delete(publication_files).where(
+                publication_files.c.publication_id == published.publication_id
+            )
+        )
 
 
 def test_same_bar_revision_different_hash_aborts_whole_batch_and_audits_safe_hashes(
@@ -639,24 +727,62 @@ def test_same_bar_revision_different_hash_aborts_whole_batch_and_audits_safe_has
 ) -> None:
     context = contexts[0]
     _, contract = seed(catalog, context)
-    original = bar_input(contract.contract_id)
-    catalog.record_completed_batch(
+    first = catalog.record_completed_batch(
         context,
-        RecordBatchInput(bars=(original,)),
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
         idempotency_key=str(uuid7()),
     )
-    conflicting = original.model_copy(update={"close": Decimal("2000.0")})
-    with pytest.raises(MarketDataError) as caught:
+    candidate = bar_input(
+        contract.contract_id,
+        2,
+        first.inserted_bar_record_ids[0],
+        "SOURCE_CORRECTION",
+    )
+    batches = (
+        RecordBatchInput(bars=(candidate,)),
+        RecordBatchInput(
+            bars=(
+                candidate.model_copy(
+                    update={"high": Decimal("2000.3"), "close": Decimal("2000.3")}
+                ),
+            )
+        ),
+    )
+    keys = (str(uuid7()), str(uuid7()))
+    barrier = Barrier(2, timeout=10)
+    outcomes: dict[int, object] = {}
+
+    def write(index: int) -> None:
+        barrier.wait()
+        try:
+            outcomes[index] = catalog.record_completed_batch(
+                context, batches[index], idempotency_key=keys[index]
+            )
+        except (DBAPIError, MarketDataError) as error:
+            outcomes[index] = error
+
+    threads = [Thread(target=write, args=(index,), daemon=True) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == 2
+    successes = [item for item in outcomes.values() if not isinstance(item, Exception)]
+    failures = [item for item in outcomes.values() if isinstance(item, Exception)]
+    assert len(successes) == len(failures) == 1, outcomes
+    assert isinstance(failures[0], MarketDataError)
+    assert failures[0].code == MarketDataCode.DUPLICATE_CONFLICT
+    loser_index = next(index for index, item in outcomes.items() if isinstance(item, Exception))
+    with pytest.raises(MarketDataError) as replayed:
         catalog.record_completed_batch(
-            context,
-            RecordBatchInput(bars=(conflicting,)),
-            idempotency_key=str(uuid7()),
+            context, batches[loser_index], idempotency_key=keys[loser_index]
         )
-    assert caught.value.code == MarketDataCode.DUPLICATE_CONFLICT
+    assert replayed.value.code == MarketDataCode.DUPLICATE_CONFLICT
     with catalog.engine.begin() as c:
         audit = c.execute(select(bar_conflicts)).mappings().one()
         assert audit["existing_fingerprint"] != audit["attempted_fingerprint"]
-        assert c.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 1
+        assert c.execute(select(func.count()).select_from(bar_versions)).scalar_one() == 2
 
 
 def test_invalid_observation_consumes_no_revision_and_later_valid_same_revision_inserts(

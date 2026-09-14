@@ -1,6 +1,6 @@
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from familytrade.access.repository import access_metadata, users
 from familytrade.market_data.catalog import market_data_metadata
@@ -15,13 +15,22 @@ def test_alembic_env_combines_access_and_market_data_metadata_without_duplicate_
         for table in metadata.tables.values()
     ]
     assert len(keys) == len(set(keys))
-    assert (
-        compare_metadata(
-            MigrationContext.configure(postgres_engine.connect()),
+    with postgres_engine.connect() as connection:
+        drift = compare_metadata(
+            MigrationContext.configure(connection),
             [access_metadata, market_data_metadata],
         )
-        == []
-    )
+        uuid_guarded_tables = set(
+            connection.execute(
+                text(
+                    "SELECT event_object_table FROM information_schema.triggers "
+                    "WHERE trigger_schema=current_schema() "
+                    "AND trigger_name='md_uuidv7_guard'"
+                )
+            ).scalars()
+        )
+    assert drift == []
+    assert uuid_guarded_tables == set(market_data_metadata.tables)
 
 
 def test_market_data_user_foreign_keys_target_integrated_access_repository_users_column_object() -> (

@@ -158,6 +158,18 @@ class ArchiveStore:
             if descriptor is not None:
                 os.close(descriptor)
 
+    @staticmethod
+    def _assert_owner_only_mode(path: Path, expected: int) -> None:
+        if os.name == "nt":
+            return
+        actual = stat.S_IMODE(path.stat().st_mode)
+        if actual != expected:
+            raise MarketDataError(
+                MarketDataCode.ARCHIVE_INTEGRITY,
+                "Archive path permissions are unsafe.",
+                500,
+            )
+
     def _owner_root(self, owner: str) -> Path:
         try:
             if str(__import__("uuid").UUID(owner)) != owner:
@@ -169,10 +181,14 @@ class ArchiveStore:
         path = self._root / owner
         if path.exists() or path.is_symlink():
             self._reject_link_or_reparse(path)
+        else:
+            path.mkdir(mode=0o700)
+        self._assert_owner_only_mode(path, 0o700)
         for name in ("staging", "objects", "manifests", "quarantine"):
             directory = path / name
-            directory.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(mode=0o700, exist_ok=True)
             self._reject_link_or_reparse(directory)
+            self._assert_owner_only_mode(directory, 0o700)
             self._assert_beneath_owner(path, directory)
         return self._assert_beneath_owner(path, path)
 
@@ -200,9 +216,11 @@ class ArchiveStore:
         staging = self._owner_root(owner) / "staging"
         path = staging / f"{uuid7()}.{suffix}.tmp"
         with path.open("xb") as handle:
+            path.chmod(0o600)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        self._assert_owner_only_mode(path, 0o600)
         return path
 
     def finalize(self, owner: str, temp: Path, uri: str) -> Path:
@@ -301,7 +319,10 @@ def _validate_manifest_correction_history(document: dict[str, Any]) -> None:
     if set(by_start) != {bar.start_at for bar in selected}:
         raise ValueError("manifest correction records do not cover selected bars")
     for selected_bar in selected:
-        chain = sorted(by_start[selected_bar.start_at], key=lambda item: item[0].source_revision)
+        chain = sorted(
+            by_start[selected_bar.start_at],
+            key=lambda item: (item[0].source_revision, item[0].bar_record_id),
+        )
         if len({bar.source_revision for bar, _ in chain}) != len(chain):
             raise ValueError("forked manifest correction chain")
         for ordinal, (bar, record) in enumerate(chain, start=1):
@@ -414,6 +435,69 @@ def _verify_catalog_reconstruction_dag(
 
     if sys.getrecursionlimit() < 4096:
         sys.setrecursionlimit(4096)
+    captured_ids = _catalog_reconstruction_ids(connection, owner, {seed_revision_id})
+    revision_rows = {
+        row["dataset_revision_id"]: dict(row)
+        for row in connection.execute(
+            select(dataset_revisions).where(
+                and_(
+                    dataset_revisions.c.owner_user_id == owner,
+                    dataset_revisions.c.dataset_revision_id.in_(captured_ids),
+                )
+            )
+        ).mappings()
+    }
+    contract_hashes = {
+        (row["contract_id"], row["contract_version"]): row["projection_sha256"]
+        for row in connection.execute(
+            select(
+                contract_versions.c.contract_id,
+                contract_versions.c.contract_version,
+                contract_versions.c.projection_sha256,
+            ).where(contract_versions.c.owner_user_id == owner)
+        ).mappings()
+    }
+    partitions_by_revision: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        select(
+            revision_partitions.c.ordinal,
+            revision_partitions.c.dataset_revision_id,
+            archive_objects,
+        )
+        .join(
+            archive_objects,
+            and_(
+                archive_objects.c.owner_user_id == revision_partitions.c.owner_user_id,
+                archive_objects.c.object_id == revision_partitions.c.object_id,
+            ),
+        )
+        .where(
+            and_(
+                revision_partitions.c.owner_user_id == owner,
+                revision_partitions.c.dataset_revision_id.in_(captured_ids),
+            )
+        )
+        .order_by(revision_partitions.c.dataset_revision_id, revision_partitions.c.ordinal)
+    ).mappings():
+        partitions_by_revision.setdefault(row["dataset_revision_id"], []).append(dict(row))
+    selected_by_revision: dict[str, list[str]] = {}
+    for row in connection.execute(
+        select(
+            revision_bars.c.dataset_revision_id,
+            revision_bars.c.ordinal,
+            revision_bars.c.bar_record_id,
+        )
+        .where(
+            and_(
+                revision_bars.c.owner_user_id == owner,
+                revision_bars.c.dataset_revision_id.in_(captured_ids),
+            )
+        )
+        .order_by(revision_bars.c.dataset_revision_id, revision_bars.c.ordinal)
+    ).mappings():
+        selected_by_revision.setdefault(row["dataset_revision_id"], []).append(row["bar_record_id"])
+    # All catalog state is detached before manifest, Parquet, hashing, or filesystem work.
+    connection.commit()
     verified: dict[str, tuple[dict[str, Any], list[CompletedBar]]] = {}
     verified_projections: dict[str, DatasetRevision] = {}
     closures: dict[str, set[str]] = {}
@@ -430,18 +514,7 @@ def _verify_catalog_reconstruction_dag(
         if revision_id in visiting or len(verified) + len(visiting) >= 1000:
             raise ValueError("cyclic or over-bound reconstruction DAG")
         visiting.add(revision_id)
-        row = (
-            connection.execute(
-                select(dataset_revisions).where(
-                    and_(
-                        dataset_revisions.c.owner_user_id == owner,
-                        dataset_revisions.c.dataset_revision_id == revision_id,
-                    )
-                )
-            )
-            .mappings()
-            .first()
-        )
+        row = revision_rows.get(revision_id)
         if row is None or row["status"] != "published":
             raise ValueError("reconstruction revision is absent or not published")
         manifest_bytes = store.read_verified(
@@ -461,15 +534,9 @@ def _verify_catalog_reconstruction_dag(
         )
         projection = DatasetRevision.model_validate(payload)
         catalog_projection = DatasetRevision.model_validate(row["projection"])
-        contract_hash = connection.execute(
-            select(contract_versions.c.projection_sha256).where(
-                and_(
-                    contract_versions.c.owner_user_id == owner,
-                    contract_versions.c.contract_id == projection.series_key.contract_id,
-                    contract_versions.c.contract_version == projection.contract_version,
-                )
-            )
-        ).scalar_one_or_none()
+        contract_hash = contract_hashes.get(
+            (projection.series_key.contract_id, projection.contract_version)
+        )
         differing_projection_fields = [
             name
             for name in DatasetRevision.model_fields
@@ -492,25 +559,7 @@ def _verify_catalog_reconstruction_dag(
             and projection.series_key.interval_seconds >= target_interval
         ):
             raise ValueError("aggregate dependency interval is not smaller")
-        catalog_partitions = list(
-            connection.execute(
-                select(revision_partitions.c.ordinal, archive_objects)
-                .join(
-                    archive_objects,
-                    and_(
-                        archive_objects.c.owner_user_id == revision_partitions.c.owner_user_id,
-                        archive_objects.c.object_id == revision_partitions.c.object_id,
-                    ),
-                )
-                .where(
-                    and_(
-                        revision_partitions.c.owner_user_id == owner,
-                        revision_partitions.c.dataset_revision_id == revision_id,
-                    )
-                )
-                .order_by(revision_partitions.c.ordinal)
-            ).mappings()
-        )
+        catalog_partitions = partitions_by_revision.get(revision_id, [])
         if len(catalog_partitions) != len(projection.partition_refs):
             raise ValueError("manifest partition count differs from catalog")
         object_bars: list[CompletedBar] = []
@@ -546,39 +595,14 @@ def _verify_catalog_reconstruction_dag(
         selected = [CompletedBar.model_validate(item) for item in document["selected_bars"]]
         if object_bars != selected:
             raise ValueError("Parquet rows differ from manifest selected bars")
-        catalog_selected = list(
-            connection.execute(
-                select(revision_bars.c.bar_record_id)
-                .where(
-                    and_(
-                        revision_bars.c.owner_user_id == owner,
-                        revision_bars.c.dataset_revision_id == revision_id,
-                    )
-                )
-                .order_by(revision_bars.c.ordinal)
-            ).scalars()
-        )
+        catalog_selected = selected_by_revision.get(revision_id, [])
         if catalog_selected != [bar.bar_record_id for bar in selected]:
             raise ValueError("manifest selection differs from catalog")
         closure_ids = {revision_id}
         if projection.parent_revision_id is not None:
             parent_uri = document.get("parent_manifest_uri")
             parent_sha = document.get("parent_manifest_sha256")
-            parent = (
-                connection.execute(
-                    select(
-                        dataset_revisions.c.manifest_uri, dataset_revisions.c.manifest_sha256
-                    ).where(
-                        and_(
-                            dataset_revisions.c.owner_user_id == owner,
-                            dataset_revisions.c.dataset_revision_id
-                            == projection.parent_revision_id,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
+            parent = revision_rows.get(projection.parent_revision_id)
             if (
                 parent is None
                 or parent_uri != parent["manifest_uri"]
@@ -589,20 +613,7 @@ def _verify_catalog_reconstruction_dag(
         for record in document.get("correction_chain_records", []):
             for component in record.get("aggregate_components", []):
                 dependency_id = component["source_dataset_revision_id"]
-                dependency = (
-                    connection.execute(
-                        select(
-                            dataset_revisions.c.manifest_uri, dataset_revisions.c.manifest_sha256
-                        ).where(
-                            and_(
-                                dataset_revisions.c.owner_user_id == owner,
-                                dataset_revisions.c.dataset_revision_id == dependency_id,
-                            )
-                        )
-                    )
-                    .mappings()
-                    .first()
-                )
+                dependency = revision_rows.get(dependency_id)
                 if (
                     dependency is None
                     or component["source_manifest_uri"] != dependency["manifest_uri"]
@@ -632,6 +643,8 @@ def _verify_catalog_reconstruction_dag(
         return closure_ids
 
     verify(seed_revision_id)
+    if set(verified) != captured_ids:
+        raise ValueError("catalog and manifest reconstruction closures differ")
     revision_count = len(verified)
     row_count = sum(len(item[1]) for item in verified.values())
     referenced_bytes = sum(
@@ -727,8 +740,11 @@ def _quarantine_dependency_closure(
               ON w.dataset_revision_id=ac.source_dataset_revision_id
            WHERE rb.owner_user_id=:owner
         ), page AS (
-          SELECT DISTINCT dataset_revision_id
-            FROM candidates
+          SELECT DISTINCT candidate.dataset_revision_id
+            FROM candidates candidate
+            LEFT JOIN ft05_corruption_work existing
+              ON existing.dataset_revision_id=candidate.dataset_revision_id
+           WHERE existing.dataset_revision_id IS NULL
            ORDER BY dataset_revision_id
            LIMIT 1000
         )
@@ -1285,6 +1301,7 @@ class MarketDataReader:
                     raise MarketDataError(
                         MarketDataCode.STALE_VERSION, "Read cursor is stale.", 409
                     )
+                self._inject("after_continuation_header_lock")
                 page_rows = list(
                     c.execute(
                         select(read_snapshot_bars)
@@ -1901,18 +1918,17 @@ class MarketDataReader:
                     )
                     .values(state="expired")
                 )
-                deleted_rows += len(
+                deleted_rows += int(
                     c.execute(
-                        select(read_snapshot_bars.c.ordinal).where(
+                        delete(read_snapshot_bars).where(
                             and_(
                                 read_snapshot_bars.c.owner_user_id == snapshot["owner_user_id"],
                                 read_snapshot_bars.c.read_snapshot_id
                                 == snapshot["read_snapshot_id"],
                             )
                         )
-                    )
-                    .scalars()
-                    .all()
+                    ).rowcount
+                    or 0
                 )
                 c.execute(
                     delete(read_snapshots).where(
@@ -1956,9 +1972,11 @@ class DatasetPublisher:
     def _write_named_temp(self, owner: str, name: str, data: bytes) -> Path:
         path = self.store._owner_root(owner) / "staging" / name
         with path.open("xb") as stream:
+            path.chmod(0o600)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        self.store._assert_owner_only_mode(path, 0o600)
         return path
 
     def _take_fence(self, connection: Any, owner: str, series_id: str) -> int:
@@ -1993,6 +2011,96 @@ class DatasetPublisher:
         )
         return int(token)
 
+    def _renew_lease(
+        self,
+        owner: str,
+        series_id: str,
+        operation: str,
+        idempotency_key: str,
+        fencing_token: int,
+    ) -> None:
+        now = self.catalog._now()
+        expires = now + timedelta(seconds=self.lease_seconds)
+        with self.catalog.engine.begin() as connection:
+            root = (
+                connection.execute(
+                    select(idempotency)
+                    .where(
+                        and_(
+                            idempotency.c.owner_user_id == owner,
+                            idempotency.c.operation == operation,
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            fence = (
+                connection.execute(
+                    select(series_fences)
+                    .where(
+                        and_(
+                            series_fences.c.owner_user_id == owner,
+                            series_fences.c.series_id == series_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            if (
+                root["state"] != "started"
+                or root["holder"] != self.worker_id
+                or root["lease_expires_at"] is None
+                or root["lease_expires_at"] <= now
+                or fence["fencing_token"] != fencing_token
+                or fence["holder"] != self.worker_id
+                or fence["lease_expires_at"] <= now
+            ):
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "Publication lease was displaced.",
+                    409,
+                    retryable=True,
+                )
+            connection.execute(
+                update(idempotency)
+                .where(
+                    and_(
+                        idempotency.c.owner_user_id == owner,
+                        idempotency.c.operation == operation,
+                        idempotency.c.idempotency_key == idempotency_key,
+                    )
+                )
+                .values(lease_expires_at=expires, updated_at=now)
+            )
+            connection.execute(
+                update(series_fences)
+                .where(
+                    and_(
+                        series_fences.c.owner_user_id == owner,
+                        series_fences.c.series_id == series_id,
+                    )
+                )
+                .values(lease_expires_at=expires)
+            )
+            connection.execute(
+                update(prestage_writes)
+                .where(
+                    and_(
+                        prestage_writes.c.owner_user_id == owner,
+                        prestage_writes.c.series_id == series_id,
+                        prestage_writes.c.idempotency_key == idempotency_key,
+                        prestage_writes.c.state == "writing",
+                    )
+                )
+                .values(lease_expires_at=expires)
+            )
+        self._inject("lease_renewed")
+
     def publish(
         self, context: UserContext, request: PublicationRequest, *, idempotency_key: str
     ) -> PublicationResult:
@@ -2000,7 +2108,7 @@ class DatasetPublisher:
         self.catalog._key(idempotency_key)
         publication_id, revision_id, object_id = str(uuid7()), str(uuid7()), str(uuid7())
         effective_parent = request.expected_parent_revision_id
-        terminal_error: MarketDataError | None = None
+        terminal_error: AccessError | MarketDataError | None = None
         resume_publication_id: str | None = None
         fencing_token: int | None = None
         with self.catalog.engine.begin() as root_transaction:
@@ -2492,25 +2600,13 @@ class DatasetPublisher:
             self._inject("after_stale_takeover_commit_before_snapshot")
 
             def check_fence() -> None:
-                with self.catalog.engine.begin() as fence_connection:
-                    valid = fence_connection.execute(
-                        select(series_fences.c.series_id).where(
-                            and_(
-                                series_fences.c.owner_user_id == context.user_id,
-                                series_fences.c.series_id == sr["series_id"],
-                                series_fences.c.fencing_token == fencing_token,
-                                series_fences.c.holder == self.worker_id,
-                                series_fences.c.lease_expires_at > self.catalog._now(),
-                            )
-                        )
-                    ).scalar()
-                if not valid:
-                    raise MarketDataError(
-                        MarketDataCode.CONFLICT,
-                        "Publication lease was displaced.",
-                        409,
-                        retryable=True,
-                    )
+                self._renew_lease(
+                    context.user_id,
+                    sr["series_id"],
+                    "dataset.publish",
+                    idempotency_key,
+                    fencing_token,
+                )
 
             if parent_revision is not None:
                 try:
@@ -2536,7 +2632,10 @@ class DatasetPublisher:
             by = {bar.start_at: bar for bar in parent_rows}
             for b in active_rows:
                 by[b.start_at] = b
-            rows = sorted(by.values(), key=lambda bar: (bar.start_at, bar.source_revision))
+            rows = sorted(
+                by.values(),
+                key=lambda bar: (bar.start_at, bar.source_revision, bar.bar_record_id),
+            )
             versions_by_start: dict[datetime, dict[str, CompletedBar]] = {}
             for bar in [*parent_rows, *active_rows]:
                 versions_by_start.setdefault(bar.start_at, {})[bar.bar_record_id] = bar
@@ -3197,16 +3296,13 @@ class DatasetPublisher:
                     self._inject("during_temp_write")
                     check_fence()
                     self._inject("after_file_fsync_before_directory_fsync")
+                check_fence()
                 self._write_named_temp(
                     context.user_id, item["manifest_temp_name"], item["manifest"]
                 )
+                check_fence()
             staging = self.store._owner_root(context.user_id) / "staging"
-            if os.name != "nt":
-                fd = os.open(staging, os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+            self.store._fsync_directory(staging)
             self._inject("after_all_fsync_before_staged_tx")
             locked_parent = c.execute(
                 select(series.c.latest_revision_id)
@@ -3481,6 +3577,7 @@ class DatasetPublisher:
                     staging / obj["temp_name"],
                     obj["ref"].uri,
                 )
+                check_fence()
                 self._inject("during_object_renames")
             check_fence()
             self.store.finalize(
@@ -3488,6 +3585,7 @@ class DatasetPublisher:
                 staging / item["manifest_temp_name"],
                 item["revision"].manifest_uri,
             )
+            check_fence()
         self._inject("after_all_renames_before_directory_fsync")
         self._inject("after_rename_fsync_before_publish_tx")
         recovered = self.reconcile_one(publication_id)
@@ -4686,7 +4784,16 @@ class DatasetPublisher:
     ) -> PublicationResult:
         self.catalog._context(context)
         self.catalog._key(idempotency_key)
-        with self.catalog.engine.begin() as admission:
+        publication_id, revision_id = str(uuid7()), str(uuid7())
+        terminal_error: AccessError | MarketDataError | None = None
+        resume_publication_id: str | None = None
+        fencing_token: int | None = None
+        with (
+            self.catalog.engine.connect().execution_options(
+                isolation_level="SERIALIZABLE"
+            ) as admission,
+            admission.begin(),
+        ):
             replay = self.catalog._idempotent(
                 admission,
                 context,
@@ -4697,52 +4804,160 @@ class DatasetPublisher:
             if replay:
                 result = PublicationResult.model_validate(replay)
                 return result.model_copy(update={"replayed": True})
-        self._inject("after_recovery_admission_before_snapshot")
-        with self.catalog.engine.begin() as c:
-            source = (
-                c.execute(
-                    select(dataset_revisions)
+            root = (
+                admission.execute(
+                    select(idempotency)
                     .where(
+                        and_(
+                            idempotency.c.owner_user_id == context.user_id,
+                            idempotency.c.operation == "dataset.recover_quarantined_latest",
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            source = (
+                admission.execute(
+                    select(dataset_revisions).where(
                         and_(
                             dataset_revisions.c.owner_user_id == context.user_id,
                             dataset_revisions.c.dataset_revision_id
                             == request.quarantined_revision_id,
                         )
                     )
-                    .with_for_update(read=True)
                 )
                 .mappings()
                 .first()
             )
             if not source:
-                raise not_found()
+                terminal_error = not_found()
+            if terminal_error is None:
+                assert source is not None
+                fence = (
+                    admission.execute(
+                        select(series_fences)
+                        .where(
+                            and_(
+                                series_fences.c.owner_user_id == context.user_id,
+                                series_fences.c.series_id == source["series_id"],
+                            )
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .one()
+                )
+            else:
+                fence = None
             sr = (
-                c.execute(
-                    select(series)
+                (
+                    admission.execute(
+                        select(series)
+                        .where(
+                            and_(
+                                series.c.owner_user_id == context.user_id,
+                                series.c.series_id == source["series_id"],
+                            )
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .one()
+                )
+                if source is not None
+                else None
+            )
+            now = self.catalog._now()
+            if terminal_error is None:
+                assert source is not None and sr is not None
+                if (
+                    source["status"] != "quarantined"
+                    or sr["latest_revision_id"] != request.quarantined_revision_id
+                    or source["manifest_sha256"] != request.expected_manifest_sha256
+                ):
+                    terminal_error = MarketDataError(
+                        MarketDataCode.STALE_VERSION,
+                        "The named revision is not the matching quarantined latest.",
+                        409,
+                    )
+            if terminal_error is None and root["current_publication_id"]:
+                staged = admission.execute(
+                    select(publications.c.state)
                     .where(
                         and_(
-                            series.c.owner_user_id == context.user_id,
-                            series.c.series_id == source["series_id"],
+                            publications.c.owner_user_id == context.user_id,
+                            publications.c.publication_id == root["current_publication_id"],
                         )
                     )
-                    .with_for_update(read=True)
+                    .with_for_update()
+                ).scalar()
+                if staged == "staged":
+                    resume_publication_id = root["current_publication_id"]
+            if terminal_error is None and resume_publication_id is None:
+                assert source is not None and fence is not None
+                fencing_token = int(fence["fencing_token"]) + 1
+                expires = now + timedelta(seconds=self.lease_seconds)
+                admission.execute(
+                    update(series_fences)
+                    .where(
+                        and_(
+                            series_fences.c.owner_user_id == context.user_id,
+                            series_fences.c.series_id == source["series_id"],
+                        )
+                    )
+                    .values(
+                        fencing_token=fencing_token,
+                        holder=self.worker_id,
+                        lease_expires_at=expires,
+                    )
                 )
-                .mappings()
-                .one()
-            )
-            if (
-                source["status"] != "quarantined"
-                or sr["latest_revision_id"] != request.quarantined_revision_id
-                or source["manifest_sha256"] != request.expected_manifest_sha256
-            ):
-                raise MarketDataError(
-                    MarketDataCode.STALE_VERSION,
-                    "The named revision is not the matching quarantined latest.",
-                    409,
+                admission.execute(
+                    update(idempotency)
+                    .where(
+                        and_(
+                            idempotency.c.owner_user_id == context.user_id,
+                            idempotency.c.operation == "dataset.recover_quarantined_latest",
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    .values(
+                        current_publication_id=publication_id,
+                        parent_admitted_at=now,
+                        admitted_parent_revision_id=request.quarantined_revision_id,
+                        attempt_generation=idempotency.c.attempt_generation + 1,
+                        holder=self.worker_id,
+                        lease_expires_at=expires,
+                        updated_at=now,
+                    )
                 )
-            source_projection = DatasetRevision.model_validate(source["projection"])
-            selected = (
-                c.execute(
+            if terminal_error is not None:
+                admission.execute(
+                    update(idempotency)
+                    .where(
+                        and_(
+                            idempotency.c.owner_user_id == context.user_id,
+                            idempotency.c.operation == "dataset.recover_quarantined_latest",
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    .values(
+                        state="failed",
+                        error={
+                            "code": terminal_error.code.value,
+                            "message": terminal_error.message,
+                            "http_status": terminal_error.http_status,
+                            "retryable": terminal_error.retryable,
+                        },
+                        holder=None,
+                        lease_expires_at=None,
+                        updated_at=now,
+                    )
+                )
+            selected = list(
+                admission.execute(
                     select(revision_bars)
                     .where(
                         and_(
@@ -4751,10 +4966,39 @@ class DatasetPublisher:
                         )
                     )
                     .order_by(revision_bars.c.ordinal)
-                )
-                .mappings()
-                .all()
+                    .with_for_update(read=True)
+                ).mappings()
             )
+        if terminal_error is not None:
+            raise terminal_error
+        if resume_publication_id is not None:
+            recovered = self.reconcile_one(resume_publication_id)
+            if recovered.terminal_state != "published":
+                raise MarketDataError(
+                    MarketDataCode.ARCHIVE_INTEGRITY,
+                    "Recovery could not be resumed safely.",
+                    500,
+                )
+            with self.catalog.engine.begin() as connection:
+                saved = connection.execute(
+                    select(idempotency.c.result).where(
+                        and_(
+                            idempotency.c.owner_user_id == context.user_id,
+                            idempotency.c.operation == "dataset.recover_quarantined_latest",
+                            idempotency.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                ).scalar_one()
+            return PublicationResult.model_validate(saved).model_copy(update={"replayed": True})
+        if source is None or sr is None or fencing_token is None:
+            raise MarketDataError(
+                MarketDataCode.DEPENDENCY_UNAVAILABLE,
+                "Recovery control transaction did not allocate a fence.",
+                503,
+                retryable=True,
+            )
+        source_projection = DatasetRevision.model_validate(source["projection"])
+        self._inject("after_recovery_admission_before_snapshot")
         source_manifest = self.store.read_verified(
             context.user_id,
             source["manifest_uri"],
@@ -5054,10 +5298,10 @@ class DatasetPublisher:
                 for item in recovery_bars
             ]
             final_selection = recovered_selection
-        publication_id, revision_id = str(uuid7()), str(uuid7())
         partition_refs: list[PartitionRef] = []
         publication_file_rows: list[dict[str, Any]] = []
         recovery_payloads: list[tuple[PartitionRef, bytes]] = []
+        recovery_staged: list[tuple[PartitionRef, bytes, str]] = []
         if aggregate_sources:
             encoded = io.BytesIO()
             pl.DataFrame([item.model_dump(mode="json") for item in recovery_bars]).write_parquet(
@@ -5078,43 +5322,42 @@ class DatasetPublisher:
             object_id = str(uuid7())
             object_uri = f"ft-archive://object/{object_id}"
             object_sha = hashlib.sha256(old_bytes).hexdigest()
-            temp = self.store.write_temp(context.user_id, old_bytes, "recovery")
-            self.store.finalize(context.user_id, temp, object_uri)
-            partition_refs.append(
-                old_ref.model_copy(
-                    update={
-                        "object_id": object_id,
-                        "uri": object_uri,
-                        "sha256": object_sha,
-                        "byte_length": len(old_bytes),
-                        "row_count": len(recovery_bars) if aggregate_sources else old_ref.row_count,
-                        "min_start_at": min(item.start_at for item in recovery_bars)
-                        if aggregate_sources
-                        else old_ref.min_start_at,
-                        "max_end_at": max(item.end_at for item in recovery_bars)
-                        if aggregate_sources
-                        else old_ref.max_end_at,
-                        "min_source_revision": min(item.source_revision for item in recovery_bars)
-                        if aggregate_sources
-                        else old_ref.min_source_revision,
-                        "max_source_revision": max(item.source_revision for item in recovery_bars)
-                        if aggregate_sources
-                        else old_ref.max_source_revision,
-                        "origin_publication_id": publication_id,
-                    }
-                )
+            temp_name = f"{uuid7()}.recovery-object.tmp"
+            partition_ref = old_ref.model_copy(
+                update={
+                    "object_id": object_id,
+                    "uri": object_uri,
+                    "sha256": object_sha,
+                    "byte_length": len(old_bytes),
+                    "row_count": len(recovery_bars) if aggregate_sources else old_ref.row_count,
+                    "min_start_at": min(item.start_at for item in recovery_bars)
+                    if aggregate_sources
+                    else old_ref.min_start_at,
+                    "max_end_at": max(item.end_at for item in recovery_bars)
+                    if aggregate_sources
+                    else old_ref.max_end_at,
+                    "min_source_revision": min(item.source_revision for item in recovery_bars)
+                    if aggregate_sources
+                    else old_ref.min_source_revision,
+                    "max_source_revision": max(item.source_revision for item in recovery_bars)
+                    if aggregate_sources
+                    else old_ref.max_source_revision,
+                    "origin_publication_id": publication_id,
+                }
             )
+            partition_refs.append(partition_ref)
+            recovery_staged.append((partition_ref, old_bytes, temp_name))
             publication_file_rows.append(
                 {
                     "owner_user_id": context.user_id,
                     "publication_id": publication_id,
                     "ordinal": ordinal,
                     "file_kind": "object",
-                    "temp_name": f"{object_id}.recovery.tmp",
+                    "temp_name": temp_name,
                     "final_uri": object_uri,
                     "sha256": object_sha,
                     "byte_length": len(old_bytes),
-                    "state": "published",
+                    "state": "temp",
                 }
             )
         now = self.catalog._now()
@@ -5213,22 +5456,18 @@ class DatasetPublisher:
         )
         manifest = canonical_json_bytes(projection)
         manifest_sha = hashlib.sha256(manifest).hexdigest()
-        self.store.finalize(
-            context.user_id,
-            self.store.write_temp(context.user_id, manifest, "recovery-manifest"),
-            manifest_uri,
-        )
+        manifest_temp_name = f"{uuid7()}.recovery-manifest.tmp"
         publication_file_rows.append(
             {
                 "owner_user_id": context.user_id,
                 "publication_id": publication_id,
                 "ordinal": len(partition_refs),
                 "file_kind": "manifest",
-                "temp_name": f"{revision_id}.recovery-manifest.tmp",
+                "temp_name": manifest_temp_name,
                 "final_uri": manifest_uri,
                 "sha256": manifest_sha,
                 "byte_length": len(manifest),
-                "state": "published",
+                "state": "temp",
             }
         )
         revision = DatasetRevision.model_validate(
@@ -5242,7 +5481,45 @@ class DatasetPublisher:
                 "manifest_byte_length": len(manifest),
             }
         )
-        self._inject("after_rename_fsync_before_publish_tx")
+        temp_uuid = str(uuid7())
+        expected_temp_names = [row["temp_name"] for row in publication_file_rows]
+        with self.catalog.engine.begin() as journal:
+            journal.execute(
+                insert(prestage_writes).values(
+                    owner_user_id=context.user_id,
+                    series_id=source["series_id"],
+                    idempotency_key=idempotency_key,
+                    temp_uuid=temp_uuid,
+                    holder=self.worker_id,
+                    fencing_token=fencing_token,
+                    lease_expires_at=self.catalog._now() + timedelta(seconds=self.lease_seconds),
+                    expected_temp_names=expected_temp_names,
+                    state="writing",
+                )
+            )
+
+        def check_recovery_fence() -> None:
+            self._renew_lease(
+                context.user_id,
+                source["series_id"],
+                "dataset.recover_quarantined_latest",
+                idempotency_key,
+                fencing_token,
+            )
+
+        self._inject("before_temp_create")
+        for _ref, payload, temp_name in recovery_staged:
+            check_recovery_fence()
+            self._write_named_temp(context.user_id, temp_name, payload)
+            self._inject("during_temp_write")
+            check_recovery_fence()
+            self._inject("after_file_fsync_before_directory_fsync")
+        check_recovery_fence()
+        self._write_named_temp(context.user_id, manifest_temp_name, manifest)
+        check_recovery_fence()
+        staging = self.store._owner_root(context.user_id) / "staging"
+        self.store._fsync_directory(staging)
+        self._inject("after_all_fsync_before_staged_tx")
         with self.catalog.engine.begin() as c:
             c.execute(
                 select(idempotency.c.idempotency_key)
@@ -5269,21 +5546,17 @@ class DatasetPublisher:
                 .mappings()
                 .one()
             )
-            fresh_fence = int(fence["fencing_token"]) + 1
-            c.execute(
-                update(series_fences)
-                .where(
-                    and_(
-                        series_fences.c.owner_user_id == context.user_id,
-                        series_fences.c.series_id == source["series_id"],
-                    )
+            if (
+                fence["fencing_token"] != fencing_token
+                or fence["holder"] != self.worker_id
+                or fence["lease_expires_at"] <= self.catalog._now()
+            ):
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "Recovery lease was displaced.",
+                    409,
+                    retryable=True,
                 )
-                .values(
-                    fencing_token=fresh_fence,
-                    holder=self.worker_id,
-                    lease_expires_at=self.catalog._now() + timedelta(seconds=self.lease_seconds),
-                )
-            )
             locked = (
                 c.execute(
                     select(series)
@@ -5312,13 +5585,13 @@ class DatasetPublisher:
                     idempotency_key=idempotency_key,
                     operation="recover_quarantined_latest",
                     quarantined_source_revision_id=request.quarantined_revision_id,
-                    parent_revision_id=None,
+                    parent_revision_id=request.quarantined_revision_id,
                     final_candidate_revision_id=revision_id,
                     snapshot_sha256=hashlib.sha256(
                         canonical_json_bytes([row["bar_record_id"] for row in final_selection])
                     ).hexdigest(),
-                    fencing_token=fresh_fence,
-                    state="published",
+                    fencing_token=fencing_token,
+                    state="staged",
                     created_at=now,
                     updated_at=now,
                 )
@@ -5338,7 +5611,7 @@ class DatasetPublisher:
                         "max_end_at": ref.max_end_at,
                         "min_source_revision": ref.min_source_revision,
                         "max_source_revision": ref.max_source_revision,
-                        "state": "published",
+                        "state": "staged",
                         "origin_publication_id": publication_id,
                         "publication_id": publication_id,
                         "catalog_origin": "publication",
@@ -5366,9 +5639,9 @@ class DatasetPublisher:
                     correction_refs=[
                         item.model_dump(mode="json") for item in revision.correction_refs
                     ],
-                    status="published",
+                    status="building",
                     created_at=now,
-                    published_at=now,
+                    published_at=None,
                     parent_depth=revision.parent_depth,
                     restore_closure_revision_count=revision.restore_closure_revision_count,
                     restore_closure_row_count=revision.restore_closure_row_count,
@@ -5379,7 +5652,7 @@ class DatasetPublisher:
                     recovery_from_quarantined_revision_id=revision.recovery_from_quarantined_revision_id,
                     recovery_from_manifest_uri=revision.recovery_from_manifest_uri,
                     recovery_from_manifest_sha256=revision.recovery_from_manifest_sha256,
-                    record_version=2,
+                    record_version=1,
                 )
             )
             c.execute(
@@ -5424,26 +5697,16 @@ class DatasetPublisher:
             )
             c.execute(insert(publication_files), publication_file_rows)
             c.execute(
-                insert(retention_refs).values(
-                    owner_user_id=context.user_id,
-                    dataset_revision_id=request.quarantined_revision_id,
-                    reference_kind="recovery_source",
-                    reference_id=revision_id,
-                    created_at=now,
-                )
-            )
-            c.execute(
-                update(series)
+                update(prestage_writes)
                 .where(
                     and_(
-                        series.c.owner_user_id == context.user_id,
-                        series.c.series_id == source["series_id"],
+                        prestage_writes.c.owner_user_id == context.user_id,
+                        prestage_writes.c.series_id == source["series_id"],
+                        prestage_writes.c.idempotency_key == idempotency_key,
+                        prestage_writes.c.temp_uuid == temp_uuid,
                     )
                 )
-                .values(
-                    latest_revision_id=revision_id,
-                    record_version=series.c.record_version + 1,
-                )
+                .values(state="staged")
             )
             result = PublicationResult(
                 publication_id=publication_id,
@@ -5451,15 +5714,27 @@ class DatasetPublisher:
                 preserved_revision_ids=(),
                 replayed=False,
             )
-            self.catalog._save_result(
-                c,
-                context,
-                "dataset.recover_quarantined_latest",
-                idempotency_key,
-                result,
-            )
             self._inject("during_publish_tx_before_commit")
-            return result
+        self._inject("after_staged_commit_before_rename")
+        for ref, _payload, temp_name in recovery_staged:
+            check_recovery_fence()
+            self.store.finalize(context.user_id, staging / temp_name, ref.uri)
+            check_recovery_fence()
+            self._inject("during_object_renames")
+        check_recovery_fence()
+        self.store.finalize(context.user_id, staging / manifest_temp_name, manifest_uri)
+        check_recovery_fence()
+        self._inject("after_all_renames_before_directory_fsync")
+        self._inject("after_rename_fsync_before_publish_tx")
+        recovered = self.reconcile_one(publication_id)
+        if recovered.terminal_state != "published":
+            raise MarketDataError(
+                MarketDataCode.ARCHIVE_INTEGRITY,
+                "Recovery could not be completed safely.",
+                500,
+            )
+        self._inject("after_publish_commit_before_cleanup")
+        return result
 
     def reconcile_one(self, publication_id: str) -> RecoveryResult:
         with self.catalog.engine.connect() as lookup:
@@ -5485,17 +5760,65 @@ class DatasetPublisher:
                 if identity["operation"] == "publish"
                 else "dataset.recover_quarantined_latest"
             )
-            c.execute(
-                select(idempotency)
-                .where(
-                    and_(
-                        idempotency.c.owner_user_id == identity["owner_user_id"],
-                        idempotency.c.operation == operation,
-                        idempotency.c.idempotency_key == identity["idempotency_key"],
+            staged_roots = tuple(
+                c.execute(
+                    select(publications.c.operation, publications.c.idempotency_key)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == identity["owner_user_id"],
+                            publications.c.series_id == identity["series_id"],
+                            publications.c.state == "staged",
+                        )
                     )
+                    .order_by(publications.c.operation, publications.c.idempotency_key)
                 )
-                .with_for_update()
-            ).one()
+            )
+            root_pairs = tuple(
+                sorted(
+                    {
+                        (
+                            "dataset.publish"
+                            if item.operation == "publish"
+                            else "dataset.recover_quarantined_latest",
+                            item.idempotency_key,
+                        )
+                        for item in staged_roots
+                    }
+                    | {(operation, identity["idempotency_key"])}
+                )
+            )
+            for root_operation, root_key in root_pairs:
+                c.execute(
+                    select(idempotency)
+                    .where(
+                        and_(
+                            idempotency.c.owner_user_id == identity["owner_user_id"],
+                            idempotency.c.operation == root_operation,
+                            idempotency.c.idempotency_key == root_key,
+                        )
+                    )
+                    .with_for_update()
+                ).one()
+            stable_roots = tuple(
+                c.execute(
+                    select(publications.c.operation, publications.c.idempotency_key)
+                    .where(
+                        and_(
+                            publications.c.owner_user_id == identity["owner_user_id"],
+                            publications.c.series_id == identity["series_id"],
+                            publications.c.state == "staged",
+                        )
+                    )
+                    .order_by(publications.c.operation, publications.c.idempotency_key)
+                )
+            )
+            if stable_roots != staged_roots:
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "Staged publication roots changed during reconciliation.",
+                    409,
+                    retryable=True,
+                )
             # Terminality is immutable and every publishing transition holds this
             # root. Recheck before incrementing the fence so a terminal noop never
             # displaces a live holder.
@@ -5546,6 +5869,18 @@ class DatasetPublisher:
                 .mappings()
                 .all()
             )
+            planned_revision_ids = list(
+                c.execute(
+                    select(publication_revisions.c.dataset_revision_id)
+                    .where(
+                        and_(
+                            publication_revisions.c.owner_user_id == owner,
+                            publication_revisions.c.publication_id == publication_id,
+                        )
+                    )
+                    .order_by(publication_revisions.c.ordinal)
+                ).scalars()
+            )
             try:
                 for file in files:
                     final_path = self.store.resolve(owner, file["final_uri"])
@@ -5584,18 +5919,40 @@ class DatasetPublisher:
                     )
                     .values(state="quarantined")
                 )
-                candidate = publication["final_candidate_revision_id"]
-                if candidate:
+                c.execute(
+                    update(archive_objects)
+                    .where(
+                        and_(
+                            archive_objects.c.owner_user_id == owner,
+                            archive_objects.c.publication_id == publication_id,
+                            archive_objects.c.state == "staged",
+                        )
+                    )
+                    .values(state="quarantined")
+                )
+                if planned_revision_ids:
                     c.execute(
                         update(dataset_revisions)
                         .where(
                             and_(
                                 dataset_revisions.c.owner_user_id == owner,
-                                dataset_revisions.c.dataset_revision_id == candidate,
+                                dataset_revisions.c.dataset_revision_id.in_(planned_revision_ids),
+                                dataset_revisions.c.status == "building",
                             )
                         )
                         .values(status="quarantined", record_version=2)
                     )
+                c.execute(
+                    update(publication_retention_conversions)
+                    .where(
+                        and_(
+                            publication_retention_conversions.c.owner_user_id == owner,
+                            publication_retention_conversions.c.publication_id == publication_id,
+                            publication_retention_conversions.c.state == "planned",
+                        )
+                    )
+                    .values(state="cancelled")
+                )
                 return RecoveryResult(
                     publication_id=publication_id,
                     terminal_state="quarantined",
@@ -5634,6 +5991,51 @@ class DatasetPublisher:
                         fencing_token=fresh_fence,
                         updated_at=self.catalog._now(),
                     )
+                )
+                c.execute(
+                    update(publication_files)
+                    .where(
+                        and_(
+                            publication_files.c.owner_user_id == owner,
+                            publication_files.c.publication_id == publication_id,
+                            publication_files.c.state == "staged",
+                        )
+                    )
+                    .values(state="quarantined")
+                )
+                c.execute(
+                    update(archive_objects)
+                    .where(
+                        and_(
+                            archive_objects.c.owner_user_id == owner,
+                            archive_objects.c.publication_id == publication_id,
+                            archive_objects.c.state == "staged",
+                        )
+                    )
+                    .values(state="quarantined")
+                )
+                if planned_revision_ids:
+                    c.execute(
+                        update(dataset_revisions)
+                        .where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == owner,
+                                dataset_revisions.c.dataset_revision_id.in_(planned_revision_ids),
+                                dataset_revisions.c.status == "building",
+                            )
+                        )
+                        .values(status="quarantined", record_version=2)
+                    )
+                c.execute(
+                    update(publication_retention_conversions)
+                    .where(
+                        and_(
+                            publication_retention_conversions.c.owner_user_id == owner,
+                            publication_retention_conversions.c.publication_id == publication_id,
+                            publication_retention_conversions.c.state == "planned",
+                        )
+                    )
+                    .values(state="cancelled")
                 )
                 return RecoveryResult(
                     publication_id=publication_id,
@@ -5717,6 +6119,18 @@ class DatasetPublisher:
                     )
                     .values(state="converted")
                 )
+            if publication["operation"] == "recover_quarantined_latest":
+                c.execute(
+                    pg_insert(retention_refs)
+                    .values(
+                        owner_user_id=owner,
+                        dataset_revision_id=publication["quarantined_source_revision_id"],
+                        reference_kind="recovery_source",
+                        reference_id=candidate,
+                        created_at=self.catalog._now(),
+                    )
+                    .on_conflict_do_nothing()
+                )
             c.execute(
                 update(series)
                 .where(
@@ -5729,18 +6143,6 @@ class DatasetPublisher:
                     latest_revision_id=candidate,
                     record_version=series.c.record_version + 1,
                 )
-            )
-            planned_revision_ids = list(
-                c.execute(
-                    select(publication_revisions.c.dataset_revision_id)
-                    .where(
-                        and_(
-                            publication_revisions.c.owner_user_id == owner,
-                            publication_revisions.c.publication_id == publication_id,
-                        )
-                    )
-                    .order_by(publication_revisions.c.ordinal)
-                ).scalars()
             )
             rollover_rows = list(
                 c.execute(
@@ -5992,6 +6394,7 @@ class DatasetPublisher:
                             publication_cleanup_bars.c.cleaned_at.is_(None),
                         )
                     )
+                    .order_by(publication_cleanup_bars.c.bar_record_id)
                     .with_for_update(skip_locked=True)
                 )
                 .mappings()
@@ -6157,6 +6560,8 @@ class DatasetPublisher:
                         continue
                     target = owner_root / "quarantine" / str(uuid7())
                     os.replace(path, target)
+                    self.store._fsync_directory(staging)
+                    self.store._fsync_directory(target.parent)
                     abandoned += 1
                     quarantined += 1
                     for row in prestage_rows:
