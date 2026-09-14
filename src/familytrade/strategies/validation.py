@@ -318,6 +318,13 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                     and raw_loc[index - 2] in {"nodes", "setup_modules"}
                 )
             )
+            if (
+                "tag" in kind
+                and len(loc) >= 2
+                and isinstance(loc[-1], int)
+                and loc[-2] in {"nodes", "setup_modules"}
+            ):
+                loc = (*loc, "kind")
             result.append(_issue(_pointer(loc), code, "Invalid strategy definition field."))
         return result
     return []

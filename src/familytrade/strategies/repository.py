@@ -293,6 +293,13 @@ class StrategyRepository:
                 )
                 if loc[:1] == ("definition",):
                     loc = loc[1:]
+                if (
+                    "tag" in str(item["type"])
+                    and len(loc) >= 2
+                    and isinstance(loc[-1], int)
+                    and loc[-2] in {"nodes", "setup_modules"}
+                ):
+                    loc = (*loc, "kind")
                 path = "/" + "/".join(str(part) for part in loc)
                 kind = str(item["type"])
                 code = (

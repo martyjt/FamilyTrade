@@ -1379,7 +1379,7 @@ def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
         repository.create_draft(context, value, idempotency_key=str(uuid7()))
     assert error.value.code is ErrorCode.VALIDATION_ERROR
     assert error.value.details["errors"] == [
-        {"path": "/", "code": "NONFINITE", "message": "Invalid operation input."}
+        {"path": "/unexpected", "code": "NONFINITE", "message": "Number must be finite."}
     ]
     with engine.connect() as connection:
         after = connection.scalar(
