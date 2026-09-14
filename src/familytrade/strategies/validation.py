@@ -8,7 +8,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
-from datetime import time
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -780,7 +780,32 @@ def _window_issues(
             invalid = True
         else:
             try:
-                ZoneInfo(calendar.exchange_timezone)
+                zone = ZoneInfo(calendar.exchange_timezone)
+                if (
+                    calendar.calendar_id != window.calendar_id
+                    or calendar.calendar_version != window.calendar_version
+                ):
+                    invalid = True
+                else:
+                    first = calendar.coverage_start.astimezone(zone).date()
+                    last = calendar.coverage_end.astimezone(zone).date()
+                    day = first
+                    while day <= last:
+                        if day.isoweekday() in window.days_of_week:
+                            start_at = datetime.combine(day, start, zone).astimezone(UTC)
+                            end_at = datetime.combine(day, end, zone).astimezone(UTC)
+                            if (
+                                start_at < calendar.coverage_start
+                                or end_at > calendar.coverage_end
+                                or not any(
+                                    segment.kind == "open"
+                                    and segment.start_at <= start_at
+                                    and end_at <= segment.end_at
+                                    for segment in calendar.windows
+                                )
+                            ):
+                                invalid = True
+                        day += timedelta(days=1)
             except ZoneInfoNotFoundError:
                 invalid = True
         if invalid:
