@@ -177,12 +177,7 @@ def _canonical(value: object, *, definition: bool = False) -> object:
                 }
                 and _decimal(item)
             ):
-                decimal = Decimal(cast(str, item))
-                item = format(decimal.normalize(), "f")
-                if "." in item:
-                    item = item.rstrip("0").rstrip(".")
-                if item in {"", "-0"}:
-                    item = "0"
+                item = _canonical_decimal(cast(str, item))
             if (
                 definition
                 and key == "value"
@@ -190,8 +185,7 @@ def _canonical(value: object, *, definition: bool = False) -> object:
                 and value.get("value_type") in {"decimal", "price", "volume", "level"}
                 and _decimal(item)
             ):
-                decimal = Decimal(cast(str, item))
-                item = format(decimal.normalize(), "f").rstrip("0").rstrip(".") or "0"
+                item = _canonical_decimal(cast(str, item))
             normalized[key] = item
         return normalized
     if isinstance(value, (list, tuple)):
@@ -201,6 +195,14 @@ def _canonical(value: object, *, definition: bool = False) -> object:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     raise TypeError("not a JSON value")
+
+
+def _canonical_decimal(value: str) -> str:
+    """Render a validated Decimal without erasing significant integer zeroes."""
+    decimal = Decimal(value)
+    if decimal == 0:
+        return "0"
+    return format(decimal.normalize(), "f")
 
 
 def _bytes(value: object, *, definition: bool = False) -> bytes:
@@ -413,15 +415,31 @@ def _independent_raw_rules(value: Mapping[str, object]) -> list[ValidationIssue]
                         "ATR length is out of range.",
                     )
                 )
-            merge = module.get("merge_multiple")
-            if not _decimal(merge) or not (Decimal(0) < Decimal(cast(str, merge)) <= Decimal(100)):
+            max_zones = module.get("max_zones")
+            if (
+                isinstance(max_zones, int)
+                and not isinstance(max_zones, bool)
+                and not 2 <= max_zones <= 200
+            ):
                 issues.append(
                     _issue(
-                        f"/setup_modules/{index}/merge_multiple",
+                        f"/setup_modules/{index}/max_zones",
                         ValidationIssueCode.OUT_OF_RANGE,
-                        "Multiple must be in (0, 100].",
+                        "Max zones is out of range.",
                     )
                 )
+            for field in ("merge_multiple", "max_width_multiple"):
+                multiple = module.get(field)
+                if not _decimal(multiple) or not (
+                    Decimal(0) < Decimal(cast(str, multiple)) <= Decimal(100)
+                ):
+                    issues.append(
+                        _issue(
+                            f"/setup_modules/{index}/{field}",
+                            ValidationIssueCode.OUT_OF_RANGE,
+                            "Multiple must be in (0, 100].",
+                        )
+                    )
     return issues
 
 
@@ -633,10 +651,7 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                     tolerance_signature = (
                         signature(node.tolerance) if node.tolerance in nodes else None
                     )
-                    tolerance_ok = tolerance_signature in {
-                        ("decimal", "scalar"),
-                        ("integer", "count"),
-                    }
+                    tolerance_ok = tolerance_signature == left and left[0] in numeric
                     if left[0] not in numeric or left != right:
                         issues.append(
                             _issue(
@@ -654,7 +669,23 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                                 ValidationIssueCode.UNKNOWN_REFERENCE
                                 if node.tolerance not in nodes
                                 else ValidationIssueCode.TYPE_MISMATCH,
-                                "Tolerance must reference a scalar-compatible node.",
+                                "Tolerance must match the compared numeric pair.",
+                            )
+                        )
+                    tolerance_node = (
+                        nodes.get(node.tolerance) if node.tolerance is not None else None
+                    )
+                    if (
+                        tolerance_node is not None
+                        and tolerance_node.kind == "constant"
+                        and tolerance_signature is not None
+                        and Decimal(str(tolerance_node.value)) < 0
+                    ):
+                        issues.append(
+                            _issue(
+                                f"/nodes/{index}/tolerance",
+                                ValidationIssueCode.OUT_OF_RANGE,
+                                "Tolerance constant must be nonnegative.",
                             )
                         )
                 elif left != right:
@@ -1411,6 +1442,18 @@ def validate_rule_definition(
                         "Feature reference is unknown.",
                     )
                 )
+            elif (
+                rule == "reference"
+                and isinstance(parameter_value, str)
+                and features[parameter_value].output_type != "level"
+            ):
+                issues.append(
+                    _issue(
+                        parameter_path,
+                        ValidationIssueCode.TYPE_MISMATCH,
+                        "Level feature reference must resolve to a level.",
+                    )
+                )
         if (
             item.interval_seconds in {60, 300, 900, 1800, 3600}
             and item.interval_seconds <= execution_interval_seconds
@@ -1423,6 +1466,36 @@ def validate_rule_definition(
                     "Feature interval does not divide execution interval.",
                 )
             )
+    feature_index = {feature.feature_id: index for index, feature in enumerate(definition.features)}
+    feature_edges = {
+        feature.feature_id: feature.parameters.get("level_feature_id")
+        for feature in definition.features
+        if feature.name in {"level_touch_v1", "level_cross"}
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit_feature(feature_id: str) -> None:
+        if feature_id in visited or feature_id not in feature_edges:
+            return
+        if feature_id in visiting:
+            issues.append(
+                _issue(
+                    f"/features/{feature_index[feature_id]}/parameters/level_feature_id",
+                    ValidationIssueCode.CYCLE,
+                    "Feature dependency graph contains a cycle.",
+                )
+            )
+            return
+        visiting.add(feature_id)
+        dependency = feature_edges[feature_id]
+        if isinstance(dependency, str):
+            visit_feature(dependency)
+        visiting.remove(feature_id)
+        visited.add(feature_id)
+
+    for feature_id in feature_edges:
+        visit_feature(feature_id)
     if len(features) != len(definition.features):
         seen: set[str] = set()
         for index, feature in enumerate(definition.features):

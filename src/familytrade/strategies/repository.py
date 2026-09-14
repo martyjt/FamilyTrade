@@ -260,7 +260,25 @@ class StrategyRepository:
         if isinstance(errors, ValidationError):
             normalized: list[dict[str, str]] = []
             for item in errors.errors(include_input=False):
-                loc = item["loc"]
+                loc = tuple(
+                    part
+                    for part in item["loc"]
+                    if part
+                    not in {
+                        "feature",
+                        "constant",
+                        "arithmetic",
+                        "compare",
+                        "temporal_compare",
+                        "group",
+                        "one_position_v1",
+                        "confirmed_pivot_zones_v1",
+                        "reversal_setup_v1",
+                        "breakout_retest_v1",
+                    }
+                )
+                if loc[:1] == ("definition",):
+                    loc = loc[1:]
                 path = "/" + "/".join(str(part) for part in loc)
                 kind = str(item["type"])
                 code = (
@@ -271,7 +289,9 @@ class StrategyRepository:
                     else "OUT_OF_RANGE"
                     if kind in {"greater_than_equal", "less_than_equal", "string_pattern_mismatch"}
                     else "INVALID_ENUM"
-                    if "literal" in kind or "enum" in kind
+                    if "literal" in kind or "enum" in kind or "tag" in kind
+                    else "NONFINITE"
+                    if "finite" in kind or "nan" in kind
                     else "INVALID_TYPE"
                 )
                 normalized.append(
@@ -497,6 +517,10 @@ class StrategyRepository:
     ) -> StrategyVersion:
         value = self._normalize_names(value)
         create_kind = value.get("kind")
+        if create_kind not in {"definition", "source_version"}:
+            raise self._validation(
+                [{"path": "/kind", "code": "INVALID_ENUM", "message": "Create kind is invalid."}]
+            )
         if create_kind == "definition":
             try:
                 parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
@@ -504,50 +528,44 @@ class StrategyRepository:
                 raise self._validation(error) from error
             return self._insert(connection, context, parsed, None)
         try:
-            parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
-        except ValidationError:
-            try:
-                source_input = StrategyDraftFromVersionInput.model_validate(value)
-            except ValidationError as error:
-                raise self._validation(error) from error
-            source = (
-                connection.execute(
-                    select(strategy_versions).where(
-                        and_(
-                            strategy_versions.c.owner_user_id == context.user_id,
-                            strategy_versions.c.strategy_version_id
-                            == source_input.source_version_id,
-                        )
+            source_input = StrategyDraftFromVersionInput.model_validate(value)
+        except ValidationError as error:
+            raise self._validation(error) from error
+        source = (
+            connection.execute(
+                select(strategy_versions).where(
+                    and_(
+                        strategy_versions.c.owner_user_id == context.user_id,
+                        strategy_versions.c.strategy_version_id == source_input.source_version_id,
                     )
                 )
-                .mappings()
-                .one_or_none()
             )
-            if source is None:
-                raise not_found()
-            if source["status"] != "validated":
-                raise AccessError(
-                    ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
-                )
-            stored = self._stored_version(cast(Mapping[str, object], source))
-            parsed = StrategyDraftFromDefinitionInput.model_validate(
-                _as_model_input(
-                    {
-                        "kind": "definition",
-                        "schema_version": "v1",
+            .mappings()
+            .one_or_none()
+        )
+        if source is None:
+            raise not_found()
+        if source["status"] != "validated":
+            raise AccessError(ErrorCode.CONFLICT, "Source strategy version must be validated.", 409)
+        stored = self._stored_version(cast(Mapping[str, object], source))
+        parsed = StrategyDraftFromDefinitionInput.model_validate(
+            _as_model_input(
+                {
+                    "kind": "definition",
+                    "schema_version": "v1",
+                    "name": source_input.name,
+                    "definition_schema_version": stored.definition_schema_version,
+                    "definition": {
+                        **stored.definition.model_dump(mode="json"),
                         "name": source_input.name,
-                        "definition_schema_version": stored.definition_schema_version,
-                        "definition": {
-                            **stored.definition.model_dump(mode="json"),
-                            "name": source_input.name,
-                        },
-                        "catalogue_version": stored.catalogue_version,
-                        "execution_interval_seconds": stored.execution_interval_seconds,
-                        "fill_interval_seconds": stored.fill_interval_seconds,
-                    }
-                )
+                    },
+                    "catalogue_version": stored.catalogue_version,
+                    "execution_interval_seconds": stored.execution_interval_seconds,
+                    "fill_interval_seconds": stored.fill_interval_seconds,
+                }
             )
-            return self._insert(connection, context, parsed, source_input.source_version_id)
+        )
+        return self._insert(connection, context, parsed, source_input.source_version_id)
         if parsed.name != parsed.definition.name:
             raise self._validation(
                 [

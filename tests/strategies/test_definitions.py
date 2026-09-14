@@ -154,8 +154,8 @@ def test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings() -> None:
         {
             "kind": "constant",
             "node_id": "decimal",
-            "value_type": "decimal",
-            "unit": "scalar",
+            "value_type": "price",
+            "unit": "contract_price",
             "value": "2.00",
         }
     )
@@ -171,6 +171,16 @@ def test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings() -> None:
     assert canonical_definition_bytes(result.definition) == canonical_definition_bytes(
         second.definition
     )
+    canonical = canonical_definition_bytes(result.definition)
+    assert b'"value":"2"' in canonical
+    value["nodes"][-1]["value"] = "20.00"
+    twenty = _validate(value)
+    assert twenty.definition is not None
+    assert b'"value":"20"' in canonical_definition_bytes(twenty.definition)
+    value["nodes"][-1]["value"] = "-0.00"
+    zero = _validate(value)
+    assert zero.definition is not None
+    assert b'"value":"0"' in canonical_definition_bytes(zero.definition)
 
 
 def test_canonical_hash_preserves_array_order_and_excludes_version_metadata() -> None:
@@ -1219,8 +1229,8 @@ def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
         {
             "kind": "constant",
             "node_id": f"bad-constant-{index:03d}",
-            "value_type": "decimal",
-            "unit": "scalar",
+            "value_type": "price",
+            "unit": "contract_price",
             "value": "not-a-decimal",
         }
         for index in range(300)
@@ -1533,8 +1543,8 @@ def test_type_unit_operator_matrix_is_exhaustive() -> None:
         {
             "kind": "constant",
             "node_id": "tolerance",
-            "value_type": "decimal",
-            "unit": "scalar",
+            "value_type": "price",
+            "unit": "contract_price",
             "value": "2",
         }
     )
@@ -1549,6 +1559,18 @@ def test_type_unit_operator_matrix_is_exhaustive() -> None:
         }
     )
     assert _validate(within).valid
+    within["nodes"][-2]["value_type"] = "decimal"
+    within["nodes"][-2]["unit"] = "scalar"
+    assert ("/nodes/8/tolerance", "TYPE_MISMATCH") in {
+        (item.path, item.code.value) for item in _validate(within).errors
+    }
+    within["nodes"][-2]["value_type"] = "price"
+    within["nodes"][-2]["unit"] = "contract_price"
+    within["nodes"][-2]["value"] = "-1"
+    assert ("/nodes/8/tolerance", "OUT_OF_RANGE") in {
+        (item.path, item.code.value) for item in _validate(within).errors
+    }
+    within["nodes"][-2]["value"] = "2"
     within["nodes"][-1]["tolerance"] = "2.00"
     assert ("/nodes/8/tolerance", "UNKNOWN_REFERENCE") in {
         (item.path, item.code.value) for item in _validate(within).errors
