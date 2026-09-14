@@ -321,7 +321,9 @@ class StrategyDraftFromVersionInput(FrozenModel):
     kind: Literal["source_version"]
     schema_version: Literal["v1"]
     name: str = Field(min_length=1, max_length=120)
-    source_version_id: str
+    source_version_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
 
 
 type StrategyDraftCreateInput = Annotated[
@@ -331,7 +333,9 @@ type StrategyDraftCreateInput = Annotated[
 
 class StrategyDraftEditInput(FrozenModel):
     schema_version: Literal["v1"]
-    draft_id: str
+    draft_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
     expected_version: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=120)
     definition_schema_version: Literal["rule-strategy-v1"]
@@ -343,7 +347,9 @@ class StrategyDraftEditInput(FrozenModel):
 
 class StrategyDraftValidateInput(FrozenModel):
     schema_version: Literal["v1"]
-    draft_id: str
+    draft_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
     expected_version: int = Field(ge=1)
 
 

@@ -296,6 +296,15 @@ class StrategyRepository:
         )
         return version
 
+    @staticmethod
+    def _stored_version(row: Mapping[str, object]) -> StrategyVersion:
+        version = StrategyVersion.model_validate(
+            _as_model_input({key: value for key, value in dict(row).items() if key != "updated_at"})
+        )
+        if canonical_definition_sha256(version.definition) != version.canonical_definition_sha256:
+            raise RuntimeError("stored strategy definition hash does not match")
+        return version
+
     def _replay(
         self,
         connection: Connection,
@@ -726,11 +735,7 @@ class StrategyRepository:
             )
             if row is None:
                 raise not_found()
-            return StrategyVersion.model_validate(
-                _as_model_input(
-                    {key: value for key, value in dict(row).items() if key != "updated_at"}
-                )
-            )
+            return self._stored_version(cast(Mapping[str, object], row))
 
     @staticmethod
     def _cursor(context: UserContext, status: str | None, row: Mapping[str, object]) -> str:
