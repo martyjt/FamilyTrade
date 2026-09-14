@@ -35,8 +35,11 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv run ruff check src/familytrade/market_data tests/market_data migrations/versions/20260913_0002_ft05_market_data.py
       - run: uv run ruff format --check src/familytrade/market_data tests/market_data migrations/versions/20260913_0002_ft05_market_data.py
+      - run: uv run ruff check src/familytrade/strategies tests/strategies src/familytrade/access/repository.py tests/access/test_identity_sessions.py src/familytrade/market_data/catalog.py tests/market_data/test_models_catalog.py migrations/versions/20260914_0003_ft06_strategy_definitions.py migrations/env.py tests/market_data/test_migrations.py
+      - run: uv run ruff format --check src/familytrade/strategies tests/strategies src/familytrade/access/repository.py tests/access/test_identity_sessions.py src/familytrade/market_data/catalog.py tests/market_data/test_models_catalog.py migrations/versions/20260914_0003_ft06_strategy_definitions.py migrations/env.py tests/market_data/test_migrations.py
       - run: uv run mypy src
       - run: uv run pytest tests/market_data
+      - run: uv run pytest tests/strategies/test_definitions.py
 
   access:
     runs-on: ubuntu-latest
@@ -88,7 +91,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: uv sync --frozen --all-groups
       - run: uv run ruff check .
-      - run: uv run ruff format --check .
+      - run: uv run ruff format --check --exclude docs/ft06-implementation-contract-v1.md .
       - run: uv run mypy src
       - run: uv run pytest tests/bootstrap
       - run: npm --prefix frontend ci

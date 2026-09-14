@@ -439,6 +439,13 @@ class AccessRepository:
             )
 
     def context_is_current(self, context: UserContext) -> bool:
+        with self._engine.connect() as connection:
+            return self.context_is_current_on_connection(connection, context)
+
+    def context_is_current_on_connection(
+        self, connection: Connection, context: UserContext
+    ) -> bool:
+        """Read the FT-04 context predicate without acquiring another connection."""
         statement = (
             select(sessions.c.auth_session_id)
             .join(users, sessions.c.user_id == users.c.user_id)
@@ -449,15 +456,14 @@ class AccessRepository:
                 users.c.credential_version == context.credential_version,
                 sessions.c.is_administrator == context.is_administrator,
                 users.c.is_administrator == context.is_administrator,
-                sessions.c.scopes == list(context.scopes),
+                sessions.c.scopes == sorted(context.scopes),
                 users.c.enabled.is_(True),
                 sessions.c.revoked_at.is_(None),
                 sessions.c.idle_expires_at > func.clock_timestamp(),
                 sessions.c.absolute_expires_at > func.clock_timestamp(),
             )
         )
-        with self._engine.connect() as connection:
-            return connection.execute(statement).scalar_one_or_none() is not None
+        return connection.execute(statement).scalar_one_or_none() is not None
 
     def create_write_authorization(
         self,
