@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, Literal, cast
 from uuid import uuid7
 
@@ -433,6 +434,7 @@ def _verify_catalog_reconstruction_dag(
     seed_revision_id: str,
     *,
     allow_quarantined_seed: bool = False,
+    allow_integrity_quarantined_closure: bool = False,
     heartbeat: Callable[[], None] | None = None,
 ) -> list[CompletedBar]:
     """Verify the complete catalog-backed parent/aggregate DAG before staging."""
@@ -444,6 +446,7 @@ def _verify_catalog_reconstruction_dag(
         owner,
         {seed_revision_id},
         allow_quarantined_seeds={seed_revision_id} if allow_quarantined_seed else set(),
+        allow_integrity_quarantined_closure=allow_integrity_quarantined_closure,
     )
     revision_rows = {
         row["dataset_revision_id"]: dict(row)
@@ -511,6 +514,7 @@ def _verify_catalog_reconstruction_dag(
     verified_projections: dict[str, DatasetRevision] = {}
     closures: dict[str, set[str]] = {}
     visiting: set[str] = set()
+    verified_objects: dict[str, list[CompletedBar]] = {}
 
     def verify(revision_id: str, *, target_interval: int | None = None) -> set[str]:
         if heartbeat is not None:
@@ -530,9 +534,16 @@ def _verify_catalog_reconstruction_dag(
             allow_quarantined_seed
             and revision_id == seed_revision_id
             and row is not None
-            and row["status"] == "quarantined"
+            and _is_integrity_quarantined_revision(row)
         )
-        if row is None or (row["status"] != "published" and not allowed_seed_state):
+        allowed_closure_state = (
+            allow_integrity_quarantined_closure
+            and row is not None
+            and _is_integrity_quarantined_revision(row)
+        )
+        if row is None or (
+            row["status"] != "published" and not allowed_seed_state and not allowed_closure_state
+        ):
             raise ValueError("reconstruction revision is absent or not published")
         manifest_bytes = store.read_verified(
             owner, row["manifest_uri"], row["manifest_sha256"], row["manifest_byte_length"]
@@ -583,7 +594,9 @@ def _verify_catalog_reconstruction_dag(
         for ordinal, (ref, catalog_object) in enumerate(
             zip(projection.partition_refs, catalog_partitions, strict=True)
         ):
-            allowed_object_state = allowed_seed_state and catalog_object["state"] == "quarantined"
+            allowed_object_state = (allowed_seed_state or allowed_closure_state) and catalog_object[
+                "state"
+            ] == "quarantined"
             if (
                 catalog_object["ordinal"] != ordinal
                 or catalog_object["object_id"] != ref.object_id
@@ -599,12 +612,15 @@ def _verify_catalog_reconstruction_dag(
                 or (catalog_object["state"] != "published" and not allowed_object_state)
             ):
                 raise ValueError("manifest object metadata differs from catalog")
-            parquet_bytes = store.read_verified(owner, ref.uri, ref.sha256, ref.byte_length)
-            partition_bars = [
-                _bar(item) for item in pl.read_parquet(io.BytesIO(parquet_bytes)).to_dicts()
-            ]
-            if heartbeat is not None:
-                heartbeat()
+            partition_bars = verified_objects.get(ref.object_id)
+            if partition_bars is None:
+                parquet_bytes = store.read_verified(owner, ref.uri, ref.sha256, ref.byte_length)
+                partition_bars = [
+                    _bar(item) for item in pl.read_parquet(io.BytesIO(parquet_bytes)).to_dicts()
+                ]
+                verified_objects[ref.object_id] = partition_bars
+                if heartbeat is not None:
+                    heartbeat()
             if len(partition_bars) != ref.row_count or partition_bars != sorted(
                 partition_bars, key=lambda item: (item.start_at, item.bar_record_id)
             ):
@@ -665,21 +681,12 @@ def _verify_catalog_reconstruction_dag(
         raise ValueError("catalog and manifest reconstruction closures differ")
     revision_count = len(verified)
     row_count = sum(len(item[1]) for item in verified.values())
-    referenced_bytes = sum(
-        ref.byte_length
-        for document, _ in verified.values()
-        for ref in DatasetRevision.model_validate(
-            {
-                **{
-                    name: document[name]
-                    for name in DatasetRevision.model_fields
-                    if name not in {"manifest_sha256", "manifest_byte_length"}
-                },
-                "manifest_sha256": "0" * 64,
-                "manifest_byte_length": 1,
-            }
-        ).partition_refs
-    )
+    unique_referenced_objects = {
+        (owner, ref.object_id): ref
+        for projection in verified_projections.values()
+        for ref in projection.partition_refs
+    }
+    referenced_bytes = sum(ref.byte_length for ref in unique_referenced_objects.values())
     if revision_count > 1000 or row_count > 2_000_000 or referenced_bytes > 10 * 1024**3:
         raise ValueError("reconstruction DAG exceeds bounds")
     return verified[seed_revision_id][1]
@@ -691,6 +698,7 @@ def _catalog_reconstruction_ids(
     seed_revision_ids: set[str],
     *,
     allow_quarantined_seeds: set[str] | None = None,
+    allow_integrity_quarantined_closure: bool = False,
 ) -> set[str]:
     allowed_quarantined = allow_quarantined_seeds or set()
     closure: set[str] = set()
@@ -705,6 +713,9 @@ def _catalog_reconstruction_ids(
                     dataset_revisions.c.dataset_revision_id,
                     dataset_revisions.c.parent_revision_id,
                     dataset_revisions.c.status,
+                    dataset_revisions.c.projection,
+                    dataset_revisions.c.published_at,
+                    dataset_revisions.c.record_version,
                 ).where(
                     and_(
                         dataset_revisions.c.owner_user_id == owner,
@@ -716,7 +727,11 @@ def _catalog_reconstruction_ids(
         if len(rows) != len(batch) or any(
             row["status"] != "published"
             and not (
-                row["dataset_revision_id"] in allowed_quarantined and row["status"] == "quarantined"
+                row["dataset_revision_id"] in allowed_quarantined
+                and _is_integrity_quarantined_revision(row)
+            )
+            and not (
+                allow_integrity_quarantined_closure and _is_integrity_quarantined_revision(row)
             )
             for row in rows
         ):
@@ -745,6 +760,18 @@ def _catalog_reconstruction_ids(
             aggregate_ids | {row["parent_revision_id"] for row in rows if row["parent_revision_id"]}
         ) - closure
     return closure
+
+
+def _is_integrity_quarantined_revision(row: Any) -> bool:
+    projection = row.get("projection") if hasattr(row, "get") else None
+    return bool(
+        row["status"] == "quarantined"
+        and row["published_at"] is not None
+        and row["record_version"] == 3
+        and isinstance(projection, dict)
+        and projection.get("status") == "published"
+        and projection.get("record_version") == 2
+    )
 
 
 def _quarantine_dependency_closure(
@@ -2148,6 +2175,50 @@ class DatasetPublisher:
             self._renew_lease(owner, series_id, operation, idempotency_key, fencing_token)
             self._last_lease_renewal[heartbeat_key] = self.catalog._now()
 
+    @contextmanager
+    def _continuous_lease_heartbeat(
+        self,
+        owner: str,
+        series_id: str,
+        operation: str,
+        idempotency_key: str,
+        fencing_token: int,
+    ) -> Any:
+        """Renew a live lease while one filesystem or codec call cannot yield."""
+
+        stop = Event()
+        failures: list[BaseException] = []
+        poll_seconds = min(1.0, max(0.05, self.renew_seconds / 4))
+
+        def renew_until_stopped() -> None:
+            while not stop.wait(poll_seconds):
+                try:
+                    self._heartbeat_lease(
+                        owner,
+                        series_id,
+                        operation,
+                        idempotency_key,
+                        fencing_token,
+                    )
+                except BaseException as error:  # noqa: BLE001 - transferred to caller thread
+                    failures.append(error)
+                    stop.set()
+                    return
+
+        thread = Thread(target=renew_until_stopped, daemon=True)
+        thread.start()
+        completed = False
+        try:
+            yield
+            completed = True
+        finally:
+            stop.set()
+            thread.join(timeout=max(5.0, poll_seconds * 2))
+        if thread.is_alive():
+            raise RuntimeError("Lease heartbeat worker did not stop safely.")
+        if completed and failures:
+            raise failures[0]
+
     def publish(
         self, context: UserContext, request: PublicationRequest, *, idempotency_key: str
     ) -> PublicationResult:
@@ -2665,15 +2736,25 @@ class DatasetPublisher:
                     force=True,
                 )
 
+            def continuous_heartbeat() -> Any:
+                return self._continuous_lease_heartbeat(
+                    context.user_id,
+                    sr["series_id"],
+                    "dataset.publish",
+                    idempotency_key,
+                    fencing_token,
+                )
+
             if parent_revision is not None:
                 try:
-                    parent_rows = _verify_catalog_reconstruction_dag(
-                        c,
-                        self.store,
-                        context.user_id,
-                        parent_revision.dataset_revision_id,
-                        heartbeat=heartbeat,
-                    )
+                    with continuous_heartbeat():
+                        parent_rows = _verify_catalog_reconstruction_dag(
+                            c,
+                            self.store,
+                            context.user_id,
+                            parent_revision.dataset_revision_id,
+                            heartbeat=heartbeat,
+                        )
                 except (MarketDataError, KeyError, TypeError, ValueError) as error:
                     if isinstance(error, MarketDataError) and error.code is not (
                         MarketDataCode.ARCHIVE_INTEGRITY
@@ -3023,13 +3104,14 @@ class DatasetPublisher:
             }
             dependency_closure_by_seed: dict[str, set[str]] = {}
             for dependency_id in sorted(dependency_seeds):
-                _verify_catalog_reconstruction_dag(
-                    c,
-                    self.store,
-                    context.user_id,
-                    dependency_id,
-                    heartbeat=heartbeat,
-                )
+                with continuous_heartbeat():
+                    _verify_catalog_reconstruction_dag(
+                        c,
+                        self.store,
+                        context.user_id,
+                        dependency_id,
+                        heartbeat=heartbeat,
+                    )
                 dependency_closure_by_seed[dependency_id] = _catalog_reconstruction_ids(
                     c, context.user_id, {dependency_id}
                 )
@@ -3106,15 +3188,19 @@ class DatasetPublisher:
                     object_uri = f"ft-archive://object/{planned_object_id}"
                     encoded = io.BytesIO()
                     check_fence()
-                    pl.DataFrame([bar.model_dump(mode="json") for bar in day_rows]).write_parquet(
-                        encoded, compression="zstd"
-                    )
+                    with continuous_heartbeat():
+                        pl.DataFrame(
+                            [bar.model_dump(mode="json") for bar in day_rows]
+                        ).write_parquet(encoded, compression="zstd")
                     check_fence()
-                    data = encoded.getvalue()
+                    with continuous_heartbeat():
+                        data = encoded.getvalue()
+                        data_sha256 = hashlib.sha256(data).hexdigest()
+                    check_fence()
                     pref = PartitionRef(
                         object_id=planned_object_id,
                         uri=object_uri,
-                        sha256=hashlib.sha256(data).hexdigest(),
+                        sha256=data_sha256,
                         byte_length=len(data),
                         row_count=len(day_rows),
                         min_start_at=min(bar.start_at for bar in day_rows),
@@ -3297,8 +3383,12 @@ class DatasetPublisher:
                     "contract_projection_sha256": canonical_sha256(contract_projection),
                     "calendar_projection": calendar.model_dump(mode="json"),
                 }
-                manifest = canonical_json_bytes(projection)
-                projection["manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+                check_fence()
+                with continuous_heartbeat():
+                    manifest = canonical_json_bytes(projection)
+                    manifest_sha256 = hashlib.sha256(manifest).hexdigest()
+                check_fence()
+                projection["manifest_sha256"] = manifest_sha256
                 projection["manifest_byte_length"] = len(manifest)
                 revision = DatasetRevision.model_validate(
                     {
@@ -3362,14 +3452,16 @@ class DatasetPublisher:
             for item in artifacts:
                 for obj in item["objects"]:
                     check_fence()
-                    self._write_named_temp(context.user_id, obj["temp_name"], obj["data"])
+                    with continuous_heartbeat():
+                        self._write_named_temp(context.user_id, obj["temp_name"], obj["data"])
                     self._inject("during_temp_write")
                     check_fence()
                     self._inject("after_file_fsync_before_directory_fsync")
                 check_fence()
-                self._write_named_temp(
-                    context.user_id, item["manifest_temp_name"], item["manifest"]
-                )
+                with continuous_heartbeat():
+                    self._write_named_temp(
+                        context.user_id, item["manifest_temp_name"], item["manifest"]
+                    )
                 check_fence()
             staging = self.store._owner_root(context.user_id) / "staging"
             self.store._fsync_directory(staging)
@@ -5190,16 +5282,29 @@ class DatasetPublisher:
                 force=True,
             )
 
+        def continuous_recovery_heartbeat() -> Any:
+            return self._continuous_lease_heartbeat(
+                context.user_id,
+                source["series_id"],
+                "dataset.recover_quarantined_latest",
+                idempotency_key,
+                fencing_token,
+            )
+
         source_projection = DatasetRevision.model_validate(source["projection"])
         self._inject("after_recovery_admission_before_snapshot")
         try:
-            with self.catalog.engine.connect() as verification:
+            with (
+                self.catalog.engine.connect() as verification,
+                continuous_recovery_heartbeat(),
+            ):
                 verified_source_bars = _verify_catalog_reconstruction_dag(
                     verification,
                     self.store,
                     context.user_id,
                     request.quarantined_revision_id,
                     allow_quarantined_seed=True,
+                    allow_integrity_quarantined_closure=True,
                     heartbeat=recovery_heartbeat,
                 )
         except (KeyError, TypeError, ValueError) as error:
@@ -5209,12 +5314,13 @@ class DatasetPublisher:
                 500,
             ) from error
         check_recovery_fence()
-        source_manifest = self.store.read_verified(
-            context.user_id,
-            source["manifest_uri"],
-            request.expected_manifest_sha256,
-            source["manifest_byte_length"],
-        )
+        with continuous_recovery_heartbeat():
+            source_manifest = self.store.read_verified(
+                context.user_id,
+                source["manifest_uri"],
+                request.expected_manifest_sha256,
+                source["manifest_byte_length"],
+            )
         import json
 
         try:
@@ -5283,16 +5389,18 @@ class DatasetPublisher:
                     "required_end": source_projection.coverage_end,
                 }
         if aggregate_sources:
-            with self.catalog.engine.begin() as healthy_dependencies:
-                for dependency in aggregate_sources.values():
+            for dependency in aggregate_sources.values():
+                with self.catalog.engine.connect().execution_options(
+                    isolation_level="REPEATABLE READ"
+                ) as healthy_dependency:
                     check_recovery_fence()
                     source_series = self.catalog._series_for(
-                        healthy_dependencies,
+                        healthy_dependency,
                         context.user_id,
                         dependency["series_key"],
                     )
                     healthy = (
-                        healthy_dependencies.execute(
+                        healthy_dependency.execute(
                             select(dataset_revisions).where(
                                 and_(
                                     dataset_revisions.c.owner_user_id == context.user_id,
@@ -5316,19 +5424,40 @@ class DatasetPublisher:
                             public_details={"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"},
                         )
                     try:
-                        healthy_rows = _archive_rows_from_revision(
-                            self.store, context.user_id, dict(healthy)
-                        )
-                    except MarketDataError:
+                        with continuous_recovery_heartbeat():
+                            healthy_rows = _verify_catalog_reconstruction_dag(
+                                healthy_dependency,
+                                self.store,
+                                context.user_id,
+                                healthy["dataset_revision_id"],
+                                heartbeat=recovery_heartbeat,
+                            )
+                    except KeyError, MarketDataError, TypeError, ValueError:
                         raise MarketDataError(
                             MarketDataCode.STALE_DATA,
                             "A healthy source dependency must be recovered first.",
                             409,
                             public_details={"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"},
                         ) from None
+                    dependency["series_id"] = source_series["series_id"]
                     dependency["healthy_revision"] = dict(healthy)
                     dependency["healthy_rows"] = healthy_rows
                     check_recovery_fence()
+        dependency_expectations = tuple(
+            sorted(
+                (
+                    {
+                        "series_id": item["series_id"],
+                        "dataset_revision_id": item["healthy_revision"]["dataset_revision_id"],
+                        "manifest_uri": item["healthy_revision"]["manifest_uri"],
+                        "manifest_sha256": item["healthy_revision"]["manifest_sha256"],
+                        "manifest_byte_length": item["healthy_revision"]["manifest_byte_length"],
+                    }
+                    for item in aggregate_sources.values()
+                ),
+                key=lambda item: item["series_id"],
+            )
+        )
         recovery_bars = verified_source_bars
         final_selection = [
             {
@@ -5559,29 +5688,27 @@ class DatasetPublisher:
                 )
                 encoded = io.BytesIO()
                 check_recovery_fence()
-                pl.DataFrame([item.model_dump(mode="json") for item in day_bars]).write_parquet(
-                    encoded, compression="zstd"
-                )
+                with continuous_recovery_heartbeat():
+                    pl.DataFrame([item.model_dump(mode="json") for item in day_bars]).write_parquet(
+                        encoded, compression="zstd"
+                    )
                 check_recovery_fence()
                 template = source_projection.partition_refs[
                     min(index, len(source_projection.partition_refs) - 1)
                 ]
                 recovery_payloads.append((template, encoded.getvalue(), day_bars))
         else:
-            recovery_payloads.extend(
-                (
-                    old_ref,
-                    self.store.read_verified(
+            for old_ref in source_projection.partition_refs:
+                with continuous_recovery_heartbeat():
+                    old_bytes = self.store.read_verified(
                         context.user_id, old_ref.uri, old_ref.sha256, old_ref.byte_length
-                    ),
-                    None,
-                )
-                for old_ref in source_projection.partition_refs
-            )
+                    )
+                recovery_payloads.append((old_ref, old_bytes, None))
         for ordinal, (old_ref, old_bytes, payload_bars) in enumerate(recovery_payloads):
             object_id = str(uuid7())
             object_uri = f"ft-archive://object/{object_id}"
-            object_sha = hashlib.sha256(old_bytes).hexdigest()
+            with continuous_recovery_heartbeat():
+                object_sha = hashlib.sha256(old_bytes).hexdigest()
             temp_name = f"{uuid7()}.recovery-object.tmp"
             partition_ref = old_ref.model_copy(
                 update={
@@ -5717,9 +5844,11 @@ class DatasetPublisher:
             calendar_projection=source_document["calendar_projection"],
         )
         check_recovery_fence()
-        manifest = canonical_json_bytes(projection)
+        with continuous_recovery_heartbeat():
+            manifest = canonical_json_bytes(projection)
         check_recovery_fence()
-        manifest_sha = hashlib.sha256(manifest).hexdigest()
+        with continuous_recovery_heartbeat():
+            manifest_sha = hashlib.sha256(manifest).hexdigest()
         manifest_temp_name = f"{uuid7()}.recovery-manifest.tmp"
         publication_file_rows.append(
             {
@@ -5747,6 +5876,7 @@ class DatasetPublisher:
         )
         temp_uuid = str(uuid7())
         expected_temp_names = [row["temp_name"] for row in publication_file_rows]
+        self._inject("after_recovery_dependency_verification_before_staging")
         with self.catalog.engine.begin() as journal:
             journal.execute(
                 insert(prestage_writes).values(
@@ -5765,17 +5895,22 @@ class DatasetPublisher:
         self._inject("before_temp_create")
         for _ref, payload, temp_name in recovery_staged:
             check_recovery_fence()
-            self._write_named_temp(context.user_id, temp_name, payload)
+            with continuous_recovery_heartbeat():
+                self._write_named_temp(context.user_id, temp_name, payload)
             self._inject("during_temp_write")
             check_recovery_fence()
             self._inject("after_file_fsync_before_directory_fsync")
         check_recovery_fence()
-        self._write_named_temp(context.user_id, manifest_temp_name, manifest)
+        with continuous_recovery_heartbeat():
+            self._write_named_temp(context.user_id, manifest_temp_name, manifest)
         check_recovery_fence()
         staging = self.store._owner_root(context.user_id) / "staging"
         self.store._fsync_directory(staging)
         self._inject("after_all_fsync_before_staged_tx")
-        with self.catalog.engine.begin() as c:
+        with (
+            self.catalog.engine.connect().execution_options(isolation_level="SERIALIZABLE") as c,
+            c.begin(),
+        ):
             c.execute(
                 select(idempotency.c.idempotency_key)
                 .where(
@@ -5787,20 +5922,33 @@ class DatasetPublisher:
                 )
                 .with_for_update()
             ).one()
-            fence = (
-                c.execute(
+            affected_series_ids = tuple(
+                sorted(
+                    {source["series_id"]} | {item["series_id"] for item in dependency_expectations}
+                )
+            )
+            locked_fences = {
+                row["series_id"]: row
+                for row in c.execute(
                     select(series_fences)
                     .where(
                         and_(
                             series_fences.c.owner_user_id == context.user_id,
-                            series_fences.c.series_id == source["series_id"],
+                            series_fences.c.series_id.in_(affected_series_ids),
                         )
                     )
+                    .order_by(series_fences.c.series_id)
                     .with_for_update()
+                ).mappings()
+            }
+            if len(locked_fences) != len(affected_series_ids):
+                raise MarketDataError(
+                    MarketDataCode.STALE_DATA,
+                    "A healthy source dependency must be recovered first.",
+                    409,
+                    public_details={"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"},
                 )
-                .mappings()
-                .one()
-            )
+            fence = locked_fences[source["series_id"]]
             if (
                 fence["fencing_token"] != fencing_token
                 or fence["holder"] != self.worker_id
@@ -5812,26 +5960,76 @@ class DatasetPublisher:
                     409,
                     retryable=True,
                 )
-            locked = (
-                c.execute(
+            locked_series = {
+                row["series_id"]: row
+                for row in c.execute(
                     select(series)
                     .where(
                         and_(
                             series.c.owner_user_id == context.user_id,
-                            series.c.series_id == source["series_id"],
+                            series.c.series_id.in_(affected_series_ids),
                         )
                     )
+                    .order_by(series.c.series_id)
                     .with_for_update()
+                ).mappings()
+            }
+            if len(locked_series) != len(affected_series_ids):
+                raise MarketDataError(
+                    MarketDataCode.STALE_DATA,
+                    "A healthy source dependency must be recovered first.",
+                    409,
+                    public_details={"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"},
                 )
-                .mappings()
-                .one()
-            )
+            locked = locked_series[source["series_id"]]
             if locked["latest_revision_id"] != request.quarantined_revision_id:
                 raise MarketDataError(
                     MarketDataCode.STALE_VERSION,
                     "Quarantined latest changed during recovery.",
                     409,
                 )
+            if dependency_expectations:
+                dependency_revision_ids = tuple(
+                    item["dataset_revision_id"] for item in dependency_expectations
+                )
+                locked_dependencies = {
+                    row["dataset_revision_id"]: row
+                    for row in c.execute(
+                        select(dataset_revisions)
+                        .where(
+                            and_(
+                                dataset_revisions.c.owner_user_id == context.user_id,
+                                dataset_revisions.c.dataset_revision_id.in_(
+                                    dependency_revision_ids
+                                ),
+                            )
+                        )
+                        .order_by(dataset_revisions.c.dataset_revision_id)
+                        .with_for_update()
+                    ).mappings()
+                }
+                dependencies_are_current = all(
+                    item["dataset_revision_id"] in locked_dependencies
+                    and locked_series[item["series_id"]]["latest_revision_id"]
+                    == item["dataset_revision_id"]
+                    and locked_dependencies[item["dataset_revision_id"]]["series_id"]
+                    == item["series_id"]
+                    and locked_dependencies[item["dataset_revision_id"]]["status"] == "published"
+                    and locked_dependencies[item["dataset_revision_id"]]["manifest_uri"]
+                    == item["manifest_uri"]
+                    and locked_dependencies[item["dataset_revision_id"]]["manifest_sha256"]
+                    == item["manifest_sha256"]
+                    and locked_dependencies[item["dataset_revision_id"]]["manifest_byte_length"]
+                    == item["manifest_byte_length"]
+                    for item in dependency_expectations
+                )
+                if not dependencies_are_current:
+                    raise MarketDataError(
+                        MarketDataCode.STALE_DATA,
+                        "A healthy source dependency must be recovered first.",
+                        409,
+                        public_details={"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"},
+                    )
             c.execute(
                 insert(publications).values(
                     owner_user_id=context.user_id,
@@ -6285,6 +6483,16 @@ class DatasetPublisher:
                 ).mappings()
             ]
         self._inject("after_reconcile_fence_before_filesystem")
+
+        def continuous_reconcile_heartbeat() -> Any:
+            return self._continuous_lease_heartbeat(
+                identity["owner_user_id"],
+                identity["series_id"],
+                operation,
+                identity["idempotency_key"],
+                fresh_fence,
+            )
+
         try:
             for file in files_for_io:
                 self._renew_lease(
@@ -6302,13 +6510,15 @@ class DatasetPublisher:
                         / "staging"
                         / file["temp_name"]
                     )
-                    self.store.finalize(identity["owner_user_id"], temp_path, file["final_uri"])
-                self.store.read_verified(
-                    identity["owner_user_id"],
-                    file["final_uri"],
-                    file["sha256"],
-                    file["byte_length"],
-                )
+                    with continuous_reconcile_heartbeat():
+                        self.store.finalize(identity["owner_user_id"], temp_path, file["final_uri"])
+                with continuous_reconcile_heartbeat():
+                    self.store.read_verified(
+                        identity["owner_user_id"],
+                        file["final_uri"],
+                        file["sha256"],
+                        file["byte_length"],
+                    )
                 self._renew_lease(
                     identity["owner_user_id"],
                     identity["series_id"],

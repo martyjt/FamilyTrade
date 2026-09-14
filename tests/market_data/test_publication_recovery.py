@@ -9,13 +9,18 @@ from decimal import Decimal
 from threading import Event, Thread
 from uuid import uuid7
 
+import polars as pl
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import and_, func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
 
 from familytrade.access.models import AccessError
-from familytrade.market_data.archive import DatasetPublisher, MarketDataReader
+from familytrade.market_data.archive import (
+    DatasetPublisher,
+    MarketDataReader,
+    _quarantine_dependency_closure,
+)
 from familytrade.market_data.catalog import (
     MarketDataCatalog,
     active_bars,
@@ -641,7 +646,12 @@ def _scenario_multiple_keys_and_versions_have_deterministic_monotonic_preservati
 
 
 def _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
-    catalog, contexts, archive_store
+    catalog,
+    contexts,
+    archive_store,
+    *,
+    monkeypatch=None,
+    inflate_reused_object: bool = False,
 ) -> None:
     context = contexts[0]
     _, contract = seed(catalog, context)
@@ -658,15 +668,30 @@ def _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_befo
     )
     start = bar_input(contract.contract_id).start_at
     publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
-    parent = publisher.publish(
-        context,
-        PublicationRequest(
-            series_key=key,
-            coverage_start=start,
-            coverage_end=start + timedelta(minutes=1),
-        ),
-        idempotency_key=str(uuid7()),
+    request = PublicationRequest(
+        series_key=key,
+        coverage_start=start,
+        coverage_end=start + timedelta(minutes=1),
     )
+    if inflate_reused_object:
+        assert monkeypatch is not None
+        original_write_parquet = pl.DataFrame.write_parquet
+        incompressible = os.urandom(11 * 1024**2)
+
+        def write_inflated(frame, file, *args, **kwargs):
+            inflated = frame.with_columns(pl.Series("_test_padding", [incompressible]))
+            return original_write_parquet(inflated, file, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(pl.DataFrame, "write_parquet", write_inflated)
+            parent = publisher.publish(context, request, idempotency_key=str(uuid7()))
+    else:
+        parent = publisher.publish(context, request, idempotency_key=str(uuid7()))
+    reused_object_bytes = parent.dataset_revision.partition_refs[0].byte_length
+    if inflate_reused_object:
+        assert reused_object_bytes * 1000 > 10 * 1024**3
+        assert reused_object_bytes < 10 * 1024**3
+        assert parent.dataset_revision.restore_closure_bytes == reused_object_bytes
     parent_document = json.loads(
         archive_store.read_verified(
             context.user_id,
@@ -3091,6 +3116,129 @@ def test_recover_derived_latest_requires_healthy_sources_then_records_consecutiv
     )
 
 
+def test_derived_recovery_revalidates_dependency_after_verification_before_staging(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    (
+        _,
+        source_bars,
+        recorded,
+        source_key,
+        source_revision,
+        target_key,
+        _,
+        _,
+    ) = _published_source_hour(catalog, context, archive_store)
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    derived = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=target_key,
+            coverage_start=source_bars[0].start_at,
+            coverage_end=source_bars[0].start_at + timedelta(hours=1),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    correction = source_bars[0].model_copy(
+        update={
+            "source_revision": 2,
+            "close": source_bars[0].close + Decimal("0.1"),
+            "supersedes_bar_record_id": recorded.inserted_bar_record_ids[0],
+            "correction_reason": "SOURCE_CORRECTION",
+        }
+    )
+    catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(correction,)), idempotency_key=str(uuid7())
+    )
+    healthy_source = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=source_key,
+            coverage_start=source_bars[0].start_at,
+            coverage_end=source_bars[0].start_at + timedelta(hours=1),
+            expected_parent_revision_id=source_revision.dataset_revision.dataset_revision_id,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    with catalog.engine.begin() as connection:
+        connection.execute(
+            update(dataset_revisions)
+            .where(
+                dataset_revisions.c.dataset_revision_id
+                == derived.dataset_revision.dataset_revision_id
+            )
+            .values(status="quarantined", record_version=3)
+        )
+
+    verified = Event()
+    release = Event()
+
+    def pause_before_staging(point: str) -> None:
+        if point == "after_recovery_dependency_verification_before_staging":
+            verified.set()
+            assert release.wait(15)
+
+    monkeypatch.setattr(publisher, "_inject", pause_before_staging)
+    request = QuarantinedLatestRecoveryRequest(
+        quarantined_revision_id=derived.dataset_revision.dataset_revision_id,
+        expected_manifest_sha256=derived.dataset_revision.manifest_sha256,
+    )
+    outcome: list[object] = []
+
+    def recover() -> None:
+        try:
+            outcome.append(
+                publisher.recover_quarantined_latest(context, request, idempotency_key=str(uuid7()))
+            )
+        except BaseException as error:  # noqa: BLE001 - thread transfers exact result
+            outcome.append(error)
+
+    worker = Thread(target=recover)
+    worker.start()
+    assert verified.wait(30)
+    affected = _quarantine_dependency_closure(
+        catalog, context.user_id, healthy_source.dataset_revision.dataset_revision_id
+    )
+    assert affected == (healthy_source.dataset_revision.dataset_revision_id,)
+    release.set()
+    worker.join(30)
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], MarketDataError)
+    assert outcome[0].code.value == "STALE_DATA"
+    assert outcome[0].public_details == {"reason": "RECOVER_SOURCE_DEPENDENCY_FIRST"}
+    with catalog.engine.begin() as connection:
+        target_latest = connection.execute(
+            select(series.c.latest_revision_id).where(
+                and_(
+                    series.c.owner_user_id == context.user_id,
+                    series.c.contract_id == target_key.contract_id,
+                    series.c.interval_seconds == target_key.interval_seconds,
+                )
+            )
+        ).scalar_one()
+        target_status = connection.execute(
+            select(dataset_revisions.c.status).where(
+                dataset_revisions.c.dataset_revision_id == target_latest
+            )
+        ).scalar_one()
+        healthy_recoveries = connection.execute(
+            select(func.count())
+            .select_from(dataset_revisions)
+            .where(
+                and_(
+                    dataset_revisions.c.recovery_from_quarantined_revision_id
+                    == derived.dataset_revision.dataset_revision_id,
+                    dataset_revisions.c.status == "published",
+                )
+            )
+        ).scalar_one()
+    assert target_latest == derived.dataset_revision.dataset_revision_id
+    assert target_status == "quarantined"
+    assert healthy_recoveries == 0
+
+
 def test_recover_derived_latest_writes_one_fresh_partition_per_materialized_trading_day(
     catalog, contexts, archive_store
 ) -> None:
@@ -4847,6 +4995,172 @@ def test_shared_corrupt_object_quarantines_all_parent_and_aggregate_dependents_u
     assert quarantined == 1002
 
 
+def test_recover_latest_accepts_parent_quarantined_by_same_shared_object_integrity_closure(
+    catalog, contexts, archive_store
+) -> None:
+    context = contexts[0]
+    start = bar_input(str(uuid7())).start_at
+    calendar = catalog.create_calendar(
+        context,
+        CalendarCreateInput(
+            exchange_timezone="America/Chicago",
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=2),
+            windows=(
+                CalendarWindowInput(
+                    kind="open",
+                    start_at=start,
+                    end_at=start + timedelta(minutes=1),
+                    trading_day=date(2026, 11, 2),
+                    reason=None,
+                ),
+                CalendarWindowInput(
+                    kind="open",
+                    start_at=start + timedelta(minutes=1),
+                    end_at=start + timedelta(minutes=2),
+                    trading_day=date(2026, 11, 3),
+                    reason=None,
+                ),
+            ),
+            metadata_as_of=start,
+            provenance_ref="shared-parent-child-recovery",
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    contract = catalog.register_contract(
+        context, contract_input(calendar.calendar_id), idempotency_key=str(uuid7())
+    )
+    template = bar_input(contract.contract_id)
+    first_bar = template.model_copy(
+        update={"start_at": start, "end_at": start + timedelta(minutes=1)}
+    )
+    second_bar = template.model_copy(
+        update={
+            "start_at": start + timedelta(minutes=1),
+            "end_at": start + timedelta(minutes=2),
+            "completed_at": start + timedelta(minutes=2),
+        }
+    )
+    recorded = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(first_bar, second_bar)),
+        idempotency_key=str(uuid7()),
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    publisher = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    parent = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=2),
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    correction = second_bar.model_copy(
+        update={
+            "source_revision": 2,
+            "close": second_bar.close + Decimal("0.1"),
+            "supersedes_bar_record_id": recorded.inserted_bar_record_ids[1],
+            "correction_reason": "SOURCE_CORRECTION",
+        }
+    )
+    corrected = catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(correction,)), idempotency_key=str(uuid7())
+    )
+    child = publisher.publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=start + timedelta(minutes=1),
+            coverage_end=start + timedelta(minutes=2),
+            expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    parent_objects = {ref.object_id: ref for ref in parent.dataset_revision.partition_refs}
+    child_objects = {ref.object_id: ref for ref in child.dataset_revision.partition_refs}
+    shared_ids = parent_objects.keys() & child_objects.keys()
+    assert len(shared_ids) == 1
+    shared = parent_objects[shared_ids.pop()]
+    object_path = archive_store.resolve(context.user_id, shared.uri)
+    original = object_path.read_bytes()
+    object_path.chmod(0o600)
+    object_path.write_bytes(b"shared-parent-child-corruption")
+    object_path.chmod(0o444)
+    reader = MarketDataReader(catalog, archive_store, context_is_current=lambda _: True)
+    with pytest.raises(MarketDataError) as corrupt:
+        reader.read_bars(
+            context,
+            ReadBarsRequest(
+                series_key=key,
+                coverage_start=start,
+                coverage_end=start + timedelta(minutes=2),
+                policy=PinnedRead(dataset_revision_id=child.dataset_revision.dataset_revision_id),
+            ),
+        )
+    assert corrupt.value.code.value == "ARCHIVE_INTEGRITY"
+    with catalog.engine.begin() as connection:
+        states = dict(
+            connection.execute(
+                select(dataset_revisions.c.dataset_revision_id, dataset_revisions.c.status).where(
+                    dataset_revisions.c.dataset_revision_id.in_(
+                        (
+                            parent.dataset_revision.dataset_revision_id,
+                            child.dataset_revision.dataset_revision_id,
+                        )
+                    )
+                )
+            ).all()
+        )
+    assert states == {
+        parent.dataset_revision.dataset_revision_id: "quarantined",
+        child.dataset_revision.dataset_revision_id: "quarantined",
+    }
+    object_path.chmod(0o600)
+    object_path.write_bytes(original)
+    object_path.chmod(0o444)
+    publisher.restore_retained_manifest(
+        context,
+        RetainedManifestRestoreRequest(
+            manifest_uri=child.dataset_revision.manifest_uri,
+            expected_manifest_sha256=child.dataset_revision.manifest_sha256,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    recovered = publisher.recover_quarantined_latest(
+        context,
+        QuarantinedLatestRecoveryRequest(
+            quarantined_revision_id=child.dataset_revision.dataset_revision_id,
+            expected_manifest_sha256=child.dataset_revision.manifest_sha256,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    assert recovered.dataset_revision.status == "published"
+    assert recovered.dataset_revision.recovery_from_quarantined_revision_id == (
+        child.dataset_revision.dataset_revision_id
+    )
+    result = reader.read_bars(
+        context,
+        ReadBarsRequest(
+            series_key=key,
+            coverage_start=start,
+            coverage_end=start + timedelta(minutes=2),
+            policy=LatestRead(),
+        ),
+    )
+    assert result.published_base_revision_id == recovered.dataset_revision.dataset_revision_id
+    assert [selection.bar.bar_record_id for selection in result.selections] == [
+        recorded.inserted_bar_record_ids[0],
+        corrected.inserted_bar_record_ids[0],
+    ]
+
+
 def test_manifest_final_projection_bytes_equal_published_and_recovered_catalog_lifecycle_fields(
     catalog, contexts, archive_store
 ) -> None:
@@ -5228,6 +5542,190 @@ def test_live_prestage_writer_renewal_excludes_concurrent_orphan_sweep(
             ).scalar_one()
             == "published"
         )
+
+
+def test_background_heartbeat_covers_blocked_encoder_and_temp_write_with_takeover_and_sweep(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    clock = [datetime(2026, 9, 13, 9, tzinfo=UTC)]
+    controlled_catalog = MarketDataCatalog(
+        catalog.engine,
+        context_is_current=catalog.context_is_current,
+        clock=lambda: clock[0],
+    )
+    _, contract = seed(controlled_catalog, context)
+    original = controlled_catalog.record_completed_batch(
+        context,
+        RecordBatchInput(bars=(bar_input(contract.contract_id),)),
+        idempotency_key=str(uuid7()),
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    bar = bar_input(contract.contract_id)
+    parent = DatasetPublisher(controlled_catalog, archive_store, worker_id=str(uuid7())).publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=bar.start_at,
+            coverage_end=bar.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    controlled_catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar.model_copy(
+                    update={
+                        "source_revision": 2,
+                        "supersedes_bar_record_id": original.inserted_bar_record_ids[0],
+                        "correction_reason": "SOURCE_CORRECTION",
+                    }
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    publisher = DatasetPublisher(
+        controlled_catalog,
+        archive_store,
+        worker_id=str(uuid7()),
+        lease_seconds=120,
+        renew_seconds=30,
+    )
+    renewed = Event()
+    encoder_entered = Event()
+    release_encoder = Event()
+    temp_entered = Event()
+    release_temp = Event()
+    renewal_count = [0]
+
+    def observe_renewal(point: str) -> None:
+        if point == "lease_renewed":
+            renewal_count[0] += 1
+            renewed.set()
+
+    monkeypatch.setattr(publisher, "_inject", observe_renewal)
+    original_write_parquet = pl.DataFrame.write_parquet
+    encoder_blocked = [False]
+
+    def blocked_encoder(frame, file, *args, **kwargs):
+        if not encoder_blocked[0]:
+            encoder_blocked[0] = True
+            encoder_entered.set()
+            assert release_encoder.wait(30)
+        return original_write_parquet(frame, file, *args, **kwargs)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", blocked_encoder)
+    original_write_temp = publisher._write_named_temp
+    temp_blocked = [False]
+
+    def blocked_temp(owner: str, name: str, data: bytes):
+        path = original_write_temp(owner, name, data)
+        if not temp_blocked[0]:
+            temp_blocked[0] = True
+            temp_entered.set()
+            assert release_temp.wait(30)
+        return path
+
+    monkeypatch.setattr(publisher, "_write_named_temp", blocked_temp)
+    outcome: list[object] = []
+
+    def publish_child() -> None:
+        try:
+            outcome.append(
+                publisher.publish(
+                    context,
+                    PublicationRequest(
+                        series_key=key,
+                        coverage_start=bar.start_at,
+                        coverage_end=bar.end_at,
+                        expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+                    ),
+                    idempotency_key=str(uuid7()),
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 - thread transfers exact result
+            outcome.append(error)
+
+    worker = Thread(target=publish_child)
+    worker.start()
+    assert encoder_entered.wait(30)
+
+    def advance_and_observe_live_lease() -> None:
+        renewed.clear()
+        clock[0] += timedelta(seconds=31)
+        assert renewed.wait(5)
+        with controlled_catalog.engine.begin() as connection:
+            series_id = connection.execute(
+                select(series.c.series_id).where(
+                    and_(
+                        series.c.owner_user_id == context.user_id,
+                        series.c.contract_id == contract.contract_id,
+                        series.c.interval_seconds == 60,
+                    )
+                )
+            ).scalar_one()
+            stolen = connection.execute(
+                update(series_fences)
+                .where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == series_id,
+                        series_fences.c.lease_expires_at <= controlled_catalog._now(),
+                    )
+                )
+                .values(
+                    fencing_token=series_fences.c.fencing_token + 1,
+                    holder=str(uuid7()),
+                    lease_expires_at=controlled_catalog._now() + timedelta(seconds=120),
+                )
+                .returning(series_fences.c.fencing_token)
+            ).scalar()
+        assert stolen is None
+
+    for _ in range(4):
+        advance_and_observe_live_lease()
+    release_encoder.set()
+    assert temp_entered.wait(30)
+    advance_and_observe_live_lease()
+    with controlled_catalog.engine.begin() as connection:
+        journal = (
+            connection.execute(
+                select(prestage_writes)
+                .where(
+                    and_(
+                        prestage_writes.c.owner_user_id == context.user_id,
+                        prestage_writes.c.state == "writing",
+                    )
+                )
+                .order_by(prestage_writes.c.lease_expires_at.desc())
+            )
+            .mappings()
+            .one()
+        )
+    temp_path = (
+        archive_store._owner_root(context.user_id) / "staging" / journal["expected_temp_names"][0]
+    )
+    old = (controlled_catalog._now() - timedelta(hours=25)).timestamp()
+    os.utime(temp_path, (old, old))
+    sweep = DatasetPublisher(
+        controlled_catalog, archive_store, worker_id=str(uuid7())
+    ).sweep_orphan_temps()
+    assert sweep.skipped_live_count >= 1
+    assert sweep.quarantined_count == 0
+    assert temp_path.exists()
+    release_temp.set()
+    worker.join(30)
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert not isinstance(outcome[0], BaseException)
+    assert renewal_count[0] >= 5
 
 
 def test_fence_takeover_cancels_staged_conversion_before_competing_publication_converts_same_active_ref(
@@ -5893,10 +6391,14 @@ def test_multiple_keys_and_versions_have_deterministic_monotonic_preservation_fr
 
 
 def test_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
-    catalog, contexts, archive_store
+    catalog, contexts, archive_store, monkeypatch
 ) -> None:
     _scenario_depth_999_publication_rolls_over_to_self_contained_checkpoint_before_child(
-        catalog, contexts, archive_store
+        catalog,
+        contexts,
+        archive_store,
+        monkeypatch=monkeypatch,
+        inflate_reused_object=True,
     )
     with catalog.engine.begin() as connection:
         assert (
