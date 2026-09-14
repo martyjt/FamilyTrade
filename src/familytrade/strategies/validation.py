@@ -848,6 +848,36 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
     return max((math.ceil(span(root) / execution_interval_seconds) for root in roots), default=0)
 
 
+def _module_warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
+    """Return only stateful setup readiness, converted once at the boundary."""
+    spans: list[int] = []
+    for module in definition.setup_modules:
+        if module.kind == "confirmed_pivot_zones_v1":
+            atr_span = (
+                module.atr_length * module.zone_interval_seconds
+                if module.use_atr
+                else module.zone_interval_seconds
+            )
+            touches_span = (
+                module.pivot_left
+                + module.pivot_right
+                + 1
+                + (module.minimum_touches - 1) * (module.pivot_right + 1)
+            ) * module.zone_interval_seconds
+            spans.append(max(atr_span, touches_span))
+        elif module.kind == "reversal_setup_v1" and module.enabled:
+            bars = 2 if module.require_directional_approach else 1
+            if module.recent_peak_stop:
+                bars = max(bars, module.peak_lookback)
+            spans.append(bars * execution_interval_seconds)
+        elif module.kind == "breakout_retest_v1" and module.enabled:
+            spans.append(
+                (2 if module.confirmation_mode == "strict_cross" else 1)
+                * execution_interval_seconds
+            )
+    return max((math.ceil(span / execution_interval_seconds) for span in spans), default=0)
+
+
 def validate_rule_definition(
     value: Mapping[str, object],
     *,
@@ -1192,12 +1222,23 @@ def validate_rule_definition(
             canonical_definition_sha256=None,
             required_warmup_bars=None,
         )
-    warmup = _warmup(definition, execution_interval_seconds)
-    if warmup > 2000:
+    historical_warmup = _warmup(definition, execution_interval_seconds)
+    if historical_warmup > 2000:
         return DefinitionValidationResult(
             valid=False,
             definition=None,
             errors=(_issue("/", ValidationIssueCode.LOOKBACK_LIMIT, "Lookback limit exceeded."),),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
+    warmup = max(historical_warmup, _module_warmup(definition, execution_interval_seconds))
+    if warmup > 5_100_050:
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=(
+                _issue("/", ValidationIssueCode.SIZE_LIMIT, "Setup warm-up exceeds its limit."),
+            ),
             canonical_definition_sha256=None,
             required_warmup_bars=None,
         )

@@ -224,3 +224,27 @@ def test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive() -> None:
         ("/nodes/7/value", "INVALID_DECIMAL"),
         ("/nodes/8/value", "OUT_OF_RANGE"),
     } <= {(item.path, item.code.value) for item in result.errors}
+
+
+def test_confirmed_pivot_zones_warmup_includes_minimum_touch_spacing_boundaries() -> None:
+    value = _fixture()
+    modules = value["setup_modules"]
+    assert isinstance(modules, list)
+    modules.append(
+        {
+            "kind": "confirmed_pivot_zones_v1",
+            "zone_interval_seconds": 900,
+            "use_atr": False,
+            "atr_length": 2,
+            "pivot_left": 1,
+            "pivot_right": 1,
+            "merge_multiple": "1",
+            "max_width_multiple": "1",
+            "minimum_touches": 10,
+            "max_zones": 1,
+            "zone_max_age_bars": 1,
+            "cooldown_execution_bars": 0,
+        }
+    )
+    result = _validate(value)
+    assert result.valid and result.required_warmup_bars == 21
