@@ -149,10 +149,14 @@ def test_invalid_rule_definition_fixture_returns_all_three_typed_errors() -> Non
 
 def test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings() -> None:
     value = _fixture()
+    value["name"] = "Caf\u00e9"
+    value["nodes"].append({"kind": "constant", "node_id": "decimal", "value_type": "decimal", "unit": "scalar", "value": "2.00"})
     result = _validate(value)
     assert result.definition is not None
     first = canonical_definition_sha256(result.definition)
     reordered = json.loads(json.dumps(value, sort_keys=True))
+    reordered["name"] = "Caf\u00e9"
+    reordered["nodes"][-1]["value"] = "2"
     second = _validate(reordered)
     assert second.definition is not None
     assert first == canonical_definition_sha256(second.definition)
