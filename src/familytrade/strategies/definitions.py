@@ -332,7 +332,7 @@ type StrategyDraftCreateInput = Annotated[
 class StrategyDraftEditInput(FrozenModel):
     schema_version: Literal["v1"]
     draft_id: str
-    expected_version: int
+    expected_version: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=120)
     definition_schema_version: Literal["rule-strategy-v1"]
     definition: RuleDefinition
@@ -344,14 +344,14 @@ class StrategyDraftEditInput(FrozenModel):
 class StrategyDraftValidateInput(FrozenModel):
     schema_version: Literal["v1"]
     draft_id: str
-    expected_version: int
+    expected_version: int = Field(ge=1)
 
 
 class StrategyListInput(FrozenModel):
     schema_version: Literal["v1"]
     status: Literal["draft", "validated"] | None = None
     cursor: str | None = None
-    limit: int = 50
+    limit: int = Field(default=50, ge=1, le=100)
 
 
 class StrategyVersion(FrozenModel):
