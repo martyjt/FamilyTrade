@@ -368,16 +368,18 @@ class StrategyRepository:
             checked = self._check(
                 connection,
                 context,
-                StrategyDraftEditInput(
-                    schema_version="v1",
-                    draft_id=stored.strategy_version_id,
-                    expected_version=1,
-                    name=stored.name,
-                    definition_schema_version=stored.definition_schema_version,
-                    definition=stored.definition,
-                    catalogue_version=stored.catalogue_version,
-                    execution_interval_seconds=stored.execution_interval_seconds,
-                    fill_interval_seconds=stored.fill_interval_seconds,
+                StrategyDraftEditInput.model_validate(
+                    {
+                        "schema_version": "v1",
+                        "draft_id": stored.strategy_version_id,
+                        "expected_version": 1,
+                        "name": stored.name,
+                        "definition_schema_version": stored.definition_schema_version,
+                        "definition": stored.definition.model_dump(mode="json"),
+                        "catalogue_version": stored.catalogue_version,
+                        "execution_interval_seconds": stored.execution_interval_seconds,
+                        "fill_interval_seconds": stored.fill_interval_seconds,
+                    }
                 ),
             )
             if not checked.valid:
