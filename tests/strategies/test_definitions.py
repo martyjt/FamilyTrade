@@ -163,10 +163,13 @@ def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
         "execution_interval_seconds": 900,
         "fill_interval_seconds": 60,
     }
-    created = repository.create_draft(context, value, idempotency_key=str(uuid7()))
+    key = str(uuid7())
+    created = repository.create_draft(context, value, idempotency_key=key)
+    replayed = repository.create_draft(context, value, idempotency_key=key)
     assert created.owner_user_id == context.user_id
     assert created.status == "draft" and created.record_version == 1
     assert created.required_warmup_bars == 6 and len(created.canonical_definition_sha256) == 64
+    assert replayed.strategy_version_id == created.strategy_version_id
 
 
 def test_edit_draft_inserts_new_successor_and_preserves_source_row_hash_and_version(
