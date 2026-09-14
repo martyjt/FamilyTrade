@@ -10,7 +10,9 @@ from uuid import UUID, uuid7
 
 import pytest
 from alembic import command
+from alembic.autogenerate import compare_metadata
 from alembic.config import Config
+from alembic.migration import MigrationContext
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.engine import Engine
@@ -18,8 +20,9 @@ from sqlalchemy.exc import DBAPIError
 
 from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, ErrorCode
-from familytrade.access.repository import AccessRepository, users
+from familytrade.access.repository import AccessRepository, access_metadata, users
 from familytrade.access.service import AccessService
+from familytrade.market_data.catalog import market_data_metadata
 from familytrade.market_data.models import CalendarVersion, CalendarWindow
 from familytrade.strategies.definitions import StrategyDraftValidateInput, StrategyListInput
 from familytrade.strategies.presets import get_preset
@@ -985,11 +988,25 @@ def test_strategy_migration_upgrade_downgrade_upgrade_preserves_ft04_ft05_rows(
     config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
     config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
     config.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    with engine.connect() as connection:
+        ft04_user = connection.scalar(
+            select(users.c.user_id).where(users.c.user_id == context.user_id)
+        )
+        assert ft04_user == context.user_id
+        assert connection.dialect.has_table(connection, "market_data_calendar_versions")
     command.downgrade(config, "20260913_0002")
+    with engine.connect() as connection:
+        assert connection.scalar(select(users.c.user_id).where(users.c.user_id == context.user_id))
+        assert connection.dialect.has_table(connection, "market_data_calendar_versions")
+        assert not connection.dialect.has_table(connection, "strategy_versions")
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.scalar(select(users.c.user_id).where(users.c.user_id == context.user_id))
         assert connection.dialect.has_table(connection, "strategy_versions")
+        assert not compare_metadata(
+            MigrationContext.configure(connection),
+            (access_metadata, market_data_metadata, strategy_metadata),
+        )
 
 
 def test_strategy_edit_fixture_preserves_original_and_separate_ttls() -> None:
@@ -1032,7 +1049,8 @@ def test_trigger_allows_only_exact_draft_to_validated_transition_and_no_other_up
 
 
 def test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_drift() -> None:
-    keys = [table.key for table in strategy_metadata.sorted_tables]
+    metadata = (access_metadata, market_data_metadata, strategy_metadata)
+    keys = [table.key for item in metadata for table in item.sorted_tables]
     assert len(keys) == len(set(keys))
     assert {"strategy_versions", "strategy_idempotency_records"} <= set(keys)
 
