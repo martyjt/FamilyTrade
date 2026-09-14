@@ -494,6 +494,13 @@ class StrategyRepository:
         self, connection: Connection, context: UserContext, value: dict[str, object]
     ) -> StrategyVersion:
         value = self._normalize_names(value)
+        create_kind = value.get("kind")
+        if create_kind == "definition":
+            try:
+                parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
+            except ValidationError as error:
+                raise self._validation(error) from error
+            return self._insert(connection, context, parsed, None)
         try:
             parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
         except ValidationError:
