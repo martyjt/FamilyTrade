@@ -1124,6 +1124,30 @@ def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
         )
     with pytest.raises(ValidationError):
         StrategyListInput.model_validate({"schema_version": "v1", "limit": 0})
+    # More than 256 independently addressable failures preserve the first 255 sorted
+    # issues and replace the remainder with one terminal, public truncation issue.
+    many = _fixture()
+    nodes = many["nodes"]
+    assert isinstance(nodes, list)
+    nodes.extend(
+        {
+            "kind": "constant",
+            "node_id": f"bad-constant-{index:03d}",
+            "value_type": "decimal",
+            "unit": "scalar",
+            "value": "not-a-decimal",
+        }
+        for index in range(300)
+    )
+    truncated = _validate(many).errors
+    assert len(truncated) == 256
+    assert (truncated[-1].path, truncated[-1].code.value) == ("/", "ISSUE_LIMIT")
+    assert tuple((item.path, item.code.value) for item in truncated[:-1]) == tuple(
+        sorted(
+            ((item.path, item.code.value) for item in truncated[:-1]),
+            key=lambda item: (item[0], item[1]),
+        )
+    )
 
 
 def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash(
@@ -1178,6 +1202,37 @@ def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
     assert ("/constraints/entry_windows/0/days_of_week", "OUT_OF_RANGE") in {
         (item.path, item.code.value) for item in weekday_result.errors
     }
+    # The remaining declared collections use OUT_OF_RANGE at their own paths, never SIZE_LIMIT.
+    args = _fixture()
+    args["nodes"].append(
+        {
+            "kind": "arithmetic",
+            "node_id": "too-many-args",
+            "op": "add",
+            "args": ["fast-now"] * 17,
+            "result_type": "price",
+            "unit": "contract_price",
+        }
+    )
+    children = _fixture()
+    children["nodes"].append(
+        {
+            "kind": "group",
+            "node_id": "too-many-children",
+            "op": "all",
+            "children": ["cross-up"] * 17,
+        }
+    )
+    modules = _fixture()
+    modules["setup_modules"] = [{"kind": "one_position_v1"} for _ in range(6)]
+    for candidate, path in (
+        (args, "/nodes/7/args"),
+        (children, "/nodes/7/children"),
+        (modules, "/setup_modules"),
+    ):
+        pairs = {(item.path, item.code.value) for item in _validate(candidate).errors}
+        assert (path, "OUT_OF_RANGE") in pairs
+        assert (path, "SIZE_LIMIT") not in pairs
 
 
 def test_raw_hashable_structural_validation_failure_is_idempotently_replayed(

@@ -762,6 +762,14 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
     calculate a setup, select a zone, resolve a price, or create an order.
     """
     issues: list[ValidationIssue] = []
+    if len(definition.setup_modules) > 5:
+        issues.append(
+            _issue(
+                "/setup_modules",
+                ValidationIssueCode.OUT_OF_RANGE,
+                "At most five setup modules are allowed.",
+            )
+        )
     seen: set[str] = set()
     kinds: set[str] = set()
     enabled_emitting = False
