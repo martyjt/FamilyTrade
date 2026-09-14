@@ -1598,7 +1598,7 @@ def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warm
         "multiple": "2",
     }
     result = _validate(value)
-    assert result.valid and result.required_warmup_bars >= 500
+    assert result.valid and result.required_warmup_bars == 500
 
 
 def test_level_features_include_referenced_rolling_dependency_warmup() -> None:
@@ -1664,7 +1664,7 @@ def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> Non
         "offset_ticks": 0,
     }
     result = _validate(value)
-    assert result.valid and result.required_warmup_bars >= 500
+    assert result.valid and result.required_warmup_bars == 500
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:
