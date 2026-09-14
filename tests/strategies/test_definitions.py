@@ -1200,7 +1200,29 @@ def test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two() -> None
 
 
 def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warmup() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    features = value["features"]
+    nodes = value["nodes"]
+    assert isinstance(features, list) and isinstance(nodes, list)
+    features.append(
+        {
+            "feature_id": "atr-500",
+            "kind": "indicator",
+            "name": "atr_wilder_v1",
+            "output_type": "price",
+            "unit": "contract_price",
+            "interval_seconds": 900,
+            "parameters": {"n": 500},
+        }
+    )
+    nodes.append({"kind": "feature", "node_id": "atr-stop", "feature_id": "atr-500", "offset": 0})
+    value["exit_policy"]["stop"] = {
+        "kind": "atr_multiple",
+        "feature_id": "atr-500",
+        "multiple": "2",
+    }
+    result = _validate(value)
+    assert result.valid and result.required_warmup_bars >= 500
 
 
 def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> None:
