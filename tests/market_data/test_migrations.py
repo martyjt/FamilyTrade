@@ -4,6 +4,7 @@ from sqlalchemy import inspect, text
 
 from familytrade.access.repository import access_metadata, users
 from familytrade.market_data.catalog import market_data_metadata
+from familytrade.strategies.repository import strategy_metadata
 
 
 def test_alembic_env_combines_access_and_market_data_metadata_without_duplicate_keys_or_drift(
@@ -11,14 +12,14 @@ def test_alembic_env_combines_access_and_market_data_metadata_without_duplicate_
 ) -> None:
     keys = [
         table.key
-        for metadata in (access_metadata, market_data_metadata)
+        for metadata in (access_metadata, market_data_metadata, strategy_metadata)
         for table in metadata.tables.values()
     ]
     assert len(keys) == len(set(keys))
     with postgres_engine.connect() as connection:
         drift = compare_metadata(
             MigrationContext.configure(connection),
-            [access_metadata, market_data_metadata],
+            [access_metadata, market_data_metadata, strategy_metadata],
         )
         uuid_guarded_tables = set(
             connection.execute(
@@ -85,7 +86,12 @@ def test_alembic_metadata_constraints_and_ft04_rows_survive_upgrade_downgrade(
         assert c.execute(users.select().where(users.c.user_id == user_id)).first() is not None
     command.upgrade(config, "head")
     upgraded = set(inspect(postgres_engine).get_table_names())
-    assert set(access_metadata.tables) | set(market_data_metadata.tables) <= upgraded
+    assert (
+        set(access_metadata.tables)
+        | set(market_data_metadata.tables)
+        | set(strategy_metadata.tables)
+        <= upgraded
+    )
     with postgres_engine.connect() as c:
         assert c.execute(users.select().where(users.c.user_id == user_id)).first() is not None
 

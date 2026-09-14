@@ -37,6 +37,7 @@ jobs:
       - run: uv run ruff format --check src/familytrade/market_data tests/market_data migrations/versions/20260913_0002_ft05_market_data.py
       - run: uv run mypy src
       - run: uv run pytest tests/market_data
+      - run: uv run pytest tests/strategies/test_definitions.py
 
   access:
     runs-on: ubuntu-latest
