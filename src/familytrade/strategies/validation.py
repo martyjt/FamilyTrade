@@ -276,6 +276,8 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                 if kind == "missing"
                 else ValidationIssueCode.INVALID_ENUM
                 if "literal" in kind or "tag" in kind
+                else ValidationIssueCode.NONFINITE
+                if "finite" in kind or "nan" in kind
                 else ValidationIssueCode.INVALID_TYPE
                 if kind.endswith("_type")
                 else ValidationIssueCode.OUT_OF_RANGE
@@ -285,7 +287,10 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                 for part in error["loc"]
                 if not isinstance(part, str)
                 or part
-                not in {"feature", "constant", "arithmetic", "compare", "temporal_compare", "group"}
+                not in {
+                    "feature", "constant", "arithmetic", "compare", "temporal_compare", "group",
+                    "one_position_v1", "confirmed_pivot_zones_v1", "reversal_setup_v1", "breakout_retest_v1",
+                }
             )
             result.append(_issue(_pointer(loc), code, "Invalid strategy definition field."))
         return result
