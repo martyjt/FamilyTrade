@@ -403,6 +403,16 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         index = index_by_id[node_id]
         path = f"/nodes/{index}/value"
         value = node.value
+        expected_unit = {
+            "price": "contract_price",
+            "volume": "contract_volume",
+            "integer": "count",
+            "boolean": "boolean",
+        }.get(node.value_type)
+        if expected_unit is not None and node.unit != expected_unit:
+            issues.append(
+                _issue(path, ValidationIssueCode.UNIT_MISMATCH, "Constant type and unit disagree.")
+            )
         decimal_types = {"decimal", "price", "volume", "level"}
         if node.value_type in decimal_types:
             if not _decimal(value):
@@ -634,6 +644,24 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
             issues.append(
                 _issue(path, ValidationIssueCode.ROOT_NOT_BOOLEAN, "Root must resolve to boolean.")
             )
+
+    def group_depth(node_id: str, seen: set[str]) -> int:
+        if node_id in seen or node_id not in nodes:
+            return 0
+        node = nodes[node_id]
+        if node.kind != "group":
+            return 0
+        return 1 + max((group_depth(child, seen | {node_id}) for child in node.children), default=0)
+
+    for node_id, node in nodes.items():
+        if node.kind == "group" and group_depth(node_id, set()) > 4:
+            issues.append(
+                _issue(
+                    f"/nodes/{index_by_id[node_id]}",
+                    ValidationIssueCode.SIZE_LIMIT,
+                    "Group nesting exceeds four levels.",
+                )
+            )
     return issues
 
 
@@ -660,6 +688,16 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         kinds.add(module.kind)
         if module.kind in {"reversal_setup_v1", "breakout_retest_v1"} and module.enabled:
             enabled_emitting = True
+        for field in ("filter_root", "arm_filter_root", "entry_filter_root"):
+            root = getattr(module, field, None)
+            if root is not None and root not in {node.node_id for node in definition.nodes}:
+                issues.append(
+                    _issue(
+                        f"/setup_modules/{index}/{field}",
+                        ValidationIssueCode.UNKNOWN_REFERENCE,
+                        "Setup filter root is unknown.",
+                    )
+                )
     if enabled_emitting and not {"one_position_v1", "confirmed_pivot_zones_v1"} <= kinds:
         issues.append(
             _issue(
