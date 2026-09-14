@@ -362,6 +362,28 @@ class StrategyRepository:
                 raise stale_version(parsed.expected_version, cast(int, row["record_version"]))
             if row["status"] != "draft":
                 raise AccessError(ErrorCode.CONFLICT, "Draft is already validated.", 409)
+            stored = StrategyVersion.model_validate(
+                {key: value for key, value in dict(row).items() if key != "updated_at"}
+            )
+            checked = self._check(
+                connection,
+                context,
+                StrategyDraftEditInput(
+                    schema_version="v1",
+                    draft_id=stored.strategy_version_id,
+                    expected_version=1,
+                    name=stored.name,
+                    definition_schema_version=stored.definition_schema_version,
+                    definition=stored.definition,
+                    catalogue_version=stored.catalogue_version,
+                    execution_interval_seconds=stored.execution_interval_seconds,
+                    fill_interval_seconds=stored.fill_interval_seconds,
+                ),
+            )
+            if not checked.valid:
+                return StrategyValidationResult(
+                    valid=False, strategy_version=None, errors=checked.errors
+                )
             connection.execute(
                 update(strategy_versions)
                 .where(
