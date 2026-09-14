@@ -150,7 +150,15 @@ def test_invalid_rule_definition_fixture_returns_all_three_typed_errors() -> Non
 def test_canonical_hash_sorts_keys_normalizes_nfc_and_decimal_strings() -> None:
     value = _fixture()
     value["name"] = "Caf\u00e9"
-    value["nodes"].append({"kind": "constant", "node_id": "decimal", "value_type": "decimal", "unit": "scalar", "value": "2.00"})
+    value["nodes"].append(
+        {
+            "kind": "constant",
+            "node_id": "decimal",
+            "value_type": "decimal",
+            "unit": "scalar",
+            "value": "2.00",
+        }
+    )
     result = _validate(value)
     assert result.definition is not None
     first = canonical_definition_sha256(result.definition)
@@ -300,12 +308,17 @@ def test_revocation_expiry_credential_and_scope_change_during_wait_are_unauthent
     assert outcome[0].code is ErrorCode.UNAUTHENTICATED
 
 
-def _validate(value: dict[str, object]):
+def _validate(
+    value: dict[str, object],
+    *,
+    execution_interval_seconds: int = 900,
+    fill_interval_seconds: int = 60,
+):
     return validate_rule_definition(
         value,
         owner_user_id="owner",
-        execution_interval_seconds=900,
-        fill_interval_seconds=60,
+        execution_interval_seconds=execution_interval_seconds,
+        fill_interval_seconds=fill_interval_seconds,
         calendar_versions={},
     )
 
@@ -513,15 +526,69 @@ def test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive() -> None:
     valid = _fixture()
     valid["nodes"].extend(
         [
-            {"kind": "constant", "node_id": "d", "value_type": "decimal", "unit": "scalar", "value": "2"},
-            {"kind": "constant", "node_id": "p", "value_type": "price", "unit": "contract_price", "value": "2"},
-            {"kind": "constant", "node_id": "v", "value_type": "volume", "unit": "contract_volume", "value": "2"},
-            {"kind": "constant", "node_id": "l", "value_type": "level", "unit": "contract_price", "value": "2"},
-            {"kind": "constant", "node_id": "i", "value_type": "integer", "unit": "count", "value": 2},
-            {"kind": "constant", "node_id": "b", "value_type": "boolean", "unit": "boolean", "value": True},
-            {"kind": "constant", "node_id": "t", "value_type": "timestamp", "unit": "utc_timestamp", "value": "2026-09-15T00:00:00Z"},
-            {"kind": "constant", "node_id": "s", "value_type": "side", "unit": "side", "value": "long"},
-                {"kind": "constant", "node_id": "r", "value_type": "regime", "unit": "regime", "value": "bullish"},
+            {
+                "kind": "constant",
+                "node_id": "d",
+                "value_type": "decimal",
+                "unit": "scalar",
+                "value": "2",
+            },
+            {
+                "kind": "constant",
+                "node_id": "p",
+                "value_type": "price",
+                "unit": "contract_price",
+                "value": "2",
+            },
+            {
+                "kind": "constant",
+                "node_id": "v",
+                "value_type": "volume",
+                "unit": "contract_volume",
+                "value": "2",
+            },
+            {
+                "kind": "constant",
+                "node_id": "l",
+                "value_type": "level",
+                "unit": "contract_price",
+                "value": "2",
+            },
+            {
+                "kind": "constant",
+                "node_id": "i",
+                "value_type": "integer",
+                "unit": "count",
+                "value": 2,
+            },
+            {
+                "kind": "constant",
+                "node_id": "b",
+                "value_type": "boolean",
+                "unit": "boolean",
+                "value": True,
+            },
+            {
+                "kind": "constant",
+                "node_id": "t",
+                "value_type": "timestamp",
+                "unit": "utc_timestamp",
+                "value": "2026-09-15T00:00:00Z",
+            },
+            {
+                "kind": "constant",
+                "node_id": "s",
+                "value_type": "side",
+                "unit": "side",
+                "value": "long",
+            },
+            {
+                "kind": "constant",
+                "node_id": "r",
+                "value_type": "regime",
+                "unit": "regime",
+                "value": "bullish",
+            },
         ]
     )
     assert _validate(valid).valid
@@ -623,7 +690,7 @@ def test_r_multiple_rejects_absent_nonpositive_or_out_of_range_without_fixture_a
     missing_module = dict(module)
     del missing_module["r_multiple"]
     missing["setup_modules"].append(missing_module)
-    assert ("/setup_modules/1/reversal_setup_v1/r_multiple", "REQUIRED") in {
+    assert ("/setup_modules/1/r_multiple", "REQUIRED") in {
         (item.path, item.code.value) for item in _validate(missing).errors
     }
 
@@ -1542,21 +1609,211 @@ def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -
 
 
 def test_every_feature_has_deterministic_numeric_warmup() -> None:
-    value = _fixture()
-    features = value["features"]
-    assert isinstance(features, list)
-    features.append(
-        {
-            "feature_id": "unused",
-            "kind": "indicator",
-            "name": "sma_v1",
-            "output_type": "price",
-            "unit": "contract_price",
-            "interval_seconds": 900,
-            "parameters": {"n": 500, "input": "close"},
-        }
+    # This is deliberately a closed table: it mirrors feature-catalogue-v1 rather
+    # than deriving its cases from the implementation catalogue.
+    catalogue = (
+        ("open", "input", "price", "contract_price", {}, 1, {}),
+        ("high", "input", "price", "contract_price", {}, 1, {}),
+        ("low", "input", "price", "contract_price", {}, 1, {}),
+        ("close", "input", "price", "contract_price", {}, 1, {}),
+        ("hl2", "input", "price", "contract_price", {}, 1, {}),
+        ("typical", "input", "price", "contract_price", {}, 1, {}),
+        ("volume", "input", "volume", "contract_volume", {}, 1, {}),
+        (
+            "sma_v1",
+            "indicator",
+            "price",
+            "contract_price",
+            {"n": 2, "input": "close"},
+            2,
+            {"n": (2, 500, 1, 501), "input": ("open", "volume", "bad", "bad")},
+        ),
+        (
+            "ema_v1",
+            "indicator",
+            "price",
+            "contract_price",
+            {"n": 2, "input": "close"},
+            2,
+            {"n": (2, 500, 1, 501), "input": ("open", "volume", "bad", "bad")},
+        ),
+        (
+            "rsi_wilder_v1",
+            "indicator",
+            "decimal",
+            "ratio_0_100",
+            {"n": 2, "input": "close"},
+            3,
+            {"n": (2, 500, 1, 501), "input": ("close", "close", "bad", "bad")},
+        ),
+        (
+            "atr_wilder_v1",
+            "indicator",
+            "price",
+            "contract_price",
+            {"n": 2},
+            2,
+            {"n": (2, 500, 1, 501)},
+        ),
+        (
+            "relative_volume_v1",
+            "indicator",
+            "decimal",
+            "ratio",
+            {"n": 2},
+            3,
+            {"n": (2, 500, 1, 501)},
+        ),
+        ("session_vwap_v1", "indicator", "price", "contract_price", {}, 1, {}),
+        (
+            "confirmed_pivot_v1",
+            "structure",
+            "level",
+            "contract_price",
+            {"pivot_kind": "high", "left": 1, "right": 1},
+            3,
+            {
+                "pivot_kind": ("high", "low", "bad", "bad"),
+                "left": (1, 50, 0, 51),
+                "right": (1, 50, 0, 51),
+            },
+        ),
+        (
+            "swing_regime_v1",
+            "structure",
+            "regime",
+            "regime",
+            {"left": 1, "right": 1},
+            5,
+            {"left": (1, 50, 0, 51), "right": (1, 50, 0, 51)},
+        ),
+        ("prior_session_high_v1", "level", "level", "contract_price", {}, 1, {}),
+        ("prior_session_low_v1", "level", "level", "contract_price", {}, 1, {}),
+        (
+            "rolling_high_v1",
+            "level",
+            "level",
+            "contract_price",
+            {"n": 2},
+            3,
+            {"n": (2, 500, 1, 501)},
+        ),
+        (
+            "rolling_low_v1",
+            "level",
+            "level",
+            "contract_price",
+            {"n": 2},
+            3,
+            {"n": (2, 500, 1, 501)},
+        ),
+        (
+            "level_touch_v1",
+            "level",
+            "boolean",
+            "boolean",
+            {"level_feature_id": "base-level", "tolerance_ticks": 0},
+            3,
+            {
+                "level_feature_id": ("base-level", "base-level", "missing", "missing"),
+                "tolerance_ticks": (0, 100, -1, 101),
+            },
+        ),
+        (
+            "level_cross",
+            "level",
+            "boolean",
+            "boolean",
+            {"level_feature_id": "base-level", "direction": "above"},
+            4,
+            {
+                "level_feature_id": ("base-level", "base-level", "missing", "missing"),
+                "direction": ("above", "below", "bad", "bad"),
+            },
+        ),
     )
-    assert _validate(value).required_warmup_bars == _validate(_fixture()).required_warmup_bars
+
+    for name, kind, output_type, unit, parameters, expected_warmup, parameter_cases in catalogue:
+        feature = {
+            "feature_id": "target",
+            "kind": kind,
+            "name": name,
+            "output_type": output_type,
+            "unit": unit,
+            "interval_seconds": 900,
+            "parameters": copy.deepcopy(parameters),
+        }
+        features: list[dict[str, object]] = []
+        if name in {"level_touch_v1", "level_cross"}:
+            features.append(
+                {
+                    "feature_id": "base-level",
+                    "kind": "level",
+                    "name": "rolling_high_v1",
+                    "output_type": "level",
+                    "unit": "contract_price",
+                    "interval_seconds": 900,
+                    "parameters": {"n": 2},
+                }
+            )
+        features.append(feature)
+        value = _fixture()
+        value["features"] = features
+        value["nodes"] = [
+            {"kind": "feature", "node_id": "target-now", "feature_id": "target", "offset": 0},
+            {"kind": "feature", "node_id": "target-again", "feature_id": "target", "offset": 0},
+            {
+                "kind": "compare",
+                "node_id": "target-equals",
+                "op": "eq",
+                "left": "target-now",
+                "right": "target-again",
+                "tolerance": None,
+            },
+        ]
+        value["entry_rules"] = {"long_root": "target-equals", "short_root": None}
+        value["exit_rules"] = {"long_root": "target-equals", "short_root": None}
+        result = _validate(value)
+        assert result.valid and result.definition is not None
+        assert result.required_warmup_bars == expected_warmup
+        target = result.definition.features[-1]
+        assert (target.name, target.kind, target.output_type, target.unit) == (
+            name,
+            kind,
+            output_type,
+            unit,
+        )
+
+        for parameter, (lower, upper, below, above) in parameter_cases.items():
+            for boundary in (lower, upper):
+                candidate = copy.deepcopy(value)
+                candidate["features"][-1]["parameters"][parameter] = boundary
+                if parameter == "input" and boundary == "volume":
+                    candidate["features"][-1]["output_type"] = "volume"
+                    candidate["features"][-1]["unit"] = "contract_volume"
+                assert _validate(candidate).valid
+            for invalid in (below, above):
+                candidate = copy.deepcopy(value)
+                candidate["features"][-1]["parameters"][parameter] = invalid
+                issue_codes = {item.code.value for item in _validate(candidate).errors}
+                expected_code = (
+                    "UNKNOWN_REFERENCE"
+                    if parameter == "level_feature_id"
+                    else "OUT_OF_RANGE"
+                    if isinstance(invalid, int)
+                    else "INVALID_ENUM"
+                )
+                assert expected_code in issue_codes
+            missing = copy.deepcopy(value)
+            del missing["features"][-1]["parameters"][parameter]
+            assert (f"/features/{len(features) - 1}/parameters/{parameter}", "REQUIRED") in {
+                (item.path, item.code.value) for item in _validate(missing).errors
+            }
+        unknown = copy.deepcopy(value)
+        unknown["features"][-1]["parameters"]["unknown"] = 1
+        assert (f"/features/{len(features) - 1}/parameters/unknown", "UNSUPPORTED_PARAMETER") in {
+            (item.path, item.code.value) for item in _validate(unknown).errors
+        }
 
 
 def test_swing_regime_earliest_numeric_warmup_is_l_plus_two_r_plus_two() -> None:
@@ -1663,27 +1920,42 @@ def test_level_features_include_referenced_rolling_dependency_warmup() -> None:
 
 def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> None:
     value = _fixture()
-    features = value["features"]
-    assert isinstance(features, list)
-    features.append(
+    value["features"] = [
         {
-            "feature_id": "limit-sma-500",
+            "feature_id": "fast",
+            "kind": "indicator",
+            "name": "sma_v1",
+            "output_type": "price",
+            "unit": "contract_price",
+            "interval_seconds": 60,
+            "parameters": {"n": 59, "input": "close"},
+        },
+        {
+            "feature_id": "slow",
             "kind": "indicator",
             "name": "sma_v1",
             "output_type": "price",
             "unit": "contract_price",
             "interval_seconds": 900,
-            "parameters": {"n": 500, "input": "close"},
-        }
-    )
-    value["order_policy"]["entry_type"] = "limit"
-    value["order_policy"]["limit_price_source"] = {
-        "kind": "feature",
-        "feature_id": "limit-sma-500",
-        "offset_ticks": 0,
-    }
-    result = _validate(value)
-    assert result.valid and result.required_warmup_bars == 500
+            "parameters": {"n": 2, "input": "close"},
+        },
+    ]
+    value["nodes"] = [
+        {"kind": "feature", "node_id": "fast-now", "feature_id": "fast", "offset": 0},
+        {"kind": "feature", "node_id": "slow-now", "feature_id": "slow", "offset": 0},
+        {
+            "kind": "temporal_compare",
+            "node_id": "mixed-cross",
+            "op": "crosses_above",
+            "left_feature": "fast-now",
+            "right_feature": "slow-now",
+        },
+    ]
+    value["entry_rules"] = {"long_root": "mixed-cross", "short_root": None}
+    value["exit_rules"] = {"long_root": "mixed-cross", "short_root": None}
+    result = _validate(value, execution_interval_seconds=3600)
+    # max(59*60 + 60, 2*900 + 900) is exactly one 3,600-second execution bar.
+    assert result.valid and result.required_warmup_bars == 1
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:

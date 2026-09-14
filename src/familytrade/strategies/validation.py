@@ -1125,17 +1125,19 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
                 or right_node.kind != "feature"
             ):
                 return 0
-            answer = max(span(node.left_feature), span(node.right_feature)) + max(
-                next(
-                    f.interval_seconds
-                    for f in definition.features
-                    if f.feature_id == left_node.feature_id
-                ),
-                next(
-                    f.interval_seconds
-                    for f in definition.features
-                    if f.feature_id == right_node.feature_id
-                ),
+            left_interval = next(
+                f.interval_seconds
+                for f in definition.features
+                if f.feature_id == left_node.feature_id
+            )
+            right_interval = next(
+                f.interval_seconds
+                for f in definition.features
+                if f.feature_id == right_node.feature_id
+            )
+            answer = max(
+                span(node.left_feature) + left_interval,
+                span(node.right_feature) + right_interval,
             )
         else:
             refs = (
