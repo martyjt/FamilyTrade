@@ -465,6 +465,9 @@ class StrategyRepository:
     ) -> StrategyValidationResult:
         with self.engine.begin() as connection:
             self._mutation_gate(connection, context, idempotency_key)
+            replay = self._replay(connection, context, "strategy.validate", idempotency_key, value)
+            if replay is not None:
+                return StrategyValidationResult(valid=True, strategy_version=replay, errors=())
             try:
                 parsed = StrategyDraftValidateInput.model_validate(value)
             except ValidationError as error:
@@ -539,13 +542,23 @@ class StrategyRepository:
                 .mappings()
                 .one()
             )
-            return StrategyValidationResult(
+            result = StrategyValidationResult(
                 valid=True,
                 strategy_version=StrategyVersion.model_validate(
                     {key: value for key, value in dict(updated).items() if key != "updated_at"}
                 ),
                 errors=(),
             )
+            assert result.strategy_version is not None
+            self._save_replay(
+                connection,
+                context,
+                "strategy.validate",
+                idempotency_key,
+                value,
+                result.strategy_version,
+            )
+            return result
 
     def get_version(self, context: UserContext, strategy_version_id: str) -> StrategyVersion:
         with self.engine.connect() as connection:
