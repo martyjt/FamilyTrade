@@ -671,10 +671,17 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                     elif known[1] == ("decimal", "scalar") and known[0][0] != "integer":
                         derived = known[0]
             if derived is None:
+                code = (
+                    ValidationIssueCode.UNIT_MISMATCH
+                    if node.op == "multiply"
+                    and len(known) == 2
+                    and sum(item != ("decimal", "scalar") for item in known) > 1
+                    else ValidationIssueCode.TYPE_MISMATCH
+                )
                 issues.append(
                     _issue(
                         f"/nodes/{index}/args",
-                        ValidationIssueCode.TYPE_MISMATCH,
+                        code,
                         "Arithmetic operands are incompatible.",
                     )
                 )
