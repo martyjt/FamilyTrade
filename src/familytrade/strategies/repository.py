@@ -270,6 +270,8 @@ class StrategyRepository:
                     if kind == "missing"
                     else "OUT_OF_RANGE"
                     if kind in {"greater_than_equal", "less_than_equal", "string_pattern_mismatch"}
+                    else "INVALID_ENUM"
+                    if "literal" in kind or "enum" in kind
                     else "INVALID_TYPE"
                 )
                 normalized.append(
