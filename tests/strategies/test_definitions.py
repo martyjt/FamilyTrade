@@ -1514,6 +1514,7 @@ def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
 
 def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -> None:
     value = _fixture()
+    assert _validate(value).valid and _validate(value).required_warmup_bars == 6
     nodes = value["nodes"]
     assert isinstance(nodes, list)
     nodes[0]["offset"] = 1
