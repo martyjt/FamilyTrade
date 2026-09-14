@@ -668,7 +668,9 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                                 f"/nodes/{index}/tolerance",
                                 ValidationIssueCode.UNKNOWN_REFERENCE
                                 if node.tolerance not in nodes
-                                else ValidationIssueCode.TYPE_MISMATCH,
+                                else ValidationIssueCode.TYPE_MISMATCH
+                                if tolerance_signature is None or left[0] != tolerance_signature[0]
+                                else ValidationIssueCode.UNIT_MISMATCH,
                                 "Tolerance must match the compared numeric pair.",
                             )
                         )
@@ -678,7 +680,20 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                     if (
                         tolerance_node is not None
                         and tolerance_node.kind == "constant"
+                        and not _decimal(tolerance_node.value)
+                    ):
+                        issues.append(
+                            _issue(
+                                f"/nodes/{index}/tolerance",
+                                ValidationIssueCode.INVALID_DECIMAL,
+                                "Tolerance constant must be a decimal.",
+                            )
+                        )
+                    if (
+                        tolerance_node is not None
+                        and tolerance_node.kind == "constant"
                         and tolerance_signature is not None
+                        and _decimal(tolerance_node.value)
                         and Decimal(str(tolerance_node.value)) < 0
                     ):
                         issues.append(

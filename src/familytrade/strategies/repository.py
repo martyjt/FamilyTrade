@@ -517,6 +517,10 @@ class StrategyRepository:
     ) -> StrategyVersion:
         value = self._normalize_names(value)
         create_kind = value.get("kind")
+        if "kind" not in value:
+            raise self._validation(
+                [{"path": "/kind", "code": "REQUIRED", "message": "Create kind is required."}]
+            )
         if create_kind not in {"definition", "source_version"}:
             raise self._validation(
                 [{"path": "/kind", "code": "INVALID_ENUM", "message": "Create kind is invalid."}]
