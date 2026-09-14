@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import uuid7
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 
 from familytrade.access.credentials import EnvelopeCipher
@@ -13,7 +13,11 @@ from familytrade.access.models import AccessError, ErrorCode
 from familytrade.access.repository import AccessRepository, access_metadata
 from familytrade.access.service import AccessService
 from familytrade.strategies.presets import get_preset
-from familytrade.strategies.repository import StrategyRepository, strategy_metadata
+from familytrade.strategies.repository import (
+    StrategyRepository,
+    strategy_idempotency_records,
+    strategy_metadata,
+)
 from familytrade.strategies.validation import (
     canonical_definition_bytes,
     canonical_definition_sha256,
@@ -515,7 +519,16 @@ def test_same_idempotency_key_different_raw_request_is_idempotency_conflict(
 ) -> None:
     repository, context, _ = strategy_repository
     definition = _fixture()
-    value = {"kind": "definition", "schema_version": "v1", "name": definition["name"], "definition_schema_version": "rule-strategy-v1", "definition": definition, "catalogue_version": "feature-catalogue-v1", "execution_interval_seconds": 900, "fill_interval_seconds": 60}
+    value = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
     key = str(uuid7())
     repository.create_draft(context, value, idempotency_key=key)
     changed = copy.deepcopy(value)
@@ -523,3 +536,84 @@ def test_same_idempotency_key_different_raw_request_is_idempotency_conflict(
     with pytest.raises(AccessError) as error:
         repository.create_draft(context, changed, idempotency_key=key)
     assert error.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+
+def test_same_idempotency_key_same_request_replays_original_success_and_failure(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    definition = _fixture()
+    request = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    success_key = str(uuid7())
+    first = repository.create_draft(context, request, idempotency_key=success_key)
+    replay = repository.create_draft(context, request, idempotency_key=success_key)
+    assert replay.strategy_version_id == first.strategy_version_id
+
+    failure_key = str(uuid7())
+    with pytest.raises(AccessError) as first_failure:
+        repository.create_draft(context, {}, idempotency_key=failure_key)
+    with pytest.raises(AccessError) as replay_failure:
+        repository.create_draft(context, {}, idempotency_key=failure_key)
+    assert first_failure.value.code is ErrorCode.VALIDATION_ERROR
+    assert replay_failure.value.code is first_failure.value.code
+    assert replay_failure.value.details == first_failure.value.details
+
+
+def test_safe_error_rolls_back_savepoint_then_commits_replayable_error(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    definition = _fixture()
+    create = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    source = repository.create_draft(context, create, idempotency_key=str(uuid7()))
+    edit = {
+        "schema_version": "v1",
+        "draft_id": source.strategy_version_id,
+        "expected_version": 1,
+        "name": "Different operation name",
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    key = str(uuid7())
+    with pytest.raises(AccessError) as first_failure:
+        repository.edit_draft(context, edit, idempotency_key=key)
+    with pytest.raises(AccessError) as replay_failure:
+        repository.edit_draft(context, edit, idempotency_key=key)
+    assert first_failure.value.code is ErrorCode.VALIDATION_ERROR
+    assert replay_failure.value.details == first_failure.value.details
+    assert repository.get_version(context, source.strategy_version_id).record_version == 1
+    with engine.connect() as connection:
+        record = (
+            connection.execute(
+                select(strategy_idempotency_records).where(
+                    strategy_idempotency_records.c.owner_user_id == context.user_id,
+                    strategy_idempotency_records.c.operation == "strategy.edit",
+                    strategy_idempotency_records.c.idempotency_key == key,
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert record["result"] is None
+    assert record["error"]["code"] == ErrorCode.VALIDATION_ERROR.value

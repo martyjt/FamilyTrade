@@ -8,7 +8,7 @@ import json
 from collections.abc import Mapping
 from datetime import datetime
 from typing import cast
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 from pydantic import ValidationError
 from sqlalchemy import (
@@ -150,7 +150,7 @@ strategy_idempotency_records = Table(
     ),
     CheckConstraint("(result IS NULL) <> (error IS NULL)", name="ck_strategy_idempotency_outcome"),
     CheckConstraint(
-        "idempotency_key ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'",
+        "idempotency_key ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'",
         name="ck_strategy_idempotency_key_uuid7",
     ),
     CheckConstraint(
@@ -177,14 +177,54 @@ class StrategyRepository:
                 403,
             )
 
-    def _mutation_gate(self, connection: Connection, context: UserContext, key: str) -> None:
-        """Serialize a caller/key outcome without taking a second pool connection."""
-        connection.execute(
-            select(
-                func.pg_advisory_xact_lock(func.hashtextextended(context.user_id + ":" + key, 0))
-            )
-        )
+    def _mutation_gate(
+        self,
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        idempotency_key: str,
+        value: dict[str, object],
+    ) -> tuple[str, str]:
+        """Authorize and serialize one caller/operation/key outcome on this connection."""
         self._authorise(connection, context, "strategy:write")
+        key = self._normalize_idempotency_key(idempotency_key)
+        digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
+        lock_key = int.from_bytes(
+            hashlib.sha256(
+                json.dumps(
+                    [context.user_id, operation, key],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).digest()[:8],
+            byteorder="big",
+            signed=True,
+        )
+        connection.execute(select(func.pg_advisory_xact_lock(lock_key)))
+        self._authorise(connection, context, "strategy:write")
+        return key, digest
+
+    @staticmethod
+    def _normalize_idempotency_key(value: str) -> str:
+        try:
+            return str(UUID(value))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise AccessError(
+                ErrorCode.VALIDATION_ERROR,
+                "idempotency_key must be a UUID.",
+                422,
+                details={"path": "/idempotency_key"},
+            ) from error
+
+    @staticmethod
+    def _is_safe_operation_error(error: AccessError) -> bool:
+        return error.code in {
+            ErrorCode.VALIDATION_ERROR,
+            ErrorCode.NOT_FOUND,
+            ErrorCode.CONFLICT,
+            ErrorCode.STALE_VERSION,
+        }
 
     @staticmethod
     def _validation(errors: object = ()) -> AccessError:
@@ -257,9 +297,8 @@ class StrategyRepository:
         context: UserContext,
         operation: str,
         key: str,
-        value: dict[str, object],
-    ) -> StrategyVersion | None:
-        digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
+        digest: str,
+    ) -> StrategyVersion | AccessError | None:
         row = (
             connection.execute(
                 select(strategy_idempotency_records)
@@ -285,8 +324,16 @@ class StrategyRepository:
             )
         if row["result"] is not None:
             return StrategyVersion.model_validate_json(json.dumps(row["result"]))
-        raise AccessError(
-            ErrorCode(row["error"]["code"]), row["error"]["message"], row["error"]["http_status"]
+        return self._error_from_record(cast(dict[str, object], row["error"]))
+
+    @staticmethod
+    def _error_from_record(record: dict[str, object]) -> AccessError:
+        return AccessError(
+            ErrorCode(cast(str, record["code"])),
+            cast(str, record["message"]),
+            cast(int, record["http_status"]),
+            retryable=cast(bool, record["retryable"]),
+            details=cast(dict[str, object], record["details"]),
         )
 
     def _save_replay(
@@ -295,7 +342,7 @@ class StrategyRepository:
         context: UserContext,
         operation: str,
         key: str,
-        value: dict[str, object],
+        digest: str,
         result: StrategyVersion,
     ) -> None:
         connection.execute(
@@ -303,7 +350,7 @@ class StrategyRepository:
                 owner_user_id=context.user_id,
                 operation=operation,
                 idempotency_key=key,
-                request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
+                request_sha256=digest,
                 result=result.model_dump(mode="json"),
                 error=null(),
                 created_at=func.clock_timestamp(),
@@ -316,72 +363,103 @@ class StrategyRepository:
         context: UserContext,
         operation: str,
         key: str,
-        value: dict[str, object],
+        digest: str,
         error: AccessError,
-    ) -> None:
-        connection.execute(
-            insert(strategy_idempotency_records).values(
-                owner_user_id=context.user_id,
-                operation=operation,
-                idempotency_key=key,
-                request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
-                result=null(),
-                error={
+    ) -> AccessError:
+        record: dict[str, object] = json.loads(
+            json.dumps(
+                {
                     "code": error.code.value,
                     "message": error.message,
                     "http_status": error.http_status,
                     "retryable": error.retryable,
                     "details": error.details,
-                },
+                }
+            )
+        )
+        connection.execute(
+            insert(strategy_idempotency_records).values(
+                owner_user_id=context.user_id,
+                operation=operation,
+                idempotency_key=key,
+                request_sha256=digest,
+                result=null(),
+                error=record,
                 created_at=func.clock_timestamp(),
             )
         )
+        return self._error_from_record(record)
 
     def create_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
+        result: StrategyVersion | None = None
+        public_error: AccessError | None = None
         with self.engine.begin() as connection:
-            self._mutation_gate(connection, context, idempotency_key)
-            replay = self._replay(connection, context, "strategy.create", idempotency_key, value)
-            if replay is not None:
-                return replay
-            try:
-                parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
-            except ValidationError as error:
+            key, digest = self._mutation_gate(
+                connection, context, "strategy.create", idempotency_key, value
+            )
+            replay = self._replay(connection, context, "strategy.create", key, digest)
+            if isinstance(replay, AccessError):
+                public_error = replay
+            elif replay is not None:
+                result = replay
+            else:
+                savepoint = connection.begin_nested()
                 try:
-                    source_input = StrategyDraftFromVersionInput.model_validate(value)
-                except ValidationError:
-                    safe = self._validation()
-                    self._save_safe_error(
-                        connection, context, "strategy.create", idempotency_key, value, safe
+                    result = self._create_draft(connection, context, value)
+                except AccessError as error:
+                    if not self._is_safe_operation_error(error):
+                        raise
+                    savepoint.rollback()
+                    public_error = self._save_safe_error(
+                        connection, context, "strategy.create", key, digest, error
                     )
-                    raise safe from error
-                source = (
-                    connection.execute(
-                        select(strategy_versions).where(
-                            and_(
-                                strategy_versions.c.owner_user_id == context.user_id,
-                                strategy_versions.c.strategy_version_id
-                                == source_input.source_version_id,
-                            )
+                else:
+                    savepoint.commit()
+                    self._save_replay(connection, context, "strategy.create", key, digest, result)
+        if public_error is not None:
+            raise public_error
+        assert result is not None
+        return result
+
+    def _create_draft(
+        self, connection: Connection, context: UserContext, value: dict[str, object]
+    ) -> StrategyVersion:
+        try:
+            parsed = StrategyDraftFromDefinitionInput.model_validate(_as_model_input(value))
+        except ValidationError:
+            try:
+                source_input = StrategyDraftFromVersionInput.model_validate(value)
+            except ValidationError as error:
+                raise self._validation() from error
+            source = (
+                connection.execute(
+                    select(strategy_versions).where(
+                        and_(
+                            strategy_versions.c.owner_user_id == context.user_id,
+                            strategy_versions.c.strategy_version_id
+                            == source_input.source_version_id,
                         )
                     )
-                    .mappings()
-                    .one_or_none()
                 )
-                if source is None:
-                    raise not_found()
-                if source["status"] != "validated":
-                    raise AccessError(
-                        ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
-                    )
-                stored = StrategyVersion.model_validate(
-                    _as_model_input(
-                        {key: item for key, item in dict(source).items() if key != "updated_at"}
-                    )
+                .mappings()
+                .one_or_none()
+            )
+            if source is None:
+                raise not_found()
+            if source["status"] != "validated":
+                raise AccessError(
+                    ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
                 )
-                parsed = StrategyDraftFromDefinitionInput.model_validate(
-                    _as_model_input({
+            stored = StrategyVersion.model_validate(
+                _as_model_input(
+                    {key: item for key, item in dict(source).items() if key != "updated_at"}
+                )
+            )
+            parsed = StrategyDraftFromDefinitionInput.model_validate(
+                _as_model_input(
+                    {
                         "kind": "definition",
                         "schema_version": "v1",
                         "name": source_input.name,
@@ -393,125 +471,173 @@ class StrategyRepository:
                         "catalogue_version": stored.catalogue_version,
                         "execution_interval_seconds": stored.execution_interval_seconds,
                         "fill_interval_seconds": stored.fill_interval_seconds,
-                    })
+                    }
                 )
-                result = self._insert(connection, context, parsed, source_input.source_version_id)
-                self._save_replay(
-                    connection, context, "strategy.create", idempotency_key, value, result
-                )
-                return result
-            if parsed.name != parsed.definition.name:
-                raise self._validation(
-                    [
-                        {
-                            "path": "/definition/name",
-                            "code": "NAME_MISMATCH",
-                            "message": "Name must match definition.name.",
-                        }
-                    ]
-                )
-            result = self._insert(connection, context, parsed, None)
-            self._save_replay(
-                connection, context, "strategy.create", idempotency_key, value, result
             )
-            return result
+            return self._insert(connection, context, parsed, source_input.source_version_id)
+        if parsed.name != parsed.definition.name:
+            raise self._validation(
+                [
+                    {
+                        "path": "/definition/name",
+                        "code": "NAME_MISMATCH",
+                        "message": "Name must match definition.name.",
+                    }
+                ]
+            )
+        return self._insert(connection, context, parsed, None)
 
     def edit_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
+        result: StrategyVersion | None = None
+        public_error: AccessError | None = None
         with self.engine.begin() as connection:
-            self._mutation_gate(connection, context, idempotency_key)
-            replay = self._replay(connection, context, "strategy.edit", idempotency_key, value)
-            if replay is not None:
-                return replay
-            try:
-                parsed = StrategyDraftEditInput.model_validate(_as_model_input(value))
-            except ValidationError as error:
-                safe = self._validation()
-                self._save_safe_error(
-                    connection, context, "strategy.edit", idempotency_key, value, safe
-                )
-                raise safe from error
-            source = (
-                connection.execute(
-                    select(strategy_versions)
-                    .where(
-                        and_(
-                            strategy_versions.c.owner_user_id == context.user_id,
-                            strategy_versions.c.strategy_version_id == parsed.draft_id,
-                        )
-                    )
-                    .with_for_update()
-                )
-                .mappings()
-                .one_or_none()
+            key, digest = self._mutation_gate(
+                connection, context, "strategy.edit", idempotency_key, value
             )
-            if source is None:
-                raise not_found()
-            if source["record_version"] != parsed.expected_version:
-                raise stale_version(parsed.expected_version, cast(int, source["record_version"]))
-            if source["status"] != "draft":
-                raise AccessError(ErrorCode.CONFLICT, "Only draft versions may be edited.", 409)
-            if parsed.name != parsed.definition.name:
-                raise self._validation(
-                    [
-                        {
-                            "path": "/definition/name",
-                            "code": "NAME_MISMATCH",
-                            "message": "Name must match definition.name.",
-                        }
-                    ]
+            replay = self._replay(connection, context, "strategy.edit", key, digest)
+            if isinstance(replay, AccessError):
+                public_error = replay
+            elif replay is not None:
+                result = replay
+            else:
+                savepoint = connection.begin_nested()
+                try:
+                    result = self._edit_draft(connection, context, value)
+                except AccessError as error:
+                    if not self._is_safe_operation_error(error):
+                        raise
+                    savepoint.rollback()
+                    public_error = self._save_safe_error(
+                        connection, context, "strategy.edit", key, digest, error
+                    )
+                else:
+                    savepoint.commit()
+                    self._save_replay(connection, context, "strategy.edit", key, digest, result)
+        if public_error is not None:
+            raise public_error
+        assert result is not None
+        return result
+
+    def _edit_draft(
+        self, connection: Connection, context: UserContext, value: dict[str, object]
+    ) -> StrategyVersion:
+        try:
+            parsed = StrategyDraftEditInput.model_validate(_as_model_input(value))
+        except ValidationError as error:
+            raise self._validation() from error
+        source = (
+            connection.execute(
+                select(strategy_versions)
+                .where(
+                    and_(
+                        strategy_versions.c.owner_user_id == context.user_id,
+                        strategy_versions.c.strategy_version_id == parsed.draft_id,
+                    )
                 )
-            result = self._insert(connection, context, parsed, parsed.draft_id)
-            self._save_replay(connection, context, "strategy.edit", idempotency_key, value, result)
-            return result
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        self._authorise(connection, context, "strategy:write")
+        if source is None:
+            raise not_found()
+        if source["record_version"] != parsed.expected_version:
+            raise stale_version(parsed.expected_version, cast(int, source["record_version"]))
+        if source["status"] != "draft":
+            raise AccessError(ErrorCode.CONFLICT, "Only draft versions may be edited.", 409)
+        if parsed.name != parsed.definition.name:
+            raise self._validation(
+                [
+                    {
+                        "path": "/definition/name",
+                        "code": "NAME_MISMATCH",
+                        "message": "Name must match definition.name.",
+                    }
+                ]
+            )
+        return self._insert(connection, context, parsed, parsed.draft_id)
 
     def validate_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyValidationResult:
+        result: StrategyValidationResult | None = None
+        public_error: AccessError | None = None
         with self.engine.begin() as connection:
-            self._mutation_gate(connection, context, idempotency_key)
-            replay = self._replay(connection, context, "strategy.validate", idempotency_key, value)
-            if replay is not None:
-                return StrategyValidationResult(valid=True, strategy_version=replay, errors=())
-            try:
-                parsed = StrategyDraftValidateInput.model_validate(value)
-            except ValidationError as error:
-                safe = self._validation()
-                self._save_safe_error(
-                    connection, context, "strategy.validate", idempotency_key, value, safe
-                )
-                raise safe from error
-            row = (
-                connection.execute(
-                    select(strategy_versions)
-                    .where(
-                        and_(
-                            strategy_versions.c.owner_user_id == context.user_id,
-                            strategy_versions.c.strategy_version_id == parsed.draft_id,
-                        )
+            key, digest = self._mutation_gate(
+                connection, context, "strategy.validate", idempotency_key, value
+            )
+            replay = self._replay(connection, context, "strategy.validate", key, digest)
+            if isinstance(replay, AccessError):
+                public_error = replay
+            elif replay is not None:
+                result = StrategyValidationResult(valid=True, strategy_version=replay, errors=())
+            else:
+                savepoint = connection.begin_nested()
+                try:
+                    result = self._validate_draft(connection, context, value)
+                except AccessError as error:
+                    if not self._is_safe_operation_error(error):
+                        raise
+                    savepoint.rollback()
+                    public_error = self._save_safe_error(
+                        connection, context, "strategy.validate", key, digest, error
                     )
-                    .with_for_update()
+                else:
+                    savepoint.commit()
+                    assert result.strategy_version is not None
+                    self._save_replay(
+                        connection,
+                        context,
+                        "strategy.validate",
+                        key,
+                        digest,
+                        result.strategy_version,
+                    )
+        if public_error is not None:
+            raise public_error
+        assert result is not None
+        return result
+
+    def _validate_draft(
+        self, connection: Connection, context: UserContext, value: dict[str, object]
+    ) -> StrategyValidationResult:
+        try:
+            parsed = StrategyDraftValidateInput.model_validate(value)
+        except ValidationError as error:
+            raise self._validation() from error
+        row = (
+            connection.execute(
+                select(strategy_versions)
+                .where(
+                    and_(
+                        strategy_versions.c.owner_user_id == context.user_id,
+                        strategy_versions.c.strategy_version_id == parsed.draft_id,
+                    )
                 )
-                .mappings()
-                .one_or_none()
+                .with_for_update()
             )
-            if row is None:
-                raise not_found()
-            if row["record_version"] != parsed.expected_version:
-                raise stale_version(parsed.expected_version, cast(int, row["record_version"]))
-            if row["status"] != "draft":
-                raise AccessError(ErrorCode.CONFLICT, "Draft is already validated.", 409)
-            stored = StrategyVersion.model_validate(
+            .mappings()
+            .one_or_none()
+        )
+        self._authorise(connection, context, "strategy:write")
+        if row is None:
+            raise not_found()
+        if row["record_version"] != parsed.expected_version:
+            raise stale_version(parsed.expected_version, cast(int, row["record_version"]))
+        if row["status"] != "draft":
+            raise AccessError(ErrorCode.CONFLICT, "Draft is already validated.", 409)
+        stored = StrategyVersion.model_validate(
+            _as_model_input({key: item for key, item in dict(row).items() if key != "updated_at"})
+        )
+        checked = self._check(
+            connection,
+            context,
+            StrategyDraftEditInput.model_validate(
                 _as_model_input(
-                    {key: value for key, value in dict(row).items() if key != "updated_at"}
-                )
-            )
-            checked = self._check(
-                connection,
-                context,
-                StrategyDraftEditInput.model_validate(
-                    _as_model_input({
+                    {
                         "schema_version": "v1",
                         "draft_id": stored.strategy_version_id,
                         "expected_version": 1,
@@ -521,54 +647,42 @@ class StrategyRepository:
                         "catalogue_version": stored.catalogue_version,
                         "execution_interval_seconds": stored.execution_interval_seconds,
                         "fill_interval_seconds": stored.fill_interval_seconds,
-                    })
-                ),
-            )
-            if not checked.valid:
-                return StrategyValidationResult(
-                    valid=False, strategy_version=None, errors=checked.errors
+                    }
                 )
+            ),
+        )
+        assert checked.valid
+        connection.execute(
+            update(strategy_versions)
+            .where(
+                and_(
+                    strategy_versions.c.owner_user_id == context.user_id,
+                    strategy_versions.c.strategy_version_id == parsed.draft_id,
+                )
+            )
+            .values(status="validated", record_version=2, updated_at=func.clock_timestamp())
+        )
+        updated = (
             connection.execute(
-                update(strategy_versions)
-                .where(
+                select(strategy_versions).where(
                     and_(
                         strategy_versions.c.owner_user_id == context.user_id,
                         strategy_versions.c.strategy_version_id == parsed.draft_id,
                     )
                 )
-                .values(status="validated", record_version=2, updated_at=func.clock_timestamp())
             )
-            updated = (
-                connection.execute(
-                    select(strategy_versions).where(
-                        and_(
-                            strategy_versions.c.owner_user_id == context.user_id,
-                            strategy_versions.c.strategy_version_id == parsed.draft_id,
-                        )
-                    )
+            .mappings()
+            .one()
+        )
+        return StrategyValidationResult(
+            valid=True,
+            strategy_version=StrategyVersion.model_validate(
+                _as_model_input(
+                    {key: item for key, item in dict(updated).items() if key != "updated_at"}
                 )
-                .mappings()
-                .one()
-            )
-            result = StrategyValidationResult(
-                valid=True,
-                strategy_version=StrategyVersion.model_validate(
-                    _as_model_input(
-                        {key: value for key, value in dict(updated).items() if key != "updated_at"}
-                    )
-                ),
-                errors=(),
-            )
-            assert result.strategy_version is not None
-            self._save_replay(
-                connection,
-                context,
-                "strategy.validate",
-                idempotency_key,
-                value,
-                result.strategy_version,
-            )
-            return result
+            ),
+            errors=(),
+        )
 
     def get_version(self, context: UserContext, strategy_version_id: str) -> StrategyVersion:
         with self.engine.connect() as connection:
