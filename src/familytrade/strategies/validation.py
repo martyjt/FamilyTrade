@@ -293,23 +293,28 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                 if kind.endswith("_type")
                 else ValidationIssueCode.OUT_OF_RANGE
             )
+            raw_loc = tuple(error["loc"])
+            wrappers = {
+                "feature",
+                "constant",
+                "arithmetic",
+                "compare",
+                "temporal_compare",
+                "group",
+                "one_position_v1",
+                "confirmed_pivot_zones_v1",
+                "reversal_setup_v1",
+                "breakout_retest_v1",
+            }
             loc = tuple(
                 part
-                for part in error["loc"]
-                if not isinstance(part, str)
-                or part
-                not in {
-                    "feature",
-                    "constant",
-                    "arithmetic",
-                    "compare",
-                    "temporal_compare",
-                    "group",
-                    "one_position_v1",
-                    "confirmed_pivot_zones_v1",
-                    "reversal_setup_v1",
-                    "breakout_retest_v1",
-                }
+                for index, part in enumerate(raw_loc)
+                if not (
+                    part in wrappers
+                    and index >= 2
+                    and isinstance(raw_loc[index - 1], int)
+                    and raw_loc[index - 2] in {"nodes", "setup_modules"}
+                )
             )
             result.append(_issue(_pointer(loc), code, "Invalid strategy definition field."))
         return result

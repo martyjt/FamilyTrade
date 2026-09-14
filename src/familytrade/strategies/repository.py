@@ -260,22 +260,28 @@ class StrategyRepository:
         if isinstance(errors, ValidationError):
             normalized: list[dict[str, str]] = []
             for item in errors.errors(include_input=False):
+                raw_loc = tuple(item["loc"])
+                wrappers = {
+                    "feature",
+                    "constant",
+                    "arithmetic",
+                    "compare",
+                    "temporal_compare",
+                    "group",
+                    "one_position_v1",
+                    "confirmed_pivot_zones_v1",
+                    "reversal_setup_v1",
+                    "breakout_retest_v1",
+                }
                 loc = tuple(
                     part
-                    for part in item["loc"]
-                    if part
-                    not in {
-                        "feature",
-                        "constant",
-                        "arithmetic",
-                        "compare",
-                        "temporal_compare",
-                        "group",
-                        "one_position_v1",
-                        "confirmed_pivot_zones_v1",
-                        "reversal_setup_v1",
-                        "breakout_retest_v1",
-                    }
+                    for index, part in enumerate(raw_loc)
+                    if not (
+                        part in wrappers
+                        and index >= 2
+                        and isinstance(raw_loc[index - 1], int)
+                        and raw_loc[index - 2] in {"nodes", "setup_modules"}
+                    )
                 )
                 if loc[:1] == ("definition",):
                     loc = loc[1:]
@@ -297,7 +303,12 @@ class StrategyRepository:
                 normalized.append(
                     {"path": path, "code": code, "message": "Invalid operation input."}
                 )
-            errors = normalized
+            nonfinite_paths = {item["path"] for item in normalized if item["code"] == "NONFINITE"}
+            errors = [
+                item
+                for item in normalized
+                if item["code"] != "INVALID_TYPE" or item["path"] not in nonfinite_paths
+            ]
         return AccessError(
             ErrorCode.VALIDATION_ERROR,
             "Invalid strategy definition.",
