@@ -309,6 +309,8 @@ class StrategyRepository:
                     if kind == "missing"
                     else "OUT_OF_RANGE"
                     if kind in {"greater_than_equal", "less_than_equal", "string_pattern_mismatch"}
+                    else "REQUIRED"
+                    if "tag_not_found" in kind
                     else "INVALID_ENUM"
                     if "literal" in kind or "enum" in kind or "tag" in kind
                     else "NONFINITE"
