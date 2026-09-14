@@ -1322,6 +1322,31 @@ def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_incl
         if not expected:
             assert ("/nodes/7", "SIZE_LIMIT") in {(i.path, i.code.value) for i in result.errors}
 
+    for offset, expected in ((1997, True), (1998, False)):
+        value = _fixture()
+        nodes = value["nodes"]
+        nodes.extend(
+            [
+                {"kind": "feature", "node_id": "fast-look", "feature_id": "fast", "offset": offset},
+                {"kind": "feature", "node_id": "slow-look", "feature_id": "slow", "offset": 0},
+                {
+                    "kind": "compare",
+                    "node_id": "look",
+                    "op": "lt",
+                    "left": "fast-look",
+                    "right": "slow-look",
+                    "tolerance": None,
+                },
+            ]
+        )
+        value["entry_rules"]["long_root"] = "look"
+        result = _validate(value)
+        assert result.valid is expected
+        if not expected:
+            assert [(issue.path, issue.code.value) for issue in result.errors] == [
+                ("/", "LOOKBACK_LIMIT")
+            ]
+
 
 def test_type_unit_operator_matrix_is_exhaustive() -> None:
     value = _fixture()
