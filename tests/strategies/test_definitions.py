@@ -510,6 +510,21 @@ def test_entry_window_rejects_break_closure_and_unrepresented_segment() -> None:
 
 
 def test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive() -> None:
+    valid = _fixture()
+    valid["nodes"].extend(
+        [
+            {"kind": "constant", "node_id": "d", "value_type": "decimal", "unit": "scalar", "value": "2"},
+            {"kind": "constant", "node_id": "p", "value_type": "price", "unit": "contract_price", "value": "2"},
+            {"kind": "constant", "node_id": "v", "value_type": "volume", "unit": "contract_volume", "value": "2"},
+            {"kind": "constant", "node_id": "l", "value_type": "level", "unit": "contract_price", "value": "2"},
+            {"kind": "constant", "node_id": "i", "value_type": "integer", "unit": "count", "value": 2},
+            {"kind": "constant", "node_id": "b", "value_type": "boolean", "unit": "boolean", "value": True},
+            {"kind": "constant", "node_id": "t", "value_type": "timestamp", "unit": "utc_timestamp", "value": "2026-09-15T00:00:00Z"},
+            {"kind": "constant", "node_id": "s", "value_type": "side", "unit": "side", "value": "long"},
+                {"kind": "constant", "node_id": "r", "value_type": "regime", "unit": "regime", "value": "bullish"},
+        ]
+    )
+    assert _validate(valid).valid
     value = _fixture()
     nodes = value["nodes"]
     assert isinstance(nodes, list)
