@@ -381,7 +381,7 @@ class StrategyRepository:
                     )
                 )
                 parsed = StrategyDraftFromDefinitionInput.model_validate(
-                    {
+                    _as_model_input({
                         "kind": "definition",
                         "schema_version": "v1",
                         "name": source_input.name,
@@ -393,7 +393,7 @@ class StrategyRepository:
                         "catalogue_version": stored.catalogue_version,
                         "execution_interval_seconds": stored.execution_interval_seconds,
                         "fill_interval_seconds": stored.fill_interval_seconds,
-                    }
+                    })
                 )
                 result = self._insert(connection, context, parsed, source_input.source_version_id)
                 self._save_replay(
