@@ -898,6 +898,20 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
         for root in (pair.long_root, pair.short_root)
         if root in nodes
     ]
+    for module in definition.setup_modules:
+        for field in ("filter_root", "arm_filter_root", "entry_filter_root"):
+            root = getattr(module, field, None)
+            if root in nodes:
+                roots.append(root)
+    for source in (
+        definition.order_policy.limit_price_source,
+        definition.exit_policy.stop,
+    ):
+        feature_id = getattr(source, "feature_id", None)
+        if feature_id is not None:
+            for node in definition.nodes:
+                if node.kind == "feature" and node.feature_id == feature_id:
+                    roots.append(node.node_id)
     return max((math.ceil(span(root) / execution_interval_seconds) for root in roots), default=0)
 
 
