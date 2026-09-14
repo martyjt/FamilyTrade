@@ -6230,6 +6230,186 @@ def test_continuous_heartbeat_waits_for_blocked_renewal_and_never_updates_after_
     assert after == before
 
 
+def test_renewal_row_lock_timeout_is_typed_and_stops_without_later_mutation(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    _, bar, key, parent, _, series_id = _parent_with_pending_correction(
+        catalog, context, archive_store
+    )
+    publisher = DatasetPublisher(
+        catalog,
+        archive_store,
+        worker_id=str(uuid7()),
+        renew_seconds=1,
+    )
+    publication_key = str(uuid7())
+
+    def crash_before_write(point: str) -> None:
+        if point == "before_temp_create":
+            raise RuntimeError("leave renewable admission")
+
+    monkeypatch.setattr(publisher, "_inject", crash_before_write)
+    with pytest.raises(RuntimeError, match="leave renewable admission"):
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar.start_at,
+                coverage_end=bar.end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=publication_key,
+        )
+    monkeypatch.setattr(publisher, "_inject", lambda _point: None)
+
+    def snapshot() -> tuple[object, ...]:
+        with catalog.engine.begin() as connection:
+            root = connection.execute(
+                select(idempotency.c.lease_expires_at, idempotency.c.updated_at).where(
+                    and_(
+                        idempotency.c.owner_user_id == context.user_id,
+                        idempotency.c.operation == "dataset.publish",
+                        idempotency.c.idempotency_key == publication_key,
+                    )
+                )
+            ).one()
+            fence = connection.execute(
+                select(series_fences.c.lease_expires_at).where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == series_id,
+                    )
+                )
+            ).scalar_one()
+            journal = connection.execute(
+                select(prestage_writes.c.lease_expires_at).where(
+                    and_(
+                        prestage_writes.c.owner_user_id == context.user_id,
+                        prestage_writes.c.idempotency_key == publication_key,
+                    )
+                )
+            ).scalar_one()
+            publication_count = connection.execute(
+                select(func.count())
+                .select_from(publications)
+                .where(publications.c.idempotency_key == publication_key)
+            ).scalar_one()
+        return (*root, fence, journal, publication_count)
+
+    with catalog.engine.begin() as connection:
+        fencing_token = connection.execute(
+            select(series_fences.c.fencing_token).where(
+                and_(
+                    series_fences.c.owner_user_id == context.user_id,
+                    series_fences.c.series_id == series_id,
+                )
+            )
+        ).scalar_one()
+    before = snapshot()
+    filesystem_mutations: list[str] = []
+    original_replace = os.replace
+    original_chmod = Path.chmod
+    original_fsync = archive_store._fsync_directory
+
+    def observe_replace(source, destination) -> None:
+        filesystem_mutations.append("replace")
+        original_replace(source, destination)
+
+    def observe_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        filesystem_mutations.append("chmod")
+        original_chmod(path, mode, *args, **kwargs)
+
+    def observe_directory_fsync(directory: Path) -> None:
+        filesystem_mutations.append("directory-fsync")
+        original_fsync(directory)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    monkeypatch.setattr(Path, "chmod", observe_chmod)
+    monkeypatch.setattr(archive_store, "_fsync_directory", observe_directory_fsync)
+
+    blocker = catalog.engine.connect()
+    blocker_transaction = blocker.begin()
+    try:
+        blocker.execute(
+            select(idempotency)
+            .where(
+                and_(
+                    idempotency.c.owner_user_id == context.user_id,
+                    idempotency.c.operation == "dataset.publish",
+                    idempotency.c.idempotency_key == publication_key,
+                )
+            )
+            .with_for_update()
+        ).one()
+        direct_started = time.monotonic()
+        with pytest.raises(MarketDataError) as direct:
+            publisher._renew_lease(
+                context.user_id,
+                series_id,
+                "dataset.publish",
+                publication_key,
+                fencing_token,
+            )
+        assert time.monotonic() - direct_started >= 1.8
+        assert direct.value.envelope(context.request_id) == {
+            "schema_version": "v1",
+            "request_id": context.request_id,
+            "error": {
+                "code": "CONFLICT",
+                "message": "The publication lease could not be renewed.",
+                "retryable": True,
+                "details": {},
+            },
+        }
+    finally:
+        blocker_transaction.rollback()
+        blocker.close()
+
+    blocker = catalog.engine.connect()
+    blocker_transaction = blocker.begin()
+    try:
+        blocker.execute(
+            select(idempotency)
+            .where(
+                and_(
+                    idempotency.c.owner_user_id == context.user_id,
+                    idempotency.c.operation == "dataset.publish",
+                    idempotency.c.idempotency_key == publication_key,
+                )
+            )
+            .with_for_update()
+        ).one()
+        with (
+            pytest.raises(MarketDataError) as continuous,
+            publisher._continuous_lease_heartbeat(
+                context.user_id,
+                series_id,
+                "dataset.publish",
+                publication_key,
+                fencing_token,
+            ) as heartbeat,
+        ):
+            deadline = time.monotonic() + 5
+            while heartbeat.failure is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            heartbeat.check()
+        assert continuous.value.code.value == "CONFLICT"
+        assert continuous.value.retryable is True
+        assert continuous.value.public_details == {}
+    finally:
+        blocker_transaction.rollback()
+        blocker.close()
+
+    assert not any(
+        thread.name.startswith("market-data-lease-") and thread.is_alive()
+        for thread in enumerate_threads()
+    )
+    time.sleep(0.25)
+    assert filesystem_mutations == []
+    assert snapshot() == before
+
+
 def test_fence_takeover_cancels_staged_conversion_before_competing_publication_converts_same_active_ref(
     catalog, contexts, archive_store, monkeypatch
 ) -> None:

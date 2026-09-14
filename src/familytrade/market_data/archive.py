@@ -2081,8 +2081,13 @@ class _LeaseHeartbeatState:
             if cancel is not None:
                 try:
                     cancel()
-                except BaseException as error:  # noqa: BLE001 - surfaced after mandatory join
-                    cancel_error = error
+                except BaseException:  # noqa: BLE001 - normalized after mandatory join
+                    cancel_error = MarketDataError(
+                        MarketDataCode.DEPENDENCY_UNAVAILABLE,
+                        "The publication lease could not be renewed.",
+                        503,
+                        retryable=True,
+                    )
         if cancel_error is not None:
             self.fail(cancel_error)
 
@@ -2177,6 +2182,42 @@ class DatasetPublisher:
         return int(token)
 
     def _renew_lease(
+        self,
+        owner: str,
+        series_id: str,
+        operation: str,
+        idempotency_key: str,
+        fencing_token: int,
+        cancellation: _LeaseHeartbeatState | None = None,
+    ) -> None:
+        try:
+            self._renew_lease_once(
+                owner,
+                series_id,
+                operation,
+                idempotency_key,
+                fencing_token,
+                cancellation,
+            )
+        except OperationalError as error:
+            if cancellation is not None and cancellation.cancelled.is_set():
+                return
+            sqlstate = getattr(error.orig, "sqlstate", None)
+            if sqlstate in {"40001", "40P01", "55P03", "57014"}:
+                raise MarketDataError(
+                    MarketDataCode.CONFLICT,
+                    "The publication lease could not be renewed.",
+                    409,
+                    retryable=True,
+                ) from None
+            raise MarketDataError(
+                MarketDataCode.DEPENDENCY_UNAVAILABLE,
+                "The publication lease could not be renewed.",
+                503,
+                retryable=True,
+            ) from None
+
+    def _renew_lease_once(
         self,
         owner: str,
         series_id: str,
