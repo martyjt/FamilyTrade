@@ -463,12 +463,20 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
             issues.append(
                 _issue(path, ValidationIssueCode.INVALID_TYPE, "Constant has an invalid type.")
             )
-        elif node.value_type == "timestamp" and (
-            not isinstance(value, str) or not value.endswith("Z")
-        ):
-            issues.append(
-                _issue(path, ValidationIssueCode.INVALID_TYPE, "Timestamp must be UTC RFC3339.")
-            )
+        elif node.value_type == "timestamp":
+            try:
+                parsed_timestamp = datetime.fromisoformat(value) if isinstance(value, str) else None
+            except ValueError:
+                parsed_timestamp = None
+            if (
+                not isinstance(value, str)
+                or not value.endswith("Z")
+                or parsed_timestamp is None
+                or parsed_timestamp.utcoffset() != timedelta(0)
+            ):
+                issues.append(
+                    _issue(path, ValidationIssueCode.INVALID_TYPE, "Timestamp must be UTC RFC3339.")
+                )
         elif node.value_type == "side" and value not in {"long", "short"}:
             issues.append(
                 _issue(path, ValidationIssueCode.INVALID_ENUM, "Side constant is invalid.")
@@ -672,6 +680,18 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
             issues.append(
                 _issue(path, ValidationIssueCode.ROOT_NOT_BOOLEAN, "Root must resolve to boolean.")
             )
+
+    for module_index, module in enumerate(definition.setup_modules):
+        for field in ("filter_root", "arm_filter_root", "entry_filter_root"):
+            root = getattr(module, field, None)
+            if root is not None and root in nodes and signature(root) != ("boolean", "boolean"):
+                issues.append(
+                    _issue(
+                        f"/setup_modules/{module_index}/{field}",
+                        ValidationIssueCode.ROOT_NOT_BOOLEAN,
+                        "Setup filter root must resolve to boolean.",
+                    )
+                )
 
     def expression_depth(node_id: str, seen: set[str]) -> int:
         if node_id in seen or node_id not in nodes:
