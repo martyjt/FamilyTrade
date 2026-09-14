@@ -62,8 +62,8 @@ change a frozen formula, fill rule, risk rule, strategy value, or fixture byte.
 FT-07 consumes, and never redefines, these integrated FT-05 symbols:
 
 - `familytrade.market_data.models.CompletedBar`, `FuturesContract`,
-  `DatasetRevision`, `CalendarVersion`, `BarSelection`, `CorrectionObservation`,
-  `AggregatedFullBar`, `AggregateGap`, `AggregateRequest`, and `AggregateResult`.
+  `DatasetRevision`, `CalendarVersion`, `BarSelection`, `AggregatedFullBar`,
+  `AggregateGap`, `AggregateRequest`, and `AggregateResult`.
 - `familytrade.market_data.aggregate.aggregate_completed_bars` for conformance
   checks of every supported 5/15/30/60-minute derived bucket.
 - Materialized `CalendarVersion.windows` as the sole runtime session, maintenance,
@@ -646,6 +646,21 @@ integrated model names without aliases. It requires:
   be wholly contained in dataset and calendar coverage and have the same owned
   series key and pinned revision ID.
 
+A selected backtest may end early with `end_policy:"mark_open"` only when
+`config.end_at < config.contract.liquidation_start_at`; that is the frozen research
+snapshot behavior and may deliberately finish with an open position, pending entry,
+or ordinary exit close visible. If `config.end_at >=
+config.contract.liquidation_start_at`, the run reaches the actual-contract
+liquidation lifecycle and initialization instead requires
+`config.end_at >= config.contract.last_trade_at`,
+`dataset_revision.coverage_end >= config.contract.last_trade_at`, and
+`config.calendar.coverage_end >= config.contract.last_trade_at`. Because coverage
+and trading are half-open, equality at `last_trade_at` covers the complete eligible
+liquidation window while permitting no Fill at or after it. This rule applies to
+both end policies and to a run whose `start_at` is already within the liquidation
+window. It prevents an ordinary Finish boundary from stranding a lifecycle close
+between liquidation start and last trade.
+
 Any well-typed integrated record that fails one of these cross-field/range checks is
 `UNSUPPORTED_CONFIGURATION` from `initialize_engine` before state, bucket, or
 counter creation. An intrinsically malformed `DatasetRevision` remains the
@@ -735,6 +750,20 @@ status/reason/source combinations are `VALIDATION_ERROR` with no state change.
 `CompletedBarEvent|DataQualityEvent|FinishRunEvent`; no untyped control mapping is
 accepted. Quality intervals ending at or before `start_at` are allowed to describe
 warm-up continuity but cannot produce strategy or accounting output.
+
+The integrated `CorrectionObservation` is deliberately not an FT-07 input. It has
+no engine-event discriminator and direct submission fails the strict union as
+`VALIDATION_ERROR` with detail `UNSUPPORTED_CORRECTION_OBSERVATION` before semantic
+input hashing, cursor/correlation advancement, or any state/output. FT-09 owns
+correction observation and its frozen `CORRECTION_OBSERVED` event. Before an
+interval is processed, the caller may normalize causal-latest data by supplying the
+one corrected `BarSelection`; FT-07 then consumes only that immutable selection.
+After the interval is committed, FT-09 records the late observation and does not
+call FT-07. If a caller instead submits a replacement `CompletedBarEvent` for the
+already consumed interval, the normal retained-byte/overlap rule returns
+`DUPLICATE_CONFLICT`, with no state change or `CORRECTION_OBSERVED` output. Thus a
+correction never enters `semantic_input_bytes` except as the selected CompletedBar's
+ordinary immutable fields, and FT-07 never duplicates FT-09 event ownership.
 
 `CompletedBarEvent.selection.bar` must be a canonical 60-second FT-05
 `CompletedBar` for the config owner,
@@ -1246,6 +1275,45 @@ resolved at signal time never move after a favorable gap. A geometry inversion i
 `ENTRY_GEOMETRY_GAP`; a fill-time cap excess is `RISK_GAP`. Both cancel the entry
 with zero fills and zero commission. No unprotected position can commit.
 
+Signal-time market sizing has one deterministic oracle and does not reject either
+accepted absolute or relative setup-backed configuration. Let `C` be the current
+completed execution aggregate close used by the ENTRY Decision. Set reference entry
+`P_ref=C+market_slippage_ticks*tick_size` for a buy and
+`P_ref=C-market_slippage_ticks*tick_size` for a sell. `C` is already on tick and
+the integer-tick result is exact. This sizing reference is causal evidence only; it
+is not serialized as a market limit price and does not change the frozen null market
+`raw_price`/`executable_price` fields.
+
+For `{kind:"setup_price",field:"stop"}`, use the SetupSnapshot's frozen absolute
+executable stop unchanged, then apply adverse stop slippage for the modeled stop
+Fill: subtract stop-slippage ticks for a long's sell stop and add them for a short's
+buy stop. For relative `{kind:"fixed_ticks"}` or `{kind:"atr_multiple"}`, freeze
+the distance/ATR FeatureValue at the Decision, resolve the sizing-only raw stop from
+`P_ref` in the loss direction, apply the existing role/side tick rounding, then
+apply adverse stop slippage. Relative target specs are resolved from `P_ref` only
+for the signal-time geometry check. They remain a frozen template: the market
+OrderIntent's relative raw/executable bracket fields stay null exactly as section
+13.3 requires. Absolute setup stop/target fields remain serialized and immutable.
+
+Use `P_ref`, that sizing stop, and the quantity-level section 8 formula for both
+fixed-contract acceptance and stop-fraction `q0`/decrement selection. At the later
+eligible fill bar, replace `P_ref` with the actual bar-open base plus adverse market
+slippage. Absolute setup prices do not move; relative stop/target prices are
+resolved anew from the actual slipped entry and their frozen template. Re-run
+geometry and the same quantity-level risk cap for the already serialized all-or-none
+quantity. Neither policy increases or reduces it: any actual gap excess is
+`RISK_GAP`, zero Fill/commission, as required by
+`market_entry_gap_rejected_by_fill_time_risk`; a passing relative template produces
+the accepted `generic_market_entry_resolves_relative_bracket` projection.
+
+The long/short reference boundary is symmetric. With `C=2000.0`, tick `0.1`, one
+market-slippage tick, one stop-slippage tick, and a five-tick relative stop, long
+`P_ref=2000.1`, raw/executable stop `1999.6`, slipped stop `1999.5`; short
+`P_ref=1999.9`, raw/executable stop `2000.4`, slipped stop `2000.5`. Both price-loss
+distances are `0.6` before multiplier/quantity. The same absolute stop values as a
+setup-backed stop use the same signal risk, but unlike the relative template they
+remain fixed when the future bar gaps, so the fill-time risk may increase and reject.
+
 ## 8. Cash, marks, sizing, risk, sessions, expiry, and end state
 
 `src/familytrade/simulation/risk.py` owns sizing, fees, cash, realized/unrealized
@@ -1466,6 +1534,17 @@ checkpoint, or event naming a different contract ID or record version is
 `UNSUPPORTED_CONTRACT_CHANGE`; the engine never stitches, rolls, or transfers a
 position.
 
+For a backtest validated to reach liquidation, `mark_open` no longer supplies an
+early-success escape at `config.end_at`: the lifecycle must already be `STOPPED`
+after a close/flat boundary or `BLOCKED_EXPIRY_UNRESOLVED` at exclusive
+`last_trade_at`. Such state is terminal without a Finish input, and any later
+`FinishRunEvent` follows the post-terminal `RUN_FINISHED` rule. Conversely, a
+`mark_open` backtest ending strictly before liquidation uses its exactly-once Finish
+to become `FINISHED` and may retain the frozen open/pending snapshot. A force-close
+run ending before liquidation follows its separate completed/blocked Finish path.
+No Finish input can convert an unresolved actual-contract liquidation close into
+`FINISHED` or `mark_open`.
+
 The immutable `contract_expiry_close_and_no_roll` fixture crosses an FT-07/FT-11
 wording boundary. Its complete FT-07 projection is nevertheless asserted: cutoff
 cancels pending/new entries; liquidation creates a `CONTRACT_LIQUIDATION` close
@@ -1478,7 +1557,8 @@ test loads the whole expected object, explicitly classifies that phrase as
 `external_ft11_context`, and asserts that EngineConfig/state/input/output contain no
 operator-intent or control field. It is neither silently skipped nor implemented.
 
-`mark_open` finishes with the actual open position, pending entry/setup,
+An early `mark_open` run validated to end before liquidation finishes with the
+actual open position, pending entry/setup,
 close intent, bracket, cash, latest mark/status, realized and unrealized P&L
 visible. It creates no
 synthetic exit. For `force_close`, initialize `force_close_state:"waiting"` and
@@ -1502,7 +1582,8 @@ flat position at the boundary creates no close intent or Fill, never enters
 run `FINISHED`.
 
 Only the exactly-once `FinishRunEvent` creates `RUN_FINISHED` and terminal
-`FINISHED` for a successful `mark_open` or completed force-close run. If the force
+`FINISHED` for a successful early `mark_open` or completed force-close run. If the
+force
 bar was missing/invalid or the position/close remains unresolved, that finish
 atomically sets `force_close_state:"blocked"` and `BLOCKED_UNCLOSED`; it never
 backdates a fill. Replaying a semantically identical FinishRunEvent, including one
@@ -1641,6 +1722,11 @@ The FT-07 event payload kinds are the relevant strict subset:
   `DataQualityEvent` combinations in section 3.
 - `RUN_FINISHED` with `{kind,status,end_policy,cash,equity,realized_pnl,
   unrealized_pnl,position_open,pending_entry,mark_status,reason|null}`.
+
+`CORRECTION_OBSERVED` is intentionally absent from this FT-07 subset. Its frozen
+shape and meaning are unchanged, but FT-09 owns validation, hashing, persistence,
+and emission. FT-07 therefore has no correction-event UUID, payload hash, sequence,
+or replay case and cannot return that event from either engine result type.
 
 `FILL_RECORDED.payload.evidence_mode` is exactly `"historical"` for every backtest
 Fill and `"contemporaneous"` for every forward-paper Fill. A delayed forward bar is
@@ -1927,6 +2013,12 @@ The named boundary and replay tests are:
 - `test_simultaneous_risk_latches_have_canonical_state_event_hash_and_replay_order`
 - `test_backtest_dataset_revision_cross_fields_and_coverage_reject_without_state`
 - `test_quantity_level_commission_cap_1_005_qty2_long_short_and_policy_matrix`
+- `test_signal_time_market_sizing_absolute_and_relative_stops_long_short`
+- `test_market_fill_time_gap_revalidates_without_resizing_either_sizing_policy`
+- `test_liquidation_reaching_backtest_requires_coverage_through_last_trade`
+- `test_finish_cannot_strand_or_finish_unresolved_actual_contract_liquidation`
+- `test_correction_observation_rejected_before_hash_state_and_output`
+- `test_pre_cursor_correction_enters_only_as_caller_selected_bar`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
