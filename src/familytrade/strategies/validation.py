@@ -872,15 +872,15 @@ def _window_issues(
                         if day.isoweekday() in window.days_of_week:
                             start_at = datetime.combine(day, start, zone).astimezone(UTC)
                             end_at = datetime.combine(day, end, zone).astimezone(UTC)
-                            if (
-                                start_at < calendar.coverage_start
-                                or end_at > calendar.coverage_end
-                                or not any(
-                                    segment.kind == "open"
-                                    and segment.start_at <= start_at
-                                    and end_at <= segment.end_at
-                                    for segment in calendar.windows
-                                )
+                            containing = [
+                                segment
+                                for segment in calendar.windows
+                                if segment.start_at <= start_at and end_at <= segment.end_at
+                            ]
+                            if start_at < calendar.coverage_start or end_at > calendar.coverage_end or not any(
+                                segment.kind == "open" for segment in containing
+                            ) and not any(
+                                segment.kind == "scheduled_closed" for segment in containing
                             ):
                                 invalid = True
                         day += timedelta(days=1)
