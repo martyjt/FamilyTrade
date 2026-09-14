@@ -9,6 +9,7 @@ from familytrade.access.repository import access_metadata
 from familytrade.market_data.catalog import market_data_metadata
 from familytrade.strategies.repository import strategy_metadata
 
+
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

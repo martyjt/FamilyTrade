@@ -369,20 +369,28 @@ class StrategyVersion(FrozenModel):
     required_warmup_bars: int
     created_from_version_id: str | None
     created_at: datetime
-    updated_at: datetime
     record_version: int
 
 
 class StrategyListItem(FrozenModel):
+    schema_version: Literal["v1"]
+    owner_user_id: str
     strategy_version_id: str
     name: str
     status: Literal["draft", "validated"]
+    definition_schema_version: Literal["rule-strategy-v1"]
     canonical_definition_sha256: str
+    catalogue_version: Literal["feature-catalogue-v1"]
+    execution_interval_seconds: int
+    fill_interval_seconds: int
+    required_warmup_bars: int
+    created_from_version_id: str | None
     created_at: datetime
     record_version: int
 
 
 class StrategyPage(FrozenModel):
+    schema_version: Literal["v1"]
     items: tuple[StrategyListItem, ...]
     next_cursor: str | None
 

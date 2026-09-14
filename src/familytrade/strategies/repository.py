@@ -190,7 +190,6 @@ class StrategyRepository:
             required_warmup_bars=check.required_warmup_bars or 0,
             created_from_version_id=source,
             created_at=now,
-            updated_at=now,
             record_version=1,
         )
         connection.execute(insert(strategy_versions).values(**version.model_dump(mode="json")))
@@ -307,7 +306,9 @@ class StrategyRepository:
             )
             return StrategyValidationResult(
                 valid=True,
-                strategy_version=StrategyVersion.model_validate(dict(updated)),
+                strategy_version=StrategyVersion.model_validate(
+                    {key: value for key, value in dict(updated).items() if key != "updated_at"}
+                ),
                 errors=(),
             )
 
@@ -328,7 +329,9 @@ class StrategyRepository:
             )
             if row is None:
                 raise not_found()
-            return StrategyVersion.model_validate(dict(row))
+            return StrategyVersion.model_validate(
+                {key: value for key, value in dict(row).items() if key != "updated_at"}
+            )
 
     def list_versions(self, context: UserContext, value: dict[str, object]) -> StrategyPage:
         try:
@@ -353,14 +356,14 @@ class StrategyRepository:
                 .all()
             )
             return StrategyPage(
+                schema_version="v1",
                 items=tuple(
                     StrategyListItem(
-                        strategy_version_id=row["strategy_version_id"],
-                        name=row["name"],
-                        status=row["status"],
-                        canonical_definition_sha256=row["canonical_definition_sha256"],
-                        created_at=row["created_at"],
-                        record_version=row["record_version"],
+                        **{
+                            key: value
+                            for key, value in dict(row).items()
+                            if key not in {"definition", "updated_at"}
+                        }
                     )
                     for row in rows
                 ),
