@@ -138,6 +138,15 @@ class StrategyRepository:
                 403,
             )
 
+    def _mutation_gate(self, connection: Connection, context: UserContext, key: str) -> None:
+        """Serialize a caller/key outcome without taking a second pool connection."""
+        connection.execute(
+            select(
+                func.pg_advisory_xact_lock(func.hashtextextended(context.user_id + ":" + key, 0))
+            )
+        )
+        self._authorise(connection, context, "strategy:write")
+
     @staticmethod
     def _validation(errors: object = ()) -> AccessError:
         return AccessError(
