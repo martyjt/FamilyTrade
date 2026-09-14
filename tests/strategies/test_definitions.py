@@ -493,7 +493,7 @@ def test_entry_window_rejects_break_closure_and_unrepresented_segment() -> None:
         }
     ]
     result = _validate(value)
-    assert ("/constraints/entry_windows/0", "INVALID_WINDOW") in {
+    assert ("/constraints/entry_windows/0/days_of_week", "OUT_OF_RANGE") in {
         (item.path, item.code.value) for item in result.errors
     }
 
@@ -1078,12 +1078,46 @@ def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash(
 
 
 def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
-    value = _fixture()
-    value["features"] = []
-    result = _validate(value)
-    assert not any(
-        issue.code.value == "SIZE_LIMIT" and issue.path == "/features" for issue in result.errors
-    )
+    feature_over = _fixture()
+    features = feature_over["features"]
+    assert isinstance(features, list)
+    features.extend(copy.deepcopy(features[0]) for _ in range(30))
+    feature_result = _validate(feature_over)
+    assert ("/features", "OUT_OF_RANGE") in {
+        (item.path, item.code.value) for item in feature_result.errors
+    }
+    node_over = _fixture()
+    nodes = node_over["nodes"]
+    assert isinstance(nodes, list)
+    for index in range(122):
+        nodes.append(
+            {
+                "kind": "constant",
+                "node_id": f"extra-{index}",
+                "value_type": "integer",
+                "unit": "count",
+                "value": 1,
+            }
+        )
+    node_result = _validate(node_over)
+    codes = {(item.path, item.code.value) for item in node_result.errors}
+    assert ("/nodes", "OUT_OF_RANGE") in codes
+    assert ("/nodes", "SIZE_LIMIT") not in codes
+
+    weekdays = _fixture()
+    weekdays["constraints"]["entry_windows"] = [
+        {
+            "days_of_week": [1, 1],
+            "start_local": "09:00",
+            "end_local": "10:00",
+            "calendar_id": str(uuid7()),
+            "calendar_version": 1,
+        }
+    ]
+    weekday_result = _validate(weekdays)
+    assert ("/constraints/entry_windows/0/days_of_week", "OUT_OF_RANGE") in {
+        (item.path, item.code.value) for item in weekday_result.errors
+    }
 
 
 def test_raw_hashable_structural_validation_failure_is_idempotently_replayed(

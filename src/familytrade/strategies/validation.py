@@ -848,12 +848,13 @@ def _window_issues(
     issues: list[ValidationIssue] = []
     for index, window in enumerate(definition.constraints.entry_windows):
         path = f"/constraints/entry_windows/{index}"
-        invalid = (
+        invalid_days = (
             len(window.days_of_week) not in range(1, 8)
             or tuple(sorted(window.days_of_week)) != window.days_of_week
             or len(set(window.days_of_week)) != len(window.days_of_week)
             or any(day not in range(1, 8) for day in window.days_of_week)
         )
+        invalid = invalid_days
         times_valid = True
         try:
             start = time.fromisoformat(window.start_local)
@@ -901,7 +902,15 @@ def _window_issues(
                 invalid = True
         if invalid:
             issues.append(
-                _issue(path, ValidationIssueCode.INVALID_WINDOW, "Entry window is invalid.")
+                _issue(
+                    path + "/days_of_week" if invalid_days else path,
+                    ValidationIssueCode.OUT_OF_RANGE
+                    if invalid_days
+                    else ValidationIssueCode.INVALID_WINDOW,
+                    "Entry-window weekdays are invalid."
+                    if invalid_days
+                    else "Entry window is invalid.",
+                )
             )
     return issues
 
