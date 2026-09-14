@@ -91,7 +91,14 @@ strategy_versions = Table(
     ),
     CheckConstraint("schema_version = 'v1'", name="ck_strategy_versions_v1"),
     CheckConstraint("status IN ('draft','validated')", name="ck_strategy_versions_status"),
-    CheckConstraint("record_version IN (1,2)", name="ck_strategy_versions_record_version"),
+    CheckConstraint(
+        "(status = 'draft' AND record_version = 1) OR (status = 'validated' AND record_version = 2)",
+        name="ck_strategy_versions_status_record_version",
+    ),
+    CheckConstraint(
+        "char_length(name) BETWEEN 1 AND 120 AND name = btrim(name)",
+        name="ck_strategy_versions_name",
+    ),
     CheckConstraint(
         "execution_interval_seconds IN (300,900,1800,3600)",
         name="ck_strategy_versions_execution_interval",
@@ -102,6 +109,20 @@ strategy_versions = Table(
     ),
     CheckConstraint(
         "canonical_definition_sha256 ~ '^[0-9a-f]{64}$'", name="ck_strategy_versions_sha256"
+    ),
+    CheckConstraint(
+        "jsonb_typeof(definition) = 'object'", name="ck_strategy_versions_definition_object"
+    ),
+    CheckConstraint(
+        "required_warmup_bars BETWEEN 0 AND 5100050", name="ck_strategy_versions_warmup"
+    ),
+    CheckConstraint(
+        "strategy_version_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'",
+        name="ck_strategy_versions_uuid7",
+    ),
+    CheckConstraint(
+        "created_from_version_id IS NULL OR created_from_version_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'",
+        name="ck_strategy_versions_source_uuid7",
     ),
 )
 Index(
@@ -126,6 +147,17 @@ strategy_idempotency_records = Table(
         name="ck_strategy_idempotency_operation",
     ),
     CheckConstraint("(result IS NULL) <> (error IS NULL)", name="ck_strategy_idempotency_outcome"),
+    CheckConstraint(
+        "idempotency_key ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'",
+        name="ck_strategy_idempotency_key_uuid7",
+    ),
+    CheckConstraint(
+        "request_sha256 ~ '^[0-9a-f]{64}$'", name="ck_strategy_idempotency_request_sha256"
+    ),
+    CheckConstraint(
+        "error IS NULL OR jsonb_typeof(error) = 'object'",
+        name="ck_strategy_idempotency_error_object",
+    ),
 )
 
 
