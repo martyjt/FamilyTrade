@@ -981,7 +981,18 @@ def _window_issues(
 
 def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
     spans: dict[str, int] = {}
-    for feature in definition.features:
+    feature_by_id = {feature.feature_id: feature for feature in definition.features}
+
+    def feature_span(feature_id: str, resolving: set[str] | None = None) -> int:
+        if feature_id in spans:
+            return spans[feature_id]
+        feature = feature_by_id.get(feature_id)
+        if feature is None:
+            return 0
+        resolving = resolving or set()
+        if feature_id in resolving:
+            return 0
+        resolving.add(feature_id)
         params = feature.parameters
         n = params.get("n", 1)
         n_int = n if isinstance(n, int) and not isinstance(n, bool) else 1
@@ -1007,7 +1018,17 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
                 + (right if isinstance(right, int) else 1)
                 + 1
             )
-        spans[feature.feature_id] = bars * feature.interval_seconds
+        answer = bars * feature.interval_seconds
+        if feature.name in {"level_touch_v1", "level_cross"}:
+            dependency = params.get("level_feature_id")
+            if isinstance(dependency, str):
+                answer = max(answer, feature_span(dependency, resolving))
+        resolving.remove(feature_id)
+        spans[feature_id] = answer
+        return answer
+
+    for feature in definition.features:
+        feature_span(feature.feature_id)
     nodes = {node.node_id: node for node in definition.nodes}
     cache: dict[str, int] = {}
 
