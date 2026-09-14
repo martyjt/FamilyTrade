@@ -284,7 +284,7 @@ class StrategyRepository:
                 409,
             )
         if row["result"] is not None:
-            return StrategyVersion.model_validate(row["result"])
+            return StrategyVersion.model_validate(_as_model_input(row["result"]))
         raise AccessError(
             ErrorCode(row["error"]["code"]), row["error"]["message"], row["error"]["http_status"]
         )
@@ -376,7 +376,9 @@ class StrategyRepository:
                         ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
                     )
                 stored = StrategyVersion.model_validate(
-                    {key: item for key, item in dict(source).items() if key != "updated_at"}
+                    _as_model_input(
+                        {key: item for key, item in dict(source).items() if key != "updated_at"}
+                    )
                 )
                 parsed = StrategyDraftFromDefinitionInput.model_validate(
                     {
@@ -501,7 +503,9 @@ class StrategyRepository:
             if row["status"] != "draft":
                 raise AccessError(ErrorCode.CONFLICT, "Draft is already validated.", 409)
             stored = StrategyVersion.model_validate(
-                {key: value for key, value in dict(row).items() if key != "updated_at"}
+                _as_model_input(
+                    {key: value for key, value in dict(row).items() if key != "updated_at"}
+                )
             )
             checked = self._check(
                 connection,
@@ -549,7 +553,9 @@ class StrategyRepository:
             result = StrategyValidationResult(
                 valid=True,
                 strategy_version=StrategyVersion.model_validate(
-                    {key: value for key, value in dict(updated).items() if key != "updated_at"}
+                    _as_model_input(
+                        {key: value for key, value in dict(updated).items() if key != "updated_at"}
+                    )
                 ),
                 errors=(),
             )
@@ -582,7 +588,9 @@ class StrategyRepository:
             if row is None:
                 raise not_found()
             return StrategyVersion.model_validate(
-                {key: value for key, value in dict(row).items() if key != "updated_at"}
+                _as_model_input(
+                    {key: value for key, value in dict(row).items() if key != "updated_at"}
+                )
             )
 
     @staticmethod
