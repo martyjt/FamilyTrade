@@ -1234,6 +1234,21 @@ def test_collection_cardinality_code_path_matrix_is_exclusive() -> None:
         assert (path, "OUT_OF_RANGE") in pairs
         assert (path, "SIZE_LIMIT") not in pairs
 
+    windows = _fixture()
+    windows["constraints"]["entry_windows"] = [
+        {
+            "days_of_week": [1],
+            "start_local": "09:00",
+            "end_local": "10:00",
+            "calendar_id": str(uuid7()),
+            "calendar_version": 1,
+        }
+        for _ in range(8)
+    ]
+    window_pairs = {(item.path, item.code.value) for item in _validate(windows).errors}
+    assert not any(path == "/constraints/entry_windows" and code == "OUT_OF_RANGE" for path, code in window_pairs)
+    assert any(path.startswith("/constraints/entry_windows/") for path, _code in window_pairs)
+
 
 def test_raw_hashable_structural_validation_failure_is_idempotently_replayed(
     strategy_repository: tuple[StrategyRepository, object, Engine],
