@@ -308,17 +308,88 @@ def test_context_and_scope_are_rechecked_after_advisory_and_row_lock_waits() -> 
     }
 
 
-def test_cross_user_clone_edit_validate_get_and_cursor_are_not_found() -> None:
-    value = _fixture()
-    features = value["features"]
-    assert isinstance(features, list)
-    features[0]["parameters"] = {"n": True, "input": "not-a-price", "extra": 1}
-    result = _validate(value)
-    assert {
-        ("/features/0/parameters/n", "INVALID_TYPE"),
-        ("/features/0/parameters/input", "INVALID_ENUM"),
-        ("/features/0/parameters/extra", "UNSUPPORTED_PARAMETER"),
-    } <= {(item.path, item.code.value) for item in result.errors}
+def test_cross_user_clone_edit_validate_get_and_cursor_are_not_found(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+
+    class Keys:
+        active_version = "test-v1"
+
+        def key(self, version: str) -> bytes:
+            assert version == "test-v1"
+            return b"K" * 32
+
+    service = AccessService(
+        AccessRepository(engine),
+        EnvelopeCipher(Keys()),
+        allowed_origins={"https://familytrade.test"},
+    )
+    email = f"other-{uuid7()}@example.test"
+    service.invite_user(email, "test-password-B!", {"strategy:read", "strategy:write"})
+    other = service.authenticate_browser(
+        service.login(email, "test-password-B!").session_token,
+        request_id=str(uuid7()),
+        required_scope="strategy:write",
+    )
+    source = repository.create_draft(
+        context, _create_request(_fixture()), idempotency_key=str(uuid7())
+    )
+    repository.validate_draft(
+        context,
+        {"schema_version": "v1", "draft_id": source.strategy_version_id, "expected_version": 1},
+        idempotency_key=str(uuid7()),
+    )
+    repository.create_draft(context, _create_request(_fixture()), idempotency_key=str(uuid7()))
+    for index, operation in enumerate(
+        (
+            lambda: repository.create_draft(
+                other,
+                {
+                    "kind": "source_version",
+                    "schema_version": "v1",
+                    "source_version_id": source.strategy_version_id,
+                    "name": "clone",
+                },
+                idempotency_key=str(uuid7()),
+            ),
+            lambda: repository.edit_draft(
+                other,
+                {
+                    "schema_version": "v1",
+                    "draft_id": source.strategy_version_id,
+                    "expected_version": 1,
+                    "name": "other",
+                    "definition_schema_version": "rule-strategy-v1",
+                    "definition": {**_fixture(), "name": "other"},
+                    "catalogue_version": "feature-catalogue-v1",
+                    "execution_interval_seconds": 900,
+                    "fill_interval_seconds": 60,
+                },
+                idempotency_key=str(uuid7()),
+            ),
+            lambda: repository.validate_draft(
+                other,
+                {
+                    "schema_version": "v1",
+                    "draft_id": source.strategy_version_id,
+                    "expected_version": 1,
+                },
+                idempotency_key=str(uuid7()),
+            ),
+            lambda: repository.get_version(other, source.strategy_version_id),
+        )
+    ):
+        with pytest.raises(AccessError) as error:
+            operation()
+        assert error.value.code is ErrorCode.NOT_FOUND, index
+    page = repository.list_versions(context, {"schema_version": "v1", "limit": 1})
+    assert page.next_cursor is not None
+    with pytest.raises(AccessError) as cursor_error:
+        repository.list_versions(
+            other, {"schema_version": "v1", "limit": 1, "cursor": page.next_cursor}
+        )
+    assert cursor_error.value.code is ErrorCode.VALIDATION_ERROR
 
 
 def test_raw_byte_node_depth_and_definition_byte_limits_use_exact_boundaries() -> None:
@@ -757,6 +828,7 @@ def test_same_key_concurrent_create_edit_and_validate_commit_one_complete_outcom
 ) -> None:
     repository, context, _ = strategy_repository
     request = _create_request(_fixture())
+
     key = str(uuid7())
     with ThreadPoolExecutor(max_workers=2) as executor:
         created = list(
@@ -765,6 +837,50 @@ def test_same_key_concurrent_create_edit_and_validate_commit_one_complete_outcom
             )
         )
     assert created[0].strategy_version_id == created[1].strategy_version_id
+    source = created[0]
+    edited_definition = _fixture()
+    edited_definition["name"] = "Concurrent edit"
+    edit = {
+        "schema_version": "v1",
+        "draft_id": source.strategy_version_id,
+        "expected_version": 1,
+        "name": "Concurrent edit",
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": edited_definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    edit_key = str(uuid7())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        edited = list(
+            executor.map(
+                lambda _: repository.edit_draft(context, edit, idempotency_key=edit_key), range(2)
+            )
+        )
+    assert edited[0].strategy_version_id == edited[1].strategy_version_id
+    validate = {
+        "schema_version": "v1",
+        "draft_id": edited[0].strategy_version_id,
+        "expected_version": 1,
+    }
+    validate_key = str(uuid7())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        validated = list(
+            executor.map(
+                lambda _: repository.validate_draft(
+                    context, validate, idempotency_key=validate_key
+                ),
+                range(2),
+            )
+        )
+    assert validated[0].valid and validated[1].valid
+    assert (
+        validated[0].strategy_version is not None
+        and validated[1].strategy_version is not None
+        and validated[0].strategy_version.strategy_version_id
+        == validated[1].strategy_version.strategy_version_id
+    )
 
 
 def test_pool_size_one_mutations_never_checkout_a_second_connection(
