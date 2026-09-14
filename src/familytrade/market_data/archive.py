@@ -225,7 +225,16 @@ class ArchiveStore:
         self._assert_owner_only_mode(path, 0o600)
         return path
 
-    def finalize(self, owner: str, temp: Path, uri: str) -> Path:
+    def finalize(
+        self,
+        owner: str,
+        temp: Path,
+        uri: str,
+        *,
+        check_fence: Callable[[], None] | None = None,
+    ) -> Path:
+        check = check_fence or (lambda: None)
+        check()
         staging = (self._owner_root(owner) / "staging").resolve()
         resolved_temp = temp.resolve()
         if (
@@ -236,9 +245,13 @@ class ArchiveStore:
         ):
             raise MarketDataError(MarketDataCode.ARCHIVE_INTEGRITY, "Unsafe archive path.", 500)
         final = self.resolve(owner, uri)
+        check()
         os.replace(resolved_temp, final)
+        check()
         final.chmod(0o400)
+        check()
         self._fsync_directory(final.parent)
+        check()
         return final
 
     def read_verified(self, owner: str, uri: str, digest: str, length: int) -> bytes:
@@ -2009,6 +2022,23 @@ class MarketDataReader:
         )
 
 
+class _LeaseHeartbeatState:
+    """Thread-visible cancellation state shared with one bounded work section."""
+
+    def __init__(self) -> None:
+        self.cancelled = Event()
+        self.failure: BaseException | None = None
+
+    def fail(self, error: BaseException) -> None:
+        if self.failure is None:
+            self.failure = error
+            self.cancelled.set()
+
+    def check(self) -> None:
+        if self.failure is not None:
+            raise self.failure
+
+
 class DatasetPublisher:
     def __init__(
         self,
@@ -2026,14 +2056,40 @@ class DatasetPublisher:
     def _inject(self, point: str) -> None:
         """Deterministic no-op seam used by crash-contract tests."""
 
-    def _write_named_temp(self, owner: str, name: str, data: bytes) -> Path:
+    def _write_named_temp(
+        self,
+        owner: str,
+        name: str,
+        data: bytes,
+        *,
+        check_fence: Callable[[], None] | None = None,
+    ) -> Path:
+        check = check_fence or (lambda: None)
+        check()
         path = self.store._owner_root(owner) / "staging" / name
-        with path.open("xb") as stream:
+        check()
+        with path.open("xb", buffering=0) as stream:
+            check()
             path.chmod(0o600)
-            stream.write(data)
+            check()
+            view = memoryview(data)
+            for offset in range(0, len(view), 1024 * 1024):
+                chunk = view[offset : offset + 1024 * 1024]
+                written = 0
+                while written < len(chunk):
+                    check()
+                    count = stream.write(chunk[written:])
+                    if count is None or count <= 0:
+                        raise OSError("Archive temp write made no progress.")
+                    written += count
+                    self._inject("after_temp_write_chunk")
+                    check()
             stream.flush()
+            check()
             os.fsync(stream.fileno())
+            check()
         self.store._assert_owner_only_mode(path, 0o600)
+        check()
         return path
 
     def _take_fence(self, connection: Any, owner: str, series_id: str) -> int:
@@ -2187,7 +2243,7 @@ class DatasetPublisher:
         """Renew a live lease while one filesystem or codec call cannot yield."""
 
         stop = Event()
-        failures: list[BaseException] = []
+        state = _LeaseHeartbeatState()
         poll_seconds = min(1.0, max(0.05, self.renew_seconds / 4))
 
         def renew_until_stopped() -> None:
@@ -2199,25 +2255,33 @@ class DatasetPublisher:
                         operation,
                         idempotency_key,
                         fencing_token,
+                        force=True,
                     )
                 except BaseException as error:  # noqa: BLE001 - transferred to caller thread
-                    failures.append(error)
+                    state.fail(error)
+                    self._inject("lease_lost")
                     stop.set()
                     return
 
         thread = Thread(target=renew_until_stopped, daemon=True)
         thread.start()
-        completed = False
+        body_error: BaseException | None = None
         try:
-            yield
-            completed = True
+            state.check()
+            yield state
+        except BaseException as error:  # noqa: BLE001 - preserve heartbeat precedence
+            body_error = error
         finally:
             stop.set()
             thread.join(timeout=max(5.0, poll_seconds * 2))
         if thread.is_alive():
             raise RuntimeError("Lease heartbeat worker did not stop safely.")
-        if completed and failures:
-            raise failures[0]
+        if state.failure is not None:
+            if body_error is not None and body_error is not state.failure:
+                raise state.failure from body_error
+            raise state.failure
+        if body_error is not None:
+            raise body_error.with_traceback(body_error.__traceback__)
 
     def publish(
         self, context: UserContext, request: PublicationRequest, *, idempotency_key: str
@@ -3452,19 +3516,31 @@ class DatasetPublisher:
             for item in artifacts:
                 for obj in item["objects"]:
                     check_fence()
-                    with continuous_heartbeat():
-                        self._write_named_temp(context.user_id, obj["temp_name"], obj["data"])
+                    with continuous_heartbeat() as heartbeat_state:
+                        self._write_named_temp(
+                            context.user_id,
+                            obj["temp_name"],
+                            obj["data"],
+                            check_fence=heartbeat_state.check,
+                        )
                     self._inject("during_temp_write")
                     check_fence()
                     self._inject("after_file_fsync_before_directory_fsync")
                 check_fence()
-                with continuous_heartbeat():
+                with continuous_heartbeat() as heartbeat_state:
                     self._write_named_temp(
-                        context.user_id, item["manifest_temp_name"], item["manifest"]
+                        context.user_id,
+                        item["manifest_temp_name"],
+                        item["manifest"],
+                        check_fence=heartbeat_state.check,
                     )
                 check_fence()
-            staging = self.store._owner_root(context.user_id) / "staging"
-            self.store._fsync_directory(staging)
+            with continuous_heartbeat() as heartbeat_state:
+                heartbeat_state.check()
+                staging = self.store._owner_root(context.user_id) / "staging"
+                heartbeat_state.check()
+                self.store._fsync_directory(staging)
+                heartbeat_state.check()
             self._inject("after_all_fsync_before_staged_tx")
             locked_parent = c.execute(
                 select(series.c.latest_revision_id)
@@ -3734,19 +3810,23 @@ class DatasetPublisher:
         for item in artifacts:
             for obj in item["objects"]:
                 check_fence()
-                self.store.finalize(
-                    context.user_id,
-                    staging / obj["temp_name"],
-                    obj["ref"].uri,
-                )
+                with continuous_heartbeat() as heartbeat_state:
+                    self.store.finalize(
+                        context.user_id,
+                        staging / obj["temp_name"],
+                        obj["ref"].uri,
+                        check_fence=heartbeat_state.check,
+                    )
                 check_fence()
                 self._inject("during_object_renames")
             check_fence()
-            self.store.finalize(
-                context.user_id,
-                staging / item["manifest_temp_name"],
-                item["revision"].manifest_uri,
-            )
+            with continuous_heartbeat() as heartbeat_state:
+                self.store.finalize(
+                    context.user_id,
+                    staging / item["manifest_temp_name"],
+                    item["revision"].manifest_uri,
+                    check_fence=heartbeat_state.check,
+                )
             check_fence()
         self._inject("after_all_renames_before_directory_fsync")
         self._inject("after_rename_fsync_before_publish_tx")
@@ -5895,17 +5975,31 @@ class DatasetPublisher:
         self._inject("before_temp_create")
         for _ref, payload, temp_name in recovery_staged:
             check_recovery_fence()
-            with continuous_recovery_heartbeat():
-                self._write_named_temp(context.user_id, temp_name, payload)
+            with continuous_recovery_heartbeat() as heartbeat_state:
+                self._write_named_temp(
+                    context.user_id,
+                    temp_name,
+                    payload,
+                    check_fence=heartbeat_state.check,
+                )
             self._inject("during_temp_write")
             check_recovery_fence()
             self._inject("after_file_fsync_before_directory_fsync")
         check_recovery_fence()
-        with continuous_recovery_heartbeat():
-            self._write_named_temp(context.user_id, manifest_temp_name, manifest)
+        with continuous_recovery_heartbeat() as heartbeat_state:
+            self._write_named_temp(
+                context.user_id,
+                manifest_temp_name,
+                manifest,
+                check_fence=heartbeat_state.check,
+            )
         check_recovery_fence()
-        staging = self.store._owner_root(context.user_id) / "staging"
-        self.store._fsync_directory(staging)
+        with continuous_recovery_heartbeat() as heartbeat_state:
+            heartbeat_state.check()
+            staging = self.store._owner_root(context.user_id) / "staging"
+            heartbeat_state.check()
+            self.store._fsync_directory(staging)
+            heartbeat_state.check()
         self._inject("after_all_fsync_before_staged_tx")
         with (
             self.catalog.engine.connect().execution_options(isolation_level="SERIALIZABLE") as c,
@@ -6187,11 +6281,23 @@ class DatasetPublisher:
         self._inject("after_staged_commit_before_rename")
         for ref, _payload, temp_name in recovery_staged:
             check_recovery_fence()
-            self.store.finalize(context.user_id, staging / temp_name, ref.uri)
+            with continuous_recovery_heartbeat() as heartbeat_state:
+                self.store.finalize(
+                    context.user_id,
+                    staging / temp_name,
+                    ref.uri,
+                    check_fence=heartbeat_state.check,
+                )
             check_recovery_fence()
             self._inject("during_object_renames")
         check_recovery_fence()
-        self.store.finalize(context.user_id, staging / manifest_temp_name, manifest_uri)
+        with continuous_recovery_heartbeat() as heartbeat_state:
+            self.store.finalize(
+                context.user_id,
+                staging / manifest_temp_name,
+                manifest_uri,
+                check_fence=heartbeat_state.check,
+            )
         check_recovery_fence()
         self._inject("after_all_renames_before_directory_fsync")
         self._inject("after_rename_fsync_before_publish_tx")
@@ -6510,8 +6616,13 @@ class DatasetPublisher:
                         / "staging"
                         / file["temp_name"]
                     )
-                    with continuous_reconcile_heartbeat():
-                        self.store.finalize(identity["owner_user_id"], temp_path, file["final_uri"])
+                    with continuous_reconcile_heartbeat() as heartbeat_state:
+                        self.store.finalize(
+                            identity["owner_user_id"],
+                            temp_path,
+                            file["final_uri"],
+                            check_fence=heartbeat_state.check,
+                        )
                 with continuous_reconcile_heartbeat():
                     self.store.read_verified(
                         identity["owner_user_id"],
@@ -6526,7 +6637,13 @@ class DatasetPublisher:
                     identity["idempotency_key"],
                     fresh_fence,
                 )
-        except MarketDataError, OSError:
+        except MarketDataError as error:
+            if error.code == MarketDataCode.CONFLICT:
+                raise
+            return self._quarantine_staged_publication(
+                dict(identity), publication_id, fresh_fence, "ARCHIVE_INTEGRITY"
+            )
+        except OSError:
             return self._quarantine_staged_publication(
                 dict(identity), publication_id, fresh_fence, "ARCHIVE_INTEGRITY"
             )

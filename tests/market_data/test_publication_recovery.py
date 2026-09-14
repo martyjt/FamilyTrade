@@ -6,6 +6,7 @@ import os
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from threading import Event, Thread
 from uuid import uuid7
 
@@ -5625,8 +5626,8 @@ def test_background_heartbeat_covers_blocked_encoder_and_temp_write_with_takeove
     original_write_temp = publisher._write_named_temp
     temp_blocked = [False]
 
-    def blocked_temp(owner: str, name: str, data: bytes):
-        path = original_write_temp(owner, name, data)
+    def blocked_temp(owner: str, name: str, data: bytes, **kwargs):
+        path = original_write_temp(owner, name, data, **kwargs)
         if not temp_blocked[0]:
             temp_blocked[0] = True
             temp_entered.set()
@@ -5726,6 +5727,315 @@ def test_background_heartbeat_covers_blocked_encoder_and_temp_write_with_takeove
     assert len(outcome) == 1
     assert not isinstance(outcome[0], BaseException)
     assert renewal_count[0] >= 5
+
+
+def _parent_with_pending_correction(catalog, context, archive_store):
+    _, contract = seed(catalog, context)
+    bar = bar_input(contract.contract_id)
+    first = catalog.record_completed_batch(
+        context, RecordBatchInput(bars=(bar,)), idempotency_key=str(uuid7())
+    )
+    key = SeriesKey(
+        source="synthetic",
+        price_basis="trades",
+        contract_id=contract.contract_id,
+        interval_seconds=60,
+    )
+    parent = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7())).publish(
+        context,
+        PublicationRequest(
+            series_key=key,
+            coverage_start=bar.start_at,
+            coverage_end=bar.end_at,
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    correction = catalog.record_completed_batch(
+        context,
+        RecordBatchInput(
+            bars=(
+                bar.model_copy(
+                    update={
+                        "source_revision": 2,
+                        "close": bar.close + Decimal("0.1"),
+                        "supersedes_bar_record_id": first.inserted_bar_record_ids[0],
+                        "correction_reason": "SOURCE_CORRECTION",
+                    }
+                ),
+            )
+        ),
+        idempotency_key=str(uuid7()),
+    )
+    with catalog.engine.begin() as connection:
+        series_id = connection.execute(
+            select(series.c.series_id).where(
+                and_(
+                    series.c.owner_user_id == context.user_id,
+                    series.c.contract_id == contract.contract_id,
+                    series.c.interval_seconds == 60,
+                )
+            )
+        ).scalar_one()
+    return contract, bar, key, parent, correction, series_id
+
+
+def test_actual_fence_loss_mid_temp_write_cancels_before_later_file_or_catalog_mutation(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    _, bar, key, parent, correction, series_id = _parent_with_pending_correction(
+        catalog, context, archive_store
+    )
+    publisher = DatasetPublisher(
+        catalog,
+        archive_store,
+        worker_id=str(uuid7()),
+        renew_seconds=30,
+    )
+    publication_key = str(uuid7())
+    loss_started = Event()
+    loss_observed = Event()
+    fence_stolen = [False]
+    post_loss_renames: list[tuple[object, object]] = []
+    post_loss_chmods: list[Path] = []
+    post_loss_fsyncs: list[int] = []
+    original_write_parquet = pl.DataFrame.write_parquet
+    padding = os.urandom(4 * 1024**2)
+
+    def inflated_encoder(frame, file, *args, **kwargs):
+        return original_write_parquet(
+            frame.with_columns(pl.Series("_test_padding", [padding])),
+            file,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", inflated_encoder)
+    original_replace = os.replace
+    original_chmod = Path.chmod
+    original_fsync = os.fsync
+
+    def observe_replace(source, destination) -> None:
+        if loss_started.is_set():
+            post_loss_renames.append((source, destination))
+        original_replace(source, destination)
+
+    def observe_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        if loss_started.is_set():
+            post_loss_chmods.append(path)
+        original_chmod(path, mode, *args, **kwargs)
+
+    def observe_fsync(descriptor: int) -> None:
+        if loss_started.is_set():
+            post_loss_fsyncs.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    monkeypatch.setattr(Path, "chmod", observe_chmod)
+    monkeypatch.setattr(os, "fsync", observe_fsync)
+
+    def steal_after_first_chunk(point: str) -> None:
+        if point == "lease_lost":
+            loss_observed.set()
+        if point != "after_temp_write_chunk" or fence_stolen[0]:
+            return
+        fence_stolen[0] = True
+        loss_started.set()
+        with catalog.engine.begin() as connection:
+            changed = connection.execute(
+                update(series_fences)
+                .where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == series_id,
+                    )
+                )
+                .values(
+                    fencing_token=series_fences.c.fencing_token + 1,
+                    holder=str(uuid7()),
+                    lease_expires_at=catalog._now() + timedelta(seconds=120),
+                )
+            ).rowcount
+        assert changed == 1
+        assert loss_observed.wait(10)
+
+    monkeypatch.setattr(publisher, "_inject", steal_after_first_chunk)
+    with pytest.raises(MarketDataError) as lost:
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar.start_at,
+                coverage_end=bar.end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=publication_key,
+        )
+    assert lost.value.code.value == "CONFLICT"
+    with catalog.engine.begin() as connection:
+        root = (
+            connection.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.publish",
+                        idempotency.c.idempotency_key == publication_key,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        journal = (
+            connection.execute(
+                select(prestage_writes).where(
+                    and_(
+                        prestage_writes.c.owner_user_id == context.user_id,
+                        prestage_writes.c.idempotency_key == publication_key,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        publication_count = connection.execute(
+            select(func.count())
+            .select_from(publications)
+            .where(publications.c.idempotency_key == publication_key)
+        ).scalar_one()
+        active_correction = connection.execute(
+            select(func.count())
+            .select_from(active_bars)
+            .where(active_bars.c.bar_record_id == correction.inserted_bar_record_ids[0])
+        ).scalar_one()
+    partial = (
+        archive_store._owner_root(context.user_id) / "staging" / journal["expected_temp_names"][0]
+    )
+    assert root["state"] == "started"
+    assert journal["state"] == "writing"
+    assert 0 < partial.stat().st_size <= 1024 * 1024
+    assert publication_count == 0
+    assert active_correction == 1
+    assert post_loss_renames == []
+    assert post_loss_chmods == []
+    assert post_loss_fsyncs == []
+
+
+def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    _, bar, key, parent, correction, series_id = _parent_with_pending_correction(
+        catalog, context, archive_store
+    )
+    publisher = DatasetPublisher(
+        catalog,
+        archive_store,
+        worker_id=str(uuid7()),
+        renew_seconds=30,
+    )
+    publication_key = str(uuid7())
+    loss_started = Event()
+    loss_observed = Event()
+    fence_stolen = [False]
+    replacements: list[tuple[Path, Path]] = []
+    post_loss_chmods: list[Path] = []
+    post_loss_fsyncs: list[int] = []
+    original_replace = os.replace
+    original_chmod = Path.chmod
+    original_fsync = os.fsync
+
+    def replace_then_steal(source, destination) -> None:
+        original_replace(source, destination)
+        replacements.append((Path(source), Path(destination)))
+        if fence_stolen[0]:
+            return
+        fence_stolen[0] = True
+        loss_started.set()
+        with catalog.engine.begin() as connection:
+            changed = connection.execute(
+                update(series_fences)
+                .where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == series_id,
+                    )
+                )
+                .values(
+                    fencing_token=series_fences.c.fencing_token + 1,
+                    holder=str(uuid7()),
+                    lease_expires_at=catalog._now() + timedelta(seconds=120),
+                )
+            ).rowcount
+        assert changed == 1
+        assert loss_observed.wait(10)
+
+    def observe_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        if loss_started.is_set():
+            post_loss_chmods.append(path)
+        original_chmod(path, mode, *args, **kwargs)
+
+    def observe_fsync(descriptor: int) -> None:
+        if loss_started.is_set():
+            post_loss_fsyncs.append(descriptor)
+        original_fsync(descriptor)
+
+    def observe_loss(point: str) -> None:
+        if point == "lease_lost":
+            loss_observed.set()
+
+    monkeypatch.setattr(os, "replace", replace_then_steal)
+    monkeypatch.setattr(Path, "chmod", observe_chmod)
+    monkeypatch.setattr(os, "fsync", observe_fsync)
+    monkeypatch.setattr(publisher, "_inject", observe_loss)
+    with pytest.raises(MarketDataError) as lost:
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar.start_at,
+                coverage_end=bar.end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=publication_key,
+        )
+    assert lost.value.code.value == "CONFLICT"
+    assert len(replacements) == 1
+    renamed_temp, final_path = replacements[0]
+    assert not renamed_temp.exists() and final_path.exists()
+    assert post_loss_chmods == []
+    assert post_loss_fsyncs == []
+    with catalog.engine.begin() as connection:
+        publication = (
+            connection.execute(
+                select(publications).where(publications.c.idempotency_key == publication_key)
+            )
+            .mappings()
+            .one()
+        )
+        root = (
+            connection.execute(
+                select(idempotency).where(
+                    and_(
+                        idempotency.c.operation == "dataset.publish",
+                        idempotency.c.idempotency_key == publication_key,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        latest = connection.execute(
+            select(series.c.latest_revision_id).where(series.c.series_id == series_id)
+        ).scalar_one()
+        active_correction = connection.execute(
+            select(func.count())
+            .select_from(active_bars)
+            .where(active_bars.c.bar_record_id == correction.inserted_bar_record_ids[0])
+        ).scalar_one()
+    assert publication["state"] == "staged"
+    assert root["state"] == "started"
+    assert latest == parent.dataset_revision.dataset_revision_id
+    assert active_correction == 1
 
 
 def test_fence_takeover_cancels_staged_conversion_before_competing_publication_converts_same_active_ref(
