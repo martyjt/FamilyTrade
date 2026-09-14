@@ -703,6 +703,7 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
     seen: set[str] = set()
     kinds: set[str] = set()
     enabled_emitting = False
+    feature_ids = {feature.feature_id for feature in definition.features}
     for index, module in enumerate(definition.setup_modules):
         if module.kind in seen:
             issues.append(
@@ -811,6 +812,19 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         ):
             issues.append(
                 _issue(path, ValidationIssueCode.OUT_OF_RANGE, "Multiple must be in (0, 100].")
+            )
+    for path, source in (
+        ("/order_policy/limit_price_source", definition.order_policy.limit_price_source),
+        ("/exit_policy/stop", definition.exit_policy.stop),
+    ):
+        feature_id = getattr(source, "feature_id", None)
+        if feature_id is not None and feature_id not in feature_ids:
+            issues.append(
+                _issue(
+                    path + "/feature_id",
+                    ValidationIssueCode.UNKNOWN_REFERENCE,
+                    "Feature is unknown.",
+                )
             )
     return issues
 
