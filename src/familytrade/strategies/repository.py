@@ -382,7 +382,9 @@ class StrategyRepository:
             try:
                 parsed = StrategyDraftEditInput.model_validate(value)
             except Exception as error:
-                raise self._validation() from error
+                safe = self._validation()
+                self._save_safe_error(connection, context, "strategy.edit", idempotency_key, value, safe)
+                raise safe from error
             source = (
                 connection.execute(
                     select(strategy_versions)
@@ -425,7 +427,9 @@ class StrategyRepository:
             try:
                 parsed = StrategyDraftValidateInput.model_validate(value)
             except Exception as error:
-                raise self._validation() from error
+                safe = self._validation()
+                self._save_safe_error(connection, context, "strategy.validate", idempotency_key, value, safe)
+                raise safe from error
             row = (
                 connection.execute(
                     select(strategy_versions)
