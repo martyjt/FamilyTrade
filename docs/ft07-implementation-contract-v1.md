@@ -689,8 +689,9 @@ canonical 60-second slots; closed quality and finish count zero. Semantic replay
 zero. Before a step, or before any batch item is applied, the engine checks current
 state count plus the accepted non-replay delta. Exceeding the configured cap raises
 `BATCH_LIMIT_EXCEEDED` before that input/batch creates state, decision, fill, event,
-or checkpoint; supplied state remains byte-identical. `run_engine` deduplicates
-only its allowed adjacent semantic replay before this cumulative preflight, so splitting
+or checkpoint; supplied state remains byte-identical. After the strict ingress
+guard, `run_engine` deduplicates only its allowed adjacent semantic replay before
+this cumulative preflight, so splitting
 the same run into chunks cannot bypass either limit. A configured cap above the
 absolute ceiling is `UNSUPPORTED_CONFIGURATION` before state creation.
 Pre-start warm-up bars count identically; warm-up is not a cap bypass.
@@ -754,16 +755,26 @@ warm-up continuity but cannot produce strategy or accounting output.
 The integrated `CorrectionObservation` is deliberately not an FT-07 input. It has
 no engine-event discriminator and direct submission fails the strict union as
 `VALIDATION_ERROR` with detail `UNSUPPORTED_CORRECTION_OBSERVATION` before semantic
-input hashing, cursor/correlation advancement, or any state/output. FT-09 owns
-correction observation and its frozen `CORRECTION_OBSERVED` event. Before an
-interval is processed, the caller may normalize causal-latest data by supplying the
-one corrected `BarSelection`; FT-07 then consumes only that immutable selection.
+input hashing, cursor/correlation advancement, or any state/output. The same ingress
+guard requires every `CompletedBarEvent.selection.correction_observations == ()`
+exactly. Any non-empty nested tuple, regardless of its `applied` or `reason` values,
+returns the same error at the same pre-hash boundary. FT-09 owns correction
+observation and its frozen `CORRECTION_OBSERVED` event. Before an interval is
+processed, the caller routes every observation to FT-09, then constructs the one
+integrated `BarSelection` whose `bar`, `origin`, and `availability_at` name the
+causal corrected choice and whose `correction_observations` is empty; FT-07 consumes
+only that immutable selection.
 After the interval is committed, FT-09 records the late observation and does not
 call FT-07. If a caller instead submits a replacement `CompletedBarEvent` for the
 already consumed interval, the normal retained-byte/overlap rule returns
-`DUPLICATE_CONFLICT`, with no state change or `CORRECTION_OBSERVED` output. Thus a
-correction never enters `semantic_input_bytes` except as the selected CompletedBar's
-ordinary immutable fields, and FT-07 never duplicates FT-09 event ownership.
+`DUPLICATE_CONFLICT`, with no state change or `CORRECTION_OBSERVED` output. For an
+accepted CompletedBarEvent, the semantic projection includes the complete integrated
+selection—`bar`, `origin`, `availability_at`, and the explicit empty
+`correction_observations` array—plus the outer revision and timing fields. The
+nested key is never omitted or ignored. Therefore retries differing only by a
+non-empty nested observation tuple are not semantic replays: the non-empty form is
+rejected before its input is hashed, while two valid empty forms follow the
+ordinary exact-byte replay rule. FT-07 never duplicates FT-09 event ownership.
 
 `CompletedBarEvent.selection.bar` must be a canonical 60-second FT-05
 `CompletedBar` for the config owner,
@@ -798,9 +809,9 @@ engine does not impose a symmetric pre-start rejection.
 `FinishRunEvent` is exactly
 `{kind:"finish_run_v1",effective_at:UTC timestamp,recorded_at:UTC timestamp,
 emission_context:EmissionContext}`.
-It is valid only for a backtest that has not already reached the separate
-actual-contract `STOPPED`/expiry-blocked terminal path, exactly once, with
-`effective_at=config.end_at` and
+After the section 4 replay/conflict/terminal dispatch, normal validation of a Finish
+on nonterminal state requires backtest mode, exactly-once processing,
+`effective_at=config.end_at`, and
 `recorded_at>=effective_at`. Every expected open minute from `start_at` through the
 finish boundary must already be accounted for by a valid completed bar or explicit
 missing/invalid quality event; otherwise it is `VALIDATION_ERROR` with detail
@@ -823,6 +834,31 @@ creating stale orders.
 
 ## 4. Event order, causality, aggregation, and deterministic identity
 
+Every `step_engine`/batch item uses this exact preflight order:
+
+1. Validate the config/state fingerprint and strict outer input shape, including the
+   pre-hash empty-correction guard in section 3. Failure returns its typed error with
+   no semantic hash or state/output.
+2. Derive logical identity and `semantic_input_bytes`. If it is the immediately
+   preceding semantic replay, return unchanged state and empty deltas first.
+3. If the retained semantic bytes changed for the same identity or overlap the
+   consumed cursor, return `DUPLICATE_CONFLICT` second.
+4. If state is `FINISHED`, `STOPPED`, `BLOCKED_UNCLOSED`, or
+   `BLOCKED_EXPIRY_UNRESOLVED`, return `RUN_FINISHED` third for every remaining
+   distinct input.
+5. Only for nonterminal state apply recorded-time/cursor/resource checks and the
+   event-kind-specific validation below, including Finish mode, exact-once,
+   `effective_at`, coverage, and unaccounted-open-interval checks.
+
+Steps 2-4 therefore precede all normal `FinishRunEvent` validation. An exact retry
+of the Finish that created `FINISHED` replays; a changed same-identity Finish is a
+duplicate conflict; every remaining distinct Finish after `FINISHED` or after an
+actual-contract `STOPPED`/blocked terminal returns `RUN_FINISHED`, even if its mode,
+effective time, recorded time, or coverage would have failed normal Finish
+validation. None of these classifications advances a counter or emits another
+event. Structurally malformed input and forbidden nested corrections remain step-1
+errors because no canonical semantic identity exists for them.
+
 Events are processed in increasing logical interval start and nondecreasing
 recorded time. A completed bar's logical interval is its bar interval; a quality
 event's is its declared interval; finish sorts after all intervals ending at its
@@ -834,8 +870,9 @@ A different semantic input overlapping a consumed logical interval is
 `DUPLICATE_CONFLICT`; any older semantically nonidentical input is
 `EVENT_OUT_OF_ORDER` while state is nonterminal. Terminal precedence is closed in
 section 8.
-`run_engine` removes its allowed adjacent semantic replay before the cumulative
-resource preflight. Incremental chunks may overlap by their last event, so batch and
+After the step-1 ingress guard, `run_engine` removes its allowed adjacent semantic
+replay before the cumulative resource preflight. Incremental chunks may overlap by
+their last event, so batch and
 incremental results are identical across a caller-boundary duplicate. Arbitrary
 old-event lookup and durable deduplication belong to later persistence, not this
 bounded checkpoint.
@@ -1004,9 +1041,11 @@ Define `semantic_input_bytes` as section 13.1 canonical bytes of the complete ty
 input after removing exactly `emission_context.attempt_id` and `.fencing_token`
 from the hash projection; their keys are omitted, not replaced by null. Every other
 field remains, including event `recorded_at`, `order_submitted_at`,
-`output_recorded_at`, selected record/payload/revision, quality sources, and Finish
-time. `input_sha256=SHA256(semantic_input_bytes)`, and `last_input_sha256` stores that
-value.
+`output_recorded_at`, the complete valid BarSelection with its explicit empty
+`correction_observations` array, selected record/payload/revision, quality sources,
+and Finish time. `input_sha256=SHA256(semantic_input_bytes)`, and
+`last_input_sha256` stores that value. A forbidden non-empty nested observation is
+rejected before this projection and has no `input_sha256`.
 
 Two inputs are byte-identical for replay exactly when their
 `semantic_input_bytes` are equal and their logical interval/kind matches. Therefore
@@ -2019,6 +2058,9 @@ The named boundary and replay tests are:
 - `test_finish_cannot_strand_or_finish_unresolved_actual_contract_liquidation`
 - `test_correction_observation_rejected_before_hash_state_and_output`
 - `test_pre_cursor_correction_enters_only_as_caller_selected_bar`
+- `test_terminal_dispatch_precedes_normal_finish_validation_for_every_terminal_state`
+- `test_completed_bar_rejects_nested_corrections_before_hash_cursor_and_state`
+- `test_retry_differing_only_by_nested_corrections_is_invalid_not_replay`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
