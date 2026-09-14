@@ -1050,6 +1050,7 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
         for root in (pair.long_root, pair.short_root)
         if root in nodes
     ]
+    direct_source_spans: list[int] = []
     for module in definition.setup_modules:
         for field in ("filter_root", "arm_filter_root", "entry_filter_root"):
             root = getattr(module, field, None)
@@ -1061,10 +1062,20 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
     ):
         feature_id = getattr(source, "feature_id", None)
         if feature_id is not None:
+            direct_source_spans.append(spans.get(feature_id, 0))
             for node in definition.nodes:
                 if node.kind == "feature" and node.feature_id == feature_id:
                     roots.append(node.node_id)
-    return max((math.ceil(span(root) / execution_interval_seconds) for root in roots), default=0)
+    return max(
+        (
+            math.ceil(value / execution_interval_seconds)
+            for value in [
+                *(span(root) for root in roots),
+                *direct_source_spans,
+            ]
+        ),
+        default=0,
+    )
 
 
 def _module_warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:

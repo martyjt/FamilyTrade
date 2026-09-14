@@ -549,7 +549,7 @@ def test_confirmed_pivot_zones_warmup_includes_minimum_touch_spacing_boundaries(
             "merge_multiple": "1",
             "max_width_multiple": "1",
             "minimum_touches": 10,
-                "max_zones": 2,
+            "max_zones": 2,
             "zone_max_age_bars": 1,
             "cooldown_execution_bars": 0,
         }
@@ -1333,11 +1333,21 @@ def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> Non
     value = _fixture()
     features = value["features"]
     assert isinstance(features, list)
-    features[0]["parameters"]["n"] = 500
+    features.append(
+        {
+            "feature_id": "limit-sma-500",
+            "kind": "indicator",
+            "name": "sma_v1",
+            "output_type": "price",
+            "unit": "contract_price",
+            "interval_seconds": 900,
+            "parameters": {"n": 500, "input": "close"},
+        }
+    )
     value["order_policy"]["entry_type"] = "limit"
     value["order_policy"]["limit_price_source"] = {
         "kind": "feature",
-        "feature_id": features[0]["feature_id"],
+        "feature_id": "limit-sma-500",
         "offset_ticks": 0,
     }
     result = _validate(value)
