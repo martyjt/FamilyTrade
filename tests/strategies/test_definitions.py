@@ -1277,22 +1277,50 @@ def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
 
 
 def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive() -> None:
-    value = _fixture()
-    nodes = value["nodes"]
+    leaves_64 = _fixture()
+    nodes = leaves_64["nodes"]
     assert isinstance(nodes, list)
-    for index in range(5):
-        nodes.append(
-            {
-                "kind": "group",
-                "node_id": f"z{index}",
-                "op": "all",
-                "children": [f"z{index + 1}" if index < 4 else "long-entry"],
-            }
-        )
-    result = _validate(value)
-    assert [
-        (item.path, item.code.value) for item in result.errors if item.code.value == "SIZE_LIMIT"
-    ] == [("/nodes/7", "SIZE_LIMIT")]
+    nodes.extend(
+        {
+            "kind": "compare",
+            "node_id": f"leaf-{index:02d}",
+            "op": "lt",
+            "left": "fast-now",
+            "right": "slow-now",
+            "tolerance": None,
+        }
+        for index in range(62)
+    )
+    assert _validate(leaves_64).valid
+    leaves_65 = copy.deepcopy(leaves_64)
+    leaves_65["nodes"].append(
+        {
+            "kind": "compare",
+            "node_id": "leaf-65",
+            "op": "lt",
+            "left": "fast-now",
+            "right": "slow-now",
+            "tolerance": None,
+        }
+    )
+    assert ("/nodes", "SIZE_LIMIT") in {(i.path, i.code.value) for i in _validate(leaves_65).errors}
+
+    for count, expected in ((4, True), (5, False)):
+        value = _fixture()
+        chain = value["nodes"]
+        for index in range(count):
+            chain.append(
+                {
+                    "kind": "group",
+                    "node_id": f"z{index}",
+                    "op": "all",
+                    "children": [f"z{index + 1}" if index + 1 < count else "cross-up"],
+                }
+            )
+        result = _validate(value)
+        assert result.valid is expected
+        if not expected:
+            assert ("/nodes/7", "SIZE_LIMIT") in {(i.path, i.code.value) for i in result.errors}
 
 
 def test_type_unit_operator_matrix_is_exhaustive() -> None:
