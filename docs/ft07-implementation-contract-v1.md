@@ -260,7 +260,7 @@ OrderState = {
   intent:OrderIntent,
   order_sequence:int,
   status:"PENDING"|"ACTIVE"|"FILLED"|"EXPIRED"|"CANCELLED",
-  status_reason:string|null, activated_at:UTC timestamp|null,
+  status_reason:string, activated_at:UTC timestamp|null,
   fill_sequence:int|null, source_setup_id:string|null,
   originating_decision_id:lowercase UUIDv7|null
 }
@@ -280,7 +280,7 @@ ProtectiveOrderState = {
   trigger_price:finite Decimal,
   status:"ACTIVE"|"FILLED"|"CANCELLED",
   active_from:UTC timestamp, filled_at:UTC timestamp|null,
-  cancelled_at:UTC timestamp|null, status_reason:string|null,
+  cancelled_at:UTC timestamp|null, status_reason:string,
   entry_order_id:lowercase UUIDv7, entry_fill_id:lowercase UUIDv7,
   order_sequence:int, fill_sequence:int|null,
   originating_decision_id:lowercase UUIDv7
@@ -445,6 +445,36 @@ global `next_fill_sequence`, the Fill uses that same integer, and state incremen
 `next_fill_sequence` by one. A sibling OCO cancellation retains null. Rejection,
 cancellation, expiry, semantic replay, and prospective fill evaluation consume no fill
 sequence.
+
+`status_reason` is never null and always stores the reason for the order's latest
+committed state transition, not its immutable creation cause. It changes in the
+same atomic domain transition as `status`, before the matching `ORDER_STATE` event
+hash is reserved. The event payload's `reason` and the resulting stored
+`status_reason` are byte-identical. The complete mapping is:
+
+| Transition | New status | Exact stored/event reason |
+| --- | --- | --- |
+| regular entry/close/force schedule created for later activation | `PENDING` | `ORDER_SUBMITTED` |
+| regular entry/close created already effective, pending order activated, or protective leg created active | `ACTIVE` | `ORDER_ACTIVATED` |
+| any regular or protective order fills | `FILLED` | the exact committed `Fill.reason` from the closed fill inventory |
+| entry TTL or any exclusive order expiry | `EXPIRED` | `ORDER_EXPIRED` |
+| pending entry cancelled at entry-window close | `CANCELLED` | `ENTRY_WINDOW_CLOSED` |
+| pending entry cancelled at contract entry cutoff | `CANCELLED` | `ENTRY_CUTOFF` |
+| pending entry cancelled when liquidation or force-close chronology applies | `CANCELLED` | `CONTRACT_LIQUIDATION` or `FORCE_CLOSE`, respectively |
+| pending entry/setup order cancelled by execution-bar setup expiry | `CANCELLED` | `SETUP_EXPIRED` |
+| pending entry cancelled by a newly latched loss/drawdown policy | `CANCELLED` | the exact latch code: `DAILY_LOSS_LIMIT` or `CUMULATIVE_DRAWDOWN_LIMIT` |
+| prospective fill cancels an existing entry for invalid resolved geometry or fill-time cap excess | `CANCELLED` | `ENTRY_GEOMETRY_GAP` or `RISK_GAP`, respectively |
+| OCO sibling, bracket, close intent, or scheduled force close cancelled because another Fill flattened the position | `CANCELLED` | `POSITION_FLAT` |
+
+Signal-time `RISK_SIZE_ZERO`, `DAILY_ENTRY_LIMIT`, geometry, conflict, and policy
+rejections that occur before committed order creation produce no `OrderState` and
+therefore no stored status reason. A lifecycle close created at liquidation or
+force-close still stores `ORDER_SUBMITTED` or `ORDER_ACTIVATED` according to its
+actual initial status; `CONTRACT_LIQUIDATION`/`FORCE_CLOSE` is not retained in this
+latest-transition field merely because it caused creation. Activation overwrites
+`ORDER_SUBMITTED`; Fill, expiry, and cancellation overwrite `ORDER_ACTIVATED`.
+Restore requires the exact reason allowed for the stored status and order role;
+null, an unknown string, or a mismatched status/reason is `CHECKPOINT_MISMATCH`.
 `activated_at`, `filled_at`, and `cancelled_at` are modeled transition times derived
 from the eligible bar/boundary, never persistence times. Durable record timing is
 carried only by Decision/OrderIntent/Fill/RunEvent under the explicit section 4
@@ -1133,9 +1163,71 @@ graph without `eval`, code generation, dynamic fields, or mutation. It implement
 the closed FT-06 type/unit/operator matrix and three-valued truth tables. Division
 by zero is `UNKNOWN`. Every entry, exit, and filter root requires `PASS`; `UNKNOWN`
 does not reuse an older value and a supplementary exit root at `UNKNOWN` never
-closes a position. Computational short-circuiting may occur, but Decision evidence
-contains every reachable leaf in lexical node-ID order with its exact value,
-source IDs, known-at time, and stable reason.
+closes a position. Group outcome aggregation may short-circuit internally only
+after every distinct reachable leaf result required for persistence has been
+produced; Decision evidence omits no reachable leaf and orders them lexically by
+node ID with exact value, source IDs, known-at time, and stable reason.
+
+For Decision evidence, an evidence leaf is each distinct reachable boolean
+`feature`, boolean `constant`, `compare`, or `temporal_compare` node after recursively
+expanding groups. Feature/arithmetic/value operands are not additional RuleResults,
+and group nodes are not serialized as RuleResults; their distinct reachable leaves
+are. A leaf referenced more than once appears once. Every reachable leaf is
+evaluated for evidence even when the root result is already determined, and the
+result tuple is sorted by lexical `node_id`, independent of traversal or group-child
+order. For every leaf, `value=true`, `unit="boolean"` means `PASS`; `value=false`,
+`unit="boolean"` means `FAIL`; and `value=null`, `unit="boolean"` means `UNKNOWN`.
+
+Each evaluation has exactly one reason context, selected from the root being
+evaluated: `entry_rule`, `exit_rule`, or `setup_filter`. Known RuleResult reasons are
+closed as follows:
+
+| Context | Leaf `PASS` | Leaf `FAIL` |
+| --- | --- | --- |
+| `entry_rule` | `ENTRY_RULE_PASS` | `ENTRY_RULE_FAIL` |
+| `exit_rule` | `EXIT_RULE_PASS` | `EXIT_RULE_FAIL` |
+| `setup_filter` | `ENTRY_RULE_PASS` | `FILTER_FAIL` |
+
+`ENTRY_RULE_PASS` is deliberately the accepted success label for a passing setup
+filter because the frozen reason inventory has no `FILTER_PASS`; no new public code
+is invented. A passing filter alone emits no Decision. Its RuleResults are carried
+by the consequent arm/entry-intent Decision, whose own reason remains the applicable
+setup/action reason rather than being replaced by the leaf label.
+
+An UNKNOWN entry/exit leaf preserves one exact causal UNKNOWN code. A boolean
+FeatureNode copies its `FeatureValue.reason_code`. A compare examines dependencies
+in `left,right,tolerance` order (omitting null tolerance); a temporal compare uses
+`previous(left),previous(right),current(left),current(right)` order. Each dependency
+recursively examines arithmetic args in their declared tuple order. The first
+UNKNOWN dependency's code wins. Only after all dependencies are known does divide
+by zero yield `ZERO_DENOMINATOR` or another nonfinite/domain failure yield
+`NUMERIC_DOMAIN`. A constant cannot be UNKNOWN. If an unavailable dependency has no
+more specific applicable readiness/data code, use `RULE_CHILD_UNKNOWN`. In
+`setup_filter` context every UNKNOWN leaf instead projects `FILTER_UNKNOWN`; its
+underlying FeatureValue remains unchanged and no unavailable value is reused.
+
+Group result and Decision-reason precedence are also closed. Evaluate all children
+for evidence, then apply the frozen truth table: `all` gives known `FAIL` priority,
+`any` gives known `PASS` priority, and `none` gives a child `PASS` priority and
+inverts it to root `FAIL`; only when no decisive child exists does any UNKNOWN make
+the group UNKNOWN. Otherwise all remaining known children produce the frozen root
+result. A known entry/exit root uses `ENTRY_RULE_PASS|ENTRY_RULE_FAIL` or
+`EXIT_RULE_PASS|EXIT_RULE_FAIL`; a failed filter root uses `FILTER_FAIL`. An UNKNOWN
+group root uses `RULE_CHILD_UNKNOWN`, except a setup-filter group uses
+`FILTER_UNKNOWN`. An UNKNOWN non-group entry/exit root copies its sole leaf's exact
+UNKNOWN reason, while an UNKNOWN non-group filter root uses `FILTER_UNKNOWN`.
+
+For example, an exit `any` group containing lexical leaves `a_rsi` UNKNOWN with
+`NOT_READY_RSI` and `b_guard` PASS records those two RuleResults in that lexical
+order and the root is `PASS`/`EXIT_RULE_PASS`. Replacing the `any` with `all` makes
+the root `UNKNOWN`/`RULE_CHILD_UNKNOWN`; using `a_rsi` directly as the exit root
+makes the Decision reason `NOT_READY_RSI`. The same UNKNOWN leaf under a setup
+filter records `FILTER_UNKNOWN` and makes the filter root `FILTER_UNKNOWN`. An
+entry `none` group with any PASS child is root `FAIL`/`ENTRY_RULE_FAIL`, regardless
+of later UNKNOWN children, while all FAIL children are root `PASS`/
+`ENTRY_RULE_PASS`. Leaf source IDs retain their existing causal operand order with
+first occurrence only; lexical sorting applies to RuleResult records, never to the
+source tuple inside one result.
 
 Rule evaluation is always anchored to one completed execution aggregate. With `A`
 defined in section 4, each `RuleResult.known_at` is the maximum of `A` and the
@@ -1163,9 +1255,10 @@ public reason strings ad hoc.
 `NOT_READY_RSI` is mandatory, rather than the generic warm-up code, whenever a
 requested Wilder RSI has not yet accumulated its exact seed/delta history or that
 history was broken by missing/invalid quality. This is the exact reason projected
-by `exit_rule_unknown_does_not_close`; a supplementary exit at that UNKNOWN result
-does not close the position. Its leaf `RuleResult.reason_code` and the resulting
-HOLD `Decision.reason_code` are both exactly `NOT_READY_RSI`, not
+by `exit_rule_unknown_does_not_close`, whose `rsi-exit` is the direct non-group
+condition root; a supplementary exit at that UNKNOWN result does not close the
+position. Its leaf `RuleResult.reason_code` and the resulting HOLD
+`Decision.reason_code` are both exactly `NOT_READY_RSI`, not
 `NOT_READY_WARMUP`, `EXIT_RULE_FAIL`, or free-form prose.
 
 ## 6. Zones, setups, targets, and configuration
@@ -1871,8 +1964,8 @@ event for the input, but before any part of this Fill transition. The Fill UUID 
 in section 4 uses exactly that internal hash and `f`. After deriving `fill_id`, apply
 one atomic Fill transition: first copy the selected order's checkpointed
 `originating_decision_id` into `Fill.causation_decision_id`; set the filled order's
-`fill_sequence=f`; update its
-status, cash, fees, per-fill/cumulative P&L, signed position, risk counters, and
+`fill_sequence=f`, `status="FILLED"`, and `status_reason=Fill.reason`; update cash,
+fees, per-fill/cumulative P&L, signed position, risk counters, and
 bracket/OCO state. For an entry Fill, copy the same non-null ID into both protective
 records before the pending-entry pointer is cleared; allocate entry-created order IDs
 stop, target, then scheduled force close when applicable, with the scheduled
@@ -2138,6 +2231,12 @@ The named boundary and replay tests are:
 - `test_exit_rule_close_fill_after_checkpoint_retains_originating_close_decision`
 - `test_lifecycle_close_fill_after_checkpoint_has_null_causation_decision`
 - `test_order_causation_fields_are_bounded_strict_and_checkpoint_byte_exact`
+- `test_order_status_reason_latest_transition_and_event_reason_matrix`
+- `test_order_status_reason_restore_validation_and_hash_chain`
+- `test_rule_result_known_pass_fail_reason_projection_by_context`
+- `test_rule_result_unknown_dependency_and_group_precedence`
+- `test_rule_result_filter_projection_and_lexical_leaf_evidence`
+- `test_rule_result_all_any_none_truth_reason_matrix`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
@@ -2150,6 +2249,8 @@ prices, fees, P&L, calendars, and outcomes remain explicitly synthetic.
 
 The complete implementation path allowlist is:
 
+- `.gitattributes`, only the three exact FT-06/FT-07 `text eol=lf` rules in this
+  reviewed candidate; immutable after identical-byte PASS.
 - `docs/ft07-implementation-contract-v1.md`, immutable after identical-byte PASS.
 - `src/familytrade/strategies/indicators.py`.
 - `src/familytrade/strategies/rules.py`.
@@ -2184,6 +2285,7 @@ uv run pytest tests/access tests/market_data tests/strategies/test_definitions.p
 uv run ruff check src/familytrade/strategies/indicators.py src/familytrade/strategies/rules.py src/familytrade/strategies/zones.py src/familytrade/strategies/setups.py src/familytrade/simulation tests/engine
 uv run ruff format --check src/familytrade/strategies/indicators.py src/familytrade/strategies/rules.py src/familytrade/strategies/zones.py src/familytrade/strategies/setups.py src/familytrade/simulation tests/engine
 uv run mypy src
+git check-attr text eol -- docs/ft06-implementation-contract-v1.md docs/ft06-implementation-contract-v1-amendment-1.md docs/ft07-implementation-contract-v1.md
 ~~~
 
 `tests/bootstrap/test_planning_packet.py` must again report 37 members and exact
@@ -2191,6 +2293,24 @@ aggregate `9bb0e22bb72ccc0dc1db56ddcb8ba9106b5260f92710b2597072247c3f5f723d`.
 The implementation diff must have zero changes to every frozen member and both
 FT-06 contract documents. CI for the exact candidate head must include the existing
 bootstrap/access/market-data/strategy checks plus the new focused engine command.
+
+The attribute command must report `text: set` and `eol: lf` for all three contract
+paths. Byte validation is raw-file validation, not `git hash-object` normalization:
+in a disposable fresh checkout of the exact candidate, set `core.autocrlf=true`,
+run a hard reset of that disposable checkout only, and read SHA-256, byte length,
+LF count, and CR count directly from each working-tree file. The required FT-06
+results remain exactly:
+
+| Path | SHA-256 | Bytes | LF | CR |
+| --- | --- | ---: | ---: | ---: |
+| `docs/ft06-implementation-contract-v1.md` | `d27368178c51aed3588d727f6a1f2776008f97ce2c9beaa3a1d9b4d46374ab09` | 55404 | 1030 | 0 |
+| `docs/ft06-implementation-contract-v1-amendment-1.md` | `0f348e46916d58f6ac421a09ea4160608217484de6e65daa306dab75b8e6fe8e` | 3925 | 97 | 0 |
+
+The FT-07 checkout must likewise equal the reviewed candidate Git blob's raw
+SHA-256/byte length with zero CR. All three checkout bytes must equal their Git blob
+bytes exactly. A mismatch is `WAIT_CONTRACT_GAP`; it cannot be normalized or
+accepted by review. This byte-preservation amendment changes only `.gitattributes`
+and the current FT-07 contract; both FT-06 Git blobs and contents remain untouched.
 
 ## 13. Dispatch terminal and human gate
 
