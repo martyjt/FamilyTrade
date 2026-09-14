@@ -375,6 +375,29 @@ def _independent_raw_rules(value: Mapping[str, object]) -> list[ValidationIssue]
                             "Arithmetic units must match.",
                         )
                     )
+    modules = value.get("setup_modules")
+    if isinstance(modules, list):
+        for index, module in enumerate(modules):
+            if not isinstance(module, Mapping) or module.get("kind") != "confirmed_pivot_zones_v1":
+                continue
+            atr = module.get("atr_length")
+            if isinstance(atr, int) and not isinstance(atr, bool) and not 2 <= atr <= 500:
+                issues.append(
+                    _issue(
+                        f"/setup_modules/{index}/atr_length",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "ATR length is out of range.",
+                    )
+                )
+            merge = module.get("merge_multiple")
+            if not _decimal(merge) or not (Decimal(0) < Decimal(cast(str, merge)) <= Decimal(100)):
+                issues.append(
+                    _issue(
+                        f"/setup_modules/{index}/merge_multiple",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "Multiple must be in (0, 100].",
+                    )
+                )
     return issues
 
 
