@@ -273,7 +273,7 @@ class StrategyRepository:
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
         with self.engine.begin() as connection:
-            self._authorise(connection, context, "strategy:write")
+            self._mutation_gate(connection, context, idempotency_key)
             replay = self._replay(connection, context, "strategy.create", idempotency_key, value)
             if replay is not None:
                 return replay
@@ -346,7 +346,7 @@ class StrategyRepository:
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
         with self.engine.begin() as connection:
-            self._authorise(connection, context, "strategy:write")
+            self._mutation_gate(connection, context, idempotency_key)
             replay = self._replay(connection, context, "strategy.edit", idempotency_key, value)
             if replay is not None:
                 return replay
@@ -392,7 +392,7 @@ class StrategyRepository:
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyValidationResult:
         with self.engine.begin() as connection:
-            self._authorise(connection, context, "strategy:write")
+            self._mutation_gate(connection, context, idempotency_key)
             try:
                 parsed = StrategyDraftValidateInput.model_validate(value)
             except Exception as error:
