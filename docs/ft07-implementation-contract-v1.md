@@ -327,7 +327,7 @@ MarkEvidence = {
 
 RunEvent = {
   schema_version:"v1", run_event_id, owner_user_id,
-  aggregate_type:"run"|"lane", aggregate_id, sequence,
+  aggregate_type:"run"|"lane", aggregate_id:lowercase UUIDv7, sequence,
   event_type, effective_at, recorded_at, payload,
   causation_id, correlation_id, state_sha256,
   attempt_id:lowercase UUIDv7|null, fencing_token:positive int,
@@ -386,7 +386,7 @@ does not recompute any accumulator from unavailable earlier inputs.
 protective order. On a committed Fill, the order snapshot receives the current
 global `next_fill_sequence`, the Fill uses that same integer, and state increments
 `next_fill_sequence` by one. A sibling OCO cancellation retains null. Rejection,
-cancellation, expiry, exact replay, and prospective fill evaluation consume no fill
+cancellation, expiry, semantic replay, and prospective fill evaluation consume no fill
 sequence.
 `activated_at`, `filled_at`, and `cancelled_at` are modeled transition times derived
 from the eligible bar/boundary, never persistence times. Durable record timing is
@@ -555,6 +555,12 @@ years later, with February 29 clipped to February 28 when the fifth year is not 
 leap year. Equality is allowed; a larger span is `UNSUPPORTED_CONFIGURATION`
 before state creation. Forward paper requires a null pinned
 revision, null `end_at`, `end_policy:"mark_open"`, and causal-latest selections.
+Backtest additionally requires `lane_id=null`; every RunEvent then has
+`aggregate_type:"run"` and `aggregate_id=run_id`. Forward paper requires a non-null
+`lane_id`; every RunEvent then has `aggregate_type:"lane"` and
+`aggregate_id=lane_id`. These values are derived solely from validated config and
+are never caller-selected per event. A mismatched mode/lane shape is
+`UNSUPPORTED_CONFIGURATION` before state creation.
 `force_close` is backtest-only and requires explicit `force_close_at`, the start of
 the last selected valid fill bar whose end is at or before `end_at`. `mark_open`
 requires null `force_close_at`. A caller cannot change config after initialization;
@@ -565,12 +571,12 @@ valid range is `1..2000000`, and `2000000` is an absolute v1 ceiling that no con
 may override. `EngineState.canonical_bar_count` is cumulative across every
 `step_engine`, `run_engine`, caller chunk, and checkpoint restore. A valid completed
 bar counts one; each missing/invalid quality interval counts its expected open
-canonical 60-second slots; closed quality and finish count zero. Exact replay counts
+canonical 60-second slots; closed quality and finish count zero. Semantic replay counts
 zero. Before a step, or before any batch item is applied, the engine checks current
 state count plus the accepted non-replay delta. Exceeding the configured cap raises
 `BATCH_LIMIT_EXCEEDED` before that input/batch creates state, decision, fill, event,
 or checkpoint; supplied state remains byte-identical. `run_engine` deduplicates
-only its allowed adjacent exact replay before this cumulative preflight, so splitting
+only its allowed adjacent semantic replay before this cumulative preflight, so splitting
 the same run into chunks cannot bypass either limit. A configured cap above the
 absolute ceiling is `UNSUPPORTED_CONFIGURATION` before state creation.
 Pre-start warm-up bars count identically; warm-up is not a cap bypass.
@@ -688,11 +694,13 @@ Events are processed in increasing logical interval start and nondecreasing
 recorded time. A completed bar's logical interval is its bar interval; a quality
 event's is its declared interval; finish sorts after all intervals ending at its
 effective time. The state stores the last logical interval, bar record ID when
-applicable, payload hash, availability/control time, and input hash. An exact
-replay of the immediately preceding input returns the unchanged state and
-`replayed:true`. A different input overlapping a consumed logical interval is
-`DUPLICATE_CONFLICT`; any older nonidentical input is `EVENT_OUT_OF_ORDER`.
-`run_engine` removes its allowed adjacent exact replay before the cumulative
+applicable, payload hash, availability/control time, and input hash. A semantic
+replay of the immediately preceding input returns the unchanged state,
+empty decision/intent/protective/fill/evidence/event deltas, and `replayed:true`.
+A different semantic input overlapping a consumed logical interval is
+`DUPLICATE_CONFLICT`; any older semantically nonidentical input is
+`EVENT_OUT_OF_ORDER`.
+`run_engine` removes its allowed adjacent semantic replay before the cumulative
 resource preflight. Incremental chunks may overlap by their last event, so batch and
 incremental results are identical across a caller-boundary duplicate. Arbitrary
 old-event lookup and durable deduplication belong to later persistence, not this
@@ -793,7 +801,7 @@ The domain, UUID timestamp, and ordered `fields` tuple are closed:
 | Fill | `fill` | `model_time` | `run_id,lane_id,fill_sequence,order_id,bar_record_id,effect,reason,pre_state_sha256` |
 | Zone | `zone` | `known_at` | `run_id,lane_id,creation_sequence,contract_id,zone_interval_seconds,kind,pivot_bar_end,confirmation_bar_end` |
 | Setup | `setup` | `known_at` | `run_id,lane_id,setup_sequence,family,side,source_zone_ids,arm_execution_index,signal_execution_index` |
-| Run event | `run-event` | `effective_at` | `run_id,lane_id,event_sequence,event_type,causation_id,correlation_id,state_sha256` |
+| Run event | `run-event` | `effective_at` | `run_id,lane_id,aggregate_type,aggregate_id,event_sequence,event_type,payload_sha256,causation_id,correlation_id,state_sha256` |
 
 For a completed bar, modeled input effective time is bar end in backtest and
 selection availability in forward paper; logical start/end are the bar bounds. For
@@ -805,14 +813,32 @@ allocated once for an entry at its Decision; its Fill allocates stop, then targe
 then a scheduled force close when required. Any independently created close
 allocates once at creation. All next-sequence
 counters are stored in `EngineState`, increment only on committed creation, and are
-covered by checkpoint/state hashes. Rejection and exact replay consume no counter.
+covered by checkpoint/state hashes. Rejection and semantic replay consume no counter.
 `source_zone_ids` in setup identity is the snapshot tuple ordered by source-zone
 creation sequence then lexical zone ID; it is never iteration order. Null optional
 identity fields remain explicit null tuple members.
-`input_sha256` is the section 13.1 canonical hash of the complete typed input with
-only `emission_context.attempt_id` and `.fencing_token` excluded. Thus a retry
-fence/attempt cannot change domain identity, while `recorded_at`,
-`order_submitted_at`, and `output_recorded_at` remain replay-significant.
+`payload_sha256` is the section 13.1 SHA-256 of the complete strict RunEvent payload;
+it commits `FILL_RECORDED.evidence_mode` and every other payload byte without adding
+a public RunEvent field.
+Define `semantic_input_bytes` as section 13.1 canonical bytes of the complete typed
+input after removing exactly `emission_context.attempt_id` and `.fencing_token`
+from the hash projection; their keys are omitted, not replaced by null. Every other
+field remains, including event `recorded_at`, `order_submitted_at`,
+`output_recorded_at`, selected record/payload/revision, quality sources, and Finish
+time. `input_sha256=SHA256(semantic_input_bytes)`, and `last_input_sha256` stores that
+value.
+
+Two inputs are byte-identical for replay exactly when their
+`semantic_input_bytes` are equal and their logical interval/kind matches. Therefore
+a retry differing only in attempt ID and/or fencing token replays the already
+committed domain result: it consumes no counter, recomputes/emits no record, returns
+empty deltas, and leaves the original Fill/RunEvent transport fields and all IDs
+unchanged. The replacement attempt/fence values are not copied into old outputs.
+Any difference in any retained field is not replay: the same/overlapping logical
+interval is `DUPLICATE_CONFLICT`, and an older interval is `EVENT_OUT_OF_ORDER`,
+both with byte-identical state. On a new non-replay input, the supplied attempt/fence
+remain opaque output metadata and do not enter any domain UUID tuple. This is an
+identity exclusion only, not a pure-engine lease/fence validation claim.
 
 These canonical vectors are normative:
 
@@ -821,8 +847,12 @@ These canonical vectors are normative:
 | `correlation` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"completed_bar_v1","2026-01-02T03:04:00Z","2026-01-02T03:05:00Z","0000000000000000000000000000000000000000000000000000000000000000"]` | `019b7caa-6360-7464-861e-19052358e1e7` |
 | `decision` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"018f4c00-0000-7000-8000-000000000002","2026-01-02T03:05:00Z","ENTRY","long","018f4c00-0000-7000-8000-000000000003","0000000000000000000000000000000000000000000000000000000000000000","019b7caa-6360-7464-861e-19052358e1e7"]` | `019b7caa-6360-740c-8624-091a15fdd2b9` |
 | `protective-stop-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,1,"018f4c00-0000-7000-8000-000000000010","018f4c00-0000-7000-8000-000000000011","sell",1,"1999.8"]` | `019b7cab-4dc0-7d0e-b4c8-ad805426627d` |
+| `run-event` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,"run","018f4c00-0000-7000-8000-000000000001",0,"FILL_RECORDED","8d2c44a2b0bf6a6f589a16d67ae99a43ecd45197ef6d5b66fb228bb283334c73","018f4c00-0000-7000-8000-000000000011","019b7caa-6360-7464-861e-19052358e1e7","0000000000000000000000000000000000000000000000000000000000000000"]` | `019b7cab-4dc0-758a-b2fb-4df46dcfbc51` |
 
-The table and vectors, not host UUID or clock APIs, are the cross-platform oracle.
+The RunEvent vector's payload canonical bytes are
+`{"evidence_mode":"historical","fill_id":"018f4c00-0000-7000-8000-000000000011","fill_sequence":0,"kind":"FILL_RECORDED","order_id":"018f4c00-0000-7000-8000-000000000010"}`.
+Their SHA-256 is the payload-hash field shown in the vector. The table and vectors,
+not host UUID or clock APIs, are the cross-platform oracle.
 
 ## 5. Feature and rule evaluation
 
@@ -991,9 +1021,34 @@ occurs at the exact boundary but cannot backdate a market fill to the earlier ba
 open; the close waits for the next eligible fill-bar start. A closed, missing, or
 delayed interval can create and persist the intent but cannot fill it.
 
-Entry TTL is execution-bar wall-clock time. All full fill bars in the half-open
-active interval are eligible; expiry occurs before a fill bar or decision at the
-exclusive expiry boundary. Missing bars and scheduled closures do not extend it.
+Entry TTL is an exact half-open count of execution-grid periods. Let `E` be the
+creating Decision's `execution_bar_end`, `S=OrderIntent.submitted_at`,
+`I=strategy_version.execution_interval_seconds`, and
+`N=order_policy.entry_ttl_execution_bars`. Validation guarantees `S>=E`. Define
+`k=floor((S-E)/I)` using UTC elapsed seconds, `ttl_start=E+k*I`, and
+`expires_at=ttl_start+N*I`. Thus a submission exactly on a boundary starts that
+period; a delayed submission inside a period receives only the remainder of that
+first period, followed by `N-1` whole periods. The accepted fixture has
+`E=S=2026-09-14T10:00:00Z`, `I=900`, `N=2`, and therefore
+`expires_at=2026-09-14T10:30:00Z` exactly.
+
+The grid continues in UTC from `E`; missing/invalid bars, maintenance, scheduled
+closure, session breaks, and delayed delivery never shift `ttl_start` or extend
+expiry. `active_from` remains the first configured fill-bar start at or after `S`
+in forward paper and at or after `E` in backtest, subject to stored-calendar/open
+and entry-window eligibility. A fill is eligible only at a modeled instant in
+`[active_from,expires_at)`. If expiry lies strictly inside an active fill bar, an
+opening-gap fill before expiry remains valid, then the order expires at the exact
+boundary before any unknowable intrabar touch. Expiry at bar start precedes its
+gap; expiry at bar end precedes a touch modeled at that end. If no eligible fill-bar
+start exists before expiry, the order remains PENDING and expires without Fill.
+
+For the delayed-forward boundary vector `E=2026-09-14T10:15:00Z`,
+`S=2026-09-14T10:15:02.200000Z`, `I=900`, and `N=1`, expiry is exactly
+`2026-09-14T10:30:00Z`; a 60-second fill bar may first activate at `10:16:00Z`, a
+gap there is eligible, and a touch modeled at `10:30:00Z` is not. Backtest uses
+`S=E`, so the same formula reduces to `E+N*I`.
+
 Effective entry-window close, an FT-07 risk latch, entry cutoff, liquidation, or
 run force-close cancels pending entries but never protective exits. No pause,
 resume, close-and-stop, operator-risk-control, or inherited control flag exists in
@@ -1097,6 +1152,41 @@ buy close: base_price="2006", fill_price="2006.1", slippage="0.1",
 All quoted Decimals above are section 13.1 canonical strings; stored USD values
 remain exact cents even when canonical serialization removes a trailing zero.
 
+`EngineState.exposure_seconds` is the frozen numerator "position-open eligible-bar
+seconds," not wall-clock time between fills. It changes only when one complete valid
+configured fill bar is committed. For each such half-open bar `[B0,B1)`, define
+`open_at=B0` when a position carried into the bar, otherwise the opening Fill's
+`model_time`; define `close_at` as a closing Fill's `model_time` when it flattens in
+that bar, otherwise `B1` while the position remains open. Add
+`max(0,close_at-open_at)` in whole seconds exactly once after all fills for the bar.
+With the frozen model times this gives the closed matrix:
+
+- opening-gap entry at `B0` and no exit: the whole bar;
+- intrabar entry at `B1` and no exit: zero for that bar;
+- carried position with opening-gap exit at `B0`: zero;
+- carried position with intrabar exit at `B1`: the whole bar;
+- opening-gap entry followed by a same-bar stop at `B1`: the whole bar;
+- intrabar entry and conservative same-bar stop both modeled at `B1`: zero.
+
+A carried position receives the whole duration only for an eligible completed fill
+bar. An incomplete aggregate, missing or invalid expected minute, explicit
+missing/invalid quality interval, maintenance, scheduled-closed interval, and every
+other closed-market span contribute zero even though position state carries. No
+source minute inside a broken fill bucket contributes partially. Pre-start warm-up
+and time at or after finite `end_at` contribute zero. Semantic replay contributes zero.
+An in-progress fill bucket contributes nothing until completion; its checkpointed
+components ensure the eventual bar increments once after restore. The counter is
+stored and hashed in every Fill/Event snapshot, never recomputed from unavailable
+history, and batch, incremental, and checkpoint replay must return the same integer.
+
+Transition timing is exact: an opening-gap Fill/Event at `B0` precedes accrual for
+the rest of that bar. If a later intrabar Fill closes at `B1`, add the bar's exposure
+inside that closing Fill's atomic transition before its RunEvents. Otherwise add the
+bar delta at `B1` after fill processing and before `MARK_RECORDED`. An intrabar entry
+at `B1` includes its zero delta in that entry transition. Consequently the next
+Fill/Event pre-state always includes all exposure from earlier eligible bars, while
+no opening-gap record prematurely claims future seconds from its current bar.
+
 Canonical boundary examples are: commission `1.005` for one contract becomes
 `1.00`, commission `1.015` becomes `1.02`; with tick `0.005`, multiplier `1`, and
 quantity `1`, raw close P&L `0.005` becomes `0.00` while `0.015` becomes `0.02`.
@@ -1141,7 +1231,8 @@ At `entry_cutoff_at`, cancel entries/setups and block new ones. At
 `liquidation_start_at`, cancel entry state and first inspect the position. If flat,
 create no close intent, emit no close Decision/Fill, never enter `CLOSING`, and
 terminate `STOPPED` with `CONTRACT_CLOSED`. A later
-FinishRunEvent is a nonidentical post-terminal input and returns `RUN_FINISHED`.
+FinishRunEvent is a semantically distinct post-terminal input and returns
+`RUN_FINISHED`.
 If a position is open, create the liquidation `close_intent` under section 7 and set
 `CLOSING`. It remains byte-identical across scheduled closure or missing/invalid
 data while protection stays active, then fills at the next eligible fill bar under
@@ -1192,9 +1283,10 @@ Only the exactly-once `FinishRunEvent` creates `RUN_FINISHED` and terminal
 `FINISHED` for a successful `mark_open` or completed force-close run. If the force
 bar was missing/invalid or the position/close remains unresolved, that finish
 atomically sets `force_close_state:"blocked"` and `BLOCKED_UNCLOSED`; it never
-backdates a fill. Replaying the byte-identical FinishRunEvent returns unchanged
+backdates a fill. Replaying a semantically identical FinishRunEvent, including one
+differing only in excluded attempt/fence metadata, returns unchanged
 terminal state with `replayed:true` and emits no second terminal event. Every
-nonidentical post-terminal input is `RUN_FINISHED`. Forward paper cannot
+semantically nonidentical post-terminal input is `RUN_FINISHED`. Forward paper cannot
 force-close. Actual-contract liquidation remains the separate `STOPPED`/
 `BLOCKED_EXPIRY_UNRESOLVED` path above and does not wait for a run finish event.
 
@@ -1317,6 +1409,16 @@ The FT-07 event payload kinds are the relevant strict subset:
   `DataQualityEvent` combinations in section 3.
 - `RUN_FINISHED` with `{kind,status,end_policy,cash,equity,realized_pnl,
   unrealized_pnl,position_open,pending_entry,mark_status,reason|null}`.
+
+`FILL_RECORDED.payload.evidence_mode` is exactly `"historical"` for every backtest
+Fill and `"contemporaneous"` for every forward-paper Fill. A delayed forward bar is
+still contemporaneous because the Fill is created only at its causal availability
+and never backdated into an already-open bar. `"reconstructed_after_outage"` is not
+emitted by this pure FT-07 engine because it has no durable recovery input; later
+lane recovery may use that frozen label without changing these two mode bindings.
+The derived `aggregate_type`, `aggregate_id`, evidence mode, event payload, and
+event-state hash are fixed before the RunEvent UUID is derived, so retry transport
+metadata cannot alter any of those semantic bytes or the ID.
 
 The frozen `ORDER_STATE` payload is exactly
 `{kind:"ORDER_STATE",order_id,from,to,reason}`. Its closed transition vocabulary is
@@ -1455,8 +1557,8 @@ The code, sole public message, and condition are:
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
 | CHECKPOINT_MISMATCH | Engine checkpoint is invalid. | Format/engine version, state hash, or typed checkpoint invariant fails. |
 | EVENT_OUT_OF_ORDER | Engine event is out of order. | A non-replay event is at or before the consumed cursor or recorded time regresses. |
-| DUPLICATE_CONFLICT | Logical bar has conflicting content. | The consumed logical identity reappears with a different record or payload. |
-| RUN_FINISHED | Engine run is already terminal. | A nonidentical input is supplied after a finished/stopped/blocked terminal state. |
+| DUPLICATE_CONFLICT | Logical bar has conflicting content. | The consumed logical identity reappears with different retained semantic input bytes. |
+| RUN_FINISHED | Engine run is already terminal. | A semantically nonidentical input is supplied after a finished/stopped/blocked terminal state. |
 
 `EngineError` is `{code,message,details}`. Messages are fixed by code and never
 include owner-private values or exception text. Details contain only JSON Pointer
@@ -1519,7 +1621,7 @@ fill table now supplies it; the old sentence cannot override final fill accounti
 The named boundary and replay tests are:
 
 - `test_batch_incremental_and_checkpoint_replay_are_byte_identical`
-- `test_incremental_overlap_replays_exact_last_event_once`
+- `test_incremental_overlap_semantic_replay_returns_empty_deltas_once`
 - `test_same_logical_bar_with_different_payload_is_duplicate_conflict`
 - `test_out_of_order_event_changes_no_state`
 - `test_deterministic_uuid7_ids_and_state_hashes_match_on_windows_and_linux_vectors`
@@ -1575,6 +1677,10 @@ The named boundary and replay tests are:
 - `test_order_state_creation_uses_not_created_for_pending_and_direct_active`
 - `test_fill_and_run_event_hash_snapshots_include_all_counters_and_same_bar_stop`
 - `test_long_and_short_fill_field_conventions_match_canonical_examples`
+- `test_entry_ttl_backtest_and_delayed_forward_half_open_alignment_is_exact`
+- `test_exposure_seconds_gap_intrabar_quality_checkpoint_and_replay_matrix`
+- `test_run_event_aggregate_identity_payload_hash_and_fill_evidence_mode_bytes`
+- `test_attempt_fence_only_semantic_replay_and_retained_field_conflicts`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
