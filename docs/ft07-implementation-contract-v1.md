@@ -801,7 +801,9 @@ a quality event they are its start/end and modeled time is `end_at`; for finish
 they both equal `effective_at`. `causation_event_id` on a Decision is its input
 correlation ID. `correlation_sequence` increments once per accepted non-replay
 input; all outputs from that input share its correlation ID. Order sequence is
-allocated entry, then stop, then target, or once for a close. All next-sequence
+allocated once for an entry at its Decision; its Fill allocates stop, then target,
+then a scheduled force close when required. Any independently created close
+allocates once at creation. All next-sequence
 counters are stored in `EngineState`, increment only on committed creation, and are
 covered by checkpoint/state hashes. Rejection and exact replay consume no counter.
 `source_zone_ids` in setup identity is the snapshot tuple ordered by source-zone
@@ -950,9 +952,11 @@ The three close causes bind timing and expiry as follows:
 | Backtest force close | `scheduled_force_close` uses the section 8 pre-scheduling rule and moves to `close_intent` at `config.force_close_at`. | `config.end_at` (exclusive). |
 
 At most one live `close_intent` exists. Creation appends its exact `OrderIntent` to
-`intents` once and creates `OrderState` as `PENDING`; when `active_from` is reached,
-it becomes `ACTIVE` before fill evaluation. Submission, activation, cancellation,
-and expiry each emit the corresponding exact `ORDER_STATE` transition. An exit-rule
+`intents` once. `OrderState` is `PENDING` when `active_from` is later and becomes
+`ACTIVE` before fill evaluation when that boundary is reached; if already effective,
+it is created directly `ACTIVE`. Its initial state and every later
+activation, cancellation, or expiry emit the corresponding exact `ORDER_STATE`
+transition under section 9. An exit-rule
 close persists unchanged
 across missing data, maintenance, scheduled closure, delayed delivery, and entry
 window closure. At liquidation the pre-existing exit close expires before it is
@@ -1047,6 +1051,51 @@ forbidden. The USD pipeline is exactly:
    `risk_fraction * min(starting_cash,current_equity)`; floor `budget / modeled_loss`
    before account/config caps. Inclusive risk comparisons use the modeled loss,
    with no premature cent-rounding of price loss or budget.
+
+The frozen Fill fields use these exact conventions. `slippage` is a nonnegative
+price magnitude `abs(fill_price-base_price)`, never a signed cash amount; adverse
+direction is expressed by `fill_price` being higher for a buy or lower for a sell.
+Target and intrabar-limit fills with no modeled slippage serialize `"0"`.
+`position_quantity_after` is signed contracts: positive long, negative short, and
+zero flat. On the only v1 opening Fill, `position_average_after=fill_price`; on the
+only v1 full closing Fill it is null. Adds and partial reductions are unreachable
+because v1 permits one all-or-none entry and every close is for the full position;
+no valid v1 Fill can serialize either case.
+
+`Fill.realized_pnl` is the P&L realized by that Fill, not the cumulative state value
+and not net of commission. It is `"0"` for an opening Fill and the cent-quantized
+frozen direction/price formula for a full close. `Fill.commission` is the separately
+cent-quantized per-fill fee. `cash_after` deducts entry commission on open and, on
+close, adds that Fill's realized P&L then deducts exit commission. The state's
+`realized_pnl` accumulates closing-Fill values only; state `fees` accumulates every
+Fill commission. This keeps fee attribution consistent with the frozen metrics,
+which allocate fees later but do not fold them into Fill realized P&L.
+
+With starting cash `"25000"`, tick `"0.1"`, multiplier `"10"`, one contract, and
+commission `"1.25"`, the canonical long market/stop pair is:
+
+~~~text
+buy open:  base_price="2000", fill_price="2000.1", slippage="0.1",
+           commission="1.25", realized_pnl="0", cash_after="24998.75",
+           position_quantity_after=1, position_average_after="2000.1"
+sell close: base_price="1994", fill_price="1993.9", slippage="0.1",
+            commission="1.25", realized_pnl="-62", cash_after="24935.5",
+            position_quantity_after=0, position_average_after=null
+~~~
+
+Under the same inputs the canonical short market/stop pair is:
+
+~~~text
+sell open: base_price="2000", fill_price="1999.9", slippage="0.1",
+           commission="1.25", realized_pnl="0", cash_after="24998.75",
+           position_quantity_after=-1, position_average_after="1999.9"
+buy close: base_price="2006", fill_price="2006.1", slippage="0.1",
+           commission="1.25", realized_pnl="-62", cash_after="24935.5",
+           position_quantity_after=0, position_average_after=null
+~~~
+
+All quoted Decimals above are section 13.1 canonical strings; stored USD values
+remain exact cents even when canonical serialization removes a trailing zero.
 
 Canonical boundary examples are: commission `1.005` for one contract becomes
 `1.00`, commission `1.015` becomes `1.02`; with tick `0.005`, multiplier `1`, and
@@ -1180,17 +1229,18 @@ The closed Decision emission contract is:
 - `CLOSE`: an exit-rule PASS emits one market-close `OrderIntent`; it is the only
   Decision type permitted to carry `order_intent.kind:"close"`. Contract and
   force-close schedules are deterministic lifecycle actions and emit no Decision.
-- `CANCEL`: a policy boundary cancels an existing setup or pending entry/exit order
-  without a Fill. Mechanical OCO sibling cancellation is only `ORDER_STATE`, not a
-  second trading Decision.
+- `CANCEL`: only an execution-bar evaluation may emit this type. In v1 the exact
+  case is `SETUP_EXPIRED` at the completed execution-bar boundary; it may also cancel
+  that setup's pending entry without a Fill. Mechanical OCO cancellation and
+  wall-clock order lifecycle boundaries are `ORDER_STATE`, not trading Decisions.
 - `REJECT`: an otherwise actionable candidate is rejected by conflict, target/
   geometry, sizing, or risk policy and emits no order/fill.
 
 At one accepted input, derive atomic candidates from the one prescribed pre-state,
 then serialize Decisions by `(stage_rank,side_rank,family_rank,setup_id,reason_code)`.
-Stage ranks are boundary cancellation `0`, exit evaluation/action `1`, entry-rule
-evaluation `2`, setup arm/signal `3`, entry-intent/conflict `4`, and sizing/risk
-rejection `5`. Side ranks are long `0`, short `1`, null `2`; family ranks are
+Stage ranks are execution-bar setup expiry/cancellation `0`, exit evaluation/action
+`1`, entry-rule evaluation `2`, setup arm/signal `3`, entry-intent/conflict `4`, and
+sizing/risk rejection `5`. Side ranks are long `0`, short `1`, null `2`; family ranks are
 breakout `0`, reversal `1`, none `2`; null setup ID sorts after UUIDs. This ordering
 does not change the already-derived conflict/winner outcome.
 
@@ -1207,6 +1257,29 @@ between serialized Decisions: all Decisions for the input are applied in the ord
 above before their `DECISION_RECORDED` events are appended in that same order and
 before any consequent later transition. This removes UUID/hash circularity and
 makes batch/checkpoint replay identical.
+
+A `CANCEL/SETUP_EXPIRED` Decision is fully projected from that completed execution
+bar: `execution_bar_end` is the bar end; backtest `effective_at` equals it and
+forward `effective_at` is the latest availability of its cited sources; `side` and
+`setup_id` copy the expiring snapshot; `order_intent` is null; evidence uses the
+already permitted `evaluation_stage:"arm"`, its exact evidence mode, an empty
+`results` tuple, and that snapshot as `selected_setup`. Its
+`source_bar_record_ids` is the ordered-unique concatenation of the snapshot's stored
+source tuple followed by the current execution aggregate's integrated source tuple,
+keeping first occurrence. `decided_at`, causation, sequence, IDs, and hashes use the
+normal Decision rules above.
+
+Window close, contract cutoff, risk latch, force-close cutoff, liquidation, and
+entry TTL/absolute expiry are wall-clock lifecycle transitions, never `CANCEL`
+Decisions—even when a boundary happens to equal an execution-bar end. When an order
+exists, its exact `ORDER_STATE` event has `effective_at` equal to the boundary,
+`recorded_at` from the boundary-advancing input, the input correlation ID, and no
+invented source-ID/evidence fields; its payload remains the frozen five-field
+shape. A setup-only cancellation updates the typed `SetupState` and checkpoint with
+the same stable reason but emits no fabricated event type. When a boundary lies
+inside a bar, its transition precedes the permitted fill processing defined in
+sections 3 and 7. Thus no non-bar instant is forced into a Decision whose frozen
+backtest invariant requires `effective_at=execution_bar_end`.
 
 The stable domain reason inventory is closed for v1:
 
@@ -1245,26 +1318,89 @@ The FT-07 event payload kinds are the relevant strict subset:
 - `RUN_FINISHED` with `{kind,status,end_policy,cash,equity,realized_pnl,
   unrealized_pnl,position_open,pending_entry,mark_status,reason|null}`.
 
-The frozen `ORDER_STATE` payload refers to any order by `order_id`; its
-`from,to,reason` values come from the corresponding strict state record. Entry and
-close IDs resolve to `OrderState.intent`. Protective IDs resolve only to the fixed
-`ProtectiveBracketState.stop` or `.target` records, whose role, type, side, trigger,
+The frozen `ORDER_STATE` payload is exactly
+`{kind:"ORDER_STATE",order_id,from,to,reason}`. Its closed transition vocabulary is
+`from:"NOT_CREATED"|"PENDING"|"ACTIVE"` and
+`to:"PENDING"|"ACTIVE"|"FILLED"|"EXPIRED"|"CANCELLED"`. `NOT_CREATED` is the
+required non-null payload-only origin sentinel; it is never an `OrderState.status`
+and no null or empty string is serialized. A regular entry/close or scheduled force
+close whose `active_from` is later is initially `NOT_CREATED -> PENDING` with
+`ORDER_SUBMITTED`, then `PENDING -> ACTIVE` with `ORDER_ACTIVATED`. Stop and target legs created active by
+an entry Fill each emit `NOT_CREATED -> ACTIVE` with `ORDER_ACTIVATED`, stop first.
+An order already active at creation uses that same direct transition rather than a
+fictitious PENDING hop. Fill, expiry, and cancellation transitions originate from
+the order's actual `PENDING` or `ACTIVE` state and use the stable reason inventory;
+`FILLED`, `EXPIRED`, and `CANCELLED` are terminal and never appear as `from`.
+
+Entry and close IDs resolve to `OrderState.intent`. Protective IDs resolve only to
+the fixed `ProtectiveBracketState.stop` or `.target` records, whose role, type, side, trigger,
 entry causation, and lifecycle fields are serialized in state/checkpoint bytes.
 Protective records never appear in the `intents` tuple or in
 `Decision.order_intent`; they appear in the dedicated `protective_orders` delta.
 This makes bracket persistence unambiguous without changing the frozen payload or
 `OrderIntent` schema.
 
-Events are returned in exact processing order. Within one input: exact-time boundary
-cancellation/submission/activation transitions; each completed fill bar's opening
-gap precedence and then permitted intrabar precedence; execution-bar Decisions and
-then their order transitions; close mark; risk latch; then state/finish record. The
+Events are returned in exact processing order. Within each completed fill bar:
+apply boundary/submission/activation transitions effective at or before bar start;
+apply opening-gap precedence; apply any internal entry-window close/cutoff/expiry;
+then apply only the permitted intrabar precedence. After all newly completed fill
+bars, apply execution-bar Decisions and then their order transitions, close mark,
+risk latch, and state/finish record. A boundary outside a completed bar retains its
+exact modeled position among those actions. The
 serialized Decision group follows section 9, so its `DECISION_RECORDED` events are
 adjacent and ordered exactly like `decisions`. Each event sequence increments once.
 `attempt_id` and `fencing_token` are copied unchanged from `EmissionContext` into
 each Fill/RunEvent. The correlation ID is a deterministic UUIDv7 in the
 `correlation` domain for the input identity. A later issue may validate ownership and persist
 these immutable records atomically but may not reinterpret them.
+
+The hash/identity snapshot algorithm is closed. On an accepted non-replay input,
+the engine reserves the current correlation sequence, derives the correlation ID,
+increments `next_correlation_sequence`, and applies the validated input cursor,
+canonical-bar, interval-bucket, and prior ordered transitions before any dependent
+Fill/Decision snapshot. All following hashes are section 13.1 hashes of the complete
+typed `EngineState`, including every next-sequence counter and scheduled order.
+
+For a prospective Fill, let `f=state.next_fill_sequence` and let
+`fill_pre_state_sha256` be the state hash after activation and every earlier action/
+event for the input, but before any part of this Fill transition. The Fill UUID tuple
+in section 4 uses exactly that internal hash and `f`. After deriving `fill_id`, apply
+one atomic Fill transition: set the filled order's `fill_sequence=f`; update its
+status, cash, fees, per-fill/cumulative P&L, signed position, risk counters, and
+bracket/OCO state; allocate entry-created order IDs stop, target, then scheduled
+force close when applicable; increment `next_order_sequence` for each allocation;
+and finally set `next_fill_sequence=f+1`. The Fill's `*_after` fields project this
+post-transition state. No Fill event is emitted until the whole transition is
+complete, so no hashed state exposes an unprotected newly opened position.
+
+Each RunEvent then uses a separate deterministic reservation. Let
+`e=state.next_event_sequence` after its domain transition and all earlier emitted
+events. Set `next_event_sequence=e+1`, hash that post-domain/post-reservation state
+as `event_state_sha256`, derive `run_event_id` from the section 4 tuple using
+`sequence=e` and that hash, set `RunEvent.state_sha256=event_state_sha256`, and append
+the event without another state mutation. This is non-circular because RunEvent IDs
+are not stored in `EngineState`. Multiple events for one atomic Fill share its fully
+committed domain state but have distinct hashes because each includes its own
+advanced event counter.
+
+RunEvent causation and modeled time are exact: `DECISION_RECORDED` uses the Decision
+ID/time; `ORDER_STATE` uses the order ID and status-transition boundary;
+`FILL_RECORDED` uses the Fill ID and `model_time`; `MARK_RECORDED` uses the close
+component bar ID and fill-bar end; `RISK_LATCHED` uses null and the determining mark
+time; `DATA_QUALITY` uses null and quality `end_at`; `RUN_FINISHED` uses null and the
+Finish effective time. Every event retains its input correlation ID.
+
+For an entry Fill, emit `ORDER_STATE ACTIVE->FILLED`, `FILL_RECORDED`, stop
+`NOT_CREATED->ACTIVE`, target `NOT_CREATED->ACTIVE`, then any scheduled force-close
+`NOT_CREATED->PENDING`. If conservative same-bar handling then fills the stop, its
+`fill_pre_state_sha256` is the complete post-entry state after all those event-counter
+increments. Apply the stop Fill atomically, then emit stop `ACTIVE->FILLED`, its
+`FILL_RECORDED`, target `ACTIVE->CANCELLED`, and any additional `POSITION_FLAT`
+cancellations by ascending `order_sequence`. Thus entry and stop use consecutive
+fill sequences, the stop UUID commits to the created bracket and all entry-side
+counters, and replay/checkpoint chunking cannot change either identity. A market
+close analogously emits its filled transition and Fill event before stop, target,
+then other `POSITION_FLAT` cancellations in ascending order sequence.
 
 ## 10. Pure state, checkpoint, replay, and failures
 
@@ -1434,6 +1570,11 @@ The named boundary and replay tests are:
 - `test_order_fill_sequence_is_null_until_fill_and_advances_only_on_commit`
 - `test_decision_type_emission_order_uuid_and_pre_post_hash_chain_are_exact`
 - `test_signed_zero_and_negative_protective_triggers_require_finite_tick_geometry`
+- `test_setup_expiry_cancel_decision_has_exact_completed_bar_projection`
+- `test_policy_window_cutoff_ttl_and_risk_transitions_emit_no_cancel_decision`
+- `test_order_state_creation_uses_not_created_for_pending_and_direct_active`
+- `test_fill_and_run_event_hash_snapshots_include_all_counters_and_same_bar_stop`
+- `test_long_and_short_fill_field_conventions_match_canonical_examples`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
