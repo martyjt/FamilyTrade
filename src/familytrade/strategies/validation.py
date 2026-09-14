@@ -1365,9 +1365,9 @@ def validate_rule_definition(
         return DefinitionValidationResult(
             valid=False,
             definition=None,
-            errors=ordered[:255]
-            + (
-                (
+            errors=(
+                ordered[:255]
+                + (
                     _issue(
                         "/",
                         ValidationIssueCode.ISSUE_LIMIT,
@@ -1375,7 +1375,7 @@ def validate_rule_definition(
                     ),
                 )
                 if len(ordered) > 256
-                else ()
+                else ordered
             ),
             canonical_definition_sha256=None,
             required_warmup_bars=None,
