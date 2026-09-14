@@ -181,7 +181,7 @@ Pydantic error normalization is exact:
 | missing field or missing discriminator | REQUIRED |
 | wrong JSON primitive, including bool for integer | INVALID_TYPE |
 | unknown discriminator or enum member | INVALID_ENUM |
-| string/list/numeric bound failure | OUT_OF_RANGE |
+| string, numeric, or declared field/list cardinality or uniqueness failure | OUT_OF_RANGE |
 | invalid decimal grammar | INVALID_DECIMAL |
 | non-finite value | NONFINITE |
 
@@ -200,7 +200,7 @@ The stable ValidationIssue code and path inventory is closed:
 | REQUIRED | required field/discriminator is absent | exact missing field |
 | MUTUALLY_EXCLUSIVE | fields cannot be supplied/enabled together | lexically first conflicting field |
 | INVALID_ENUM | discriminator or enum value is unknown | exact discriminator/enum field |
-| OUT_OF_RANGE | scalar/string/list cardinality is outside its inclusive bound | exact bounded field |
+| OUT_OF_RANGE | scalar/string bound or declared field/list cardinality or uniqueness constraint fails | exact bounded field or list |
 | INVALID_DECIMAL | decimal string violates canonical grammar | exact value field |
 | NONFINITE | a non-finite raw numeric value is supplied | exact value field |
 | DUPLICATE_KEY | an exact decoded key repeats or distinct object keys normalize to the same NFC key | containing object |
@@ -217,17 +217,19 @@ The stable ValidationIssue code and path inventory is closed:
 | REQUIRED_FOR_LIMIT | limit order omits its price source | /order_policy/limit_price_source |
 | FORBIDDEN_FOR_MARKET | market order supplies a limit price source | /order_policy/limit_price_source |
 | INVALID_SIDE_ROOT | disabled-side root is non-null or enabled side lacks the required root | exact entry/exit side root |
-| INVALID_MODULE_COMBINATION | setup kind/cardinality/dependency or entry-combination requirement is invalid | exact paths enumerated below |
+| INVALID_MODULE_COMBINATION | setup kind uniqueness/dependency, setup-price backing, or entry-combination requirement is invalid | exact paths enumerated below |
 | INVALID_WINDOW | local/calendar/segment rule fails for a structurally valid window | /constraints/entry_windows/{index} |
-| SIZE_LIMIT | raw/canonical bytes, JSON node count, list/argument count, or graph depth exceeds a bound | smallest containing collection; root / for operation/definition byte or node limit |
+| SIZE_LIMIT | raw/canonical bytes, total JSON node count, aggregate condition-leaf count, or container/group/arithmetic depth exceeds a resource bound | root / for operation/definition byte or node limits; otherwise exact paths below |
 | ISSUE_LIMIT | more distinct issues exist than the public result limit | root /; always the final returned issue |
 | LOOKBACK_LIMIT | derived historical span or declared historical lookback exceeds 2,000 execution bars | root / |
 | NAME_MISMATCH | operation name and definition.name differ after NFC | /definition/name |
 
 Feature parameter values with a supported name use INVALID_TYPE, INVALID_ENUM,
 OUT_OF_RANGE, or INVALID_DECIMAL rather than UNSUPPORTED_PARAMETER. A missing
-required parameter is REQUIRED at /features/{index}/parameters/{name}. Duplicate
-setup kinds are INVALID_MODULE_COMBINATION at the later
+required parameter is REQUIRED at /features/{index}/parameters/{name}. The only
+field/list uniqueness failure assigned OUT_OF_RANGE is days_of_week; repeated
+feature_id or node_id remains solely DUPLICATE_ID. Duplicate setup kinds are
+INVALID_MODULE_COMBINATION at the later
 /setup_modules/{index}/kind. A missing required zones or one-position dependency is
 INVALID_MODULE_COMBINATION at /setup_modules. A rules_only, setups_only,
 setup_and_rules, or setup_or_rules violation is INVALID_MODULE_COMBINATION at
@@ -253,11 +255,43 @@ successfully created.
 
 RuleDefinition retains its separate 65,536-byte canonical limit, 32 features, 128
 nodes, 64 condition leaves, 16 args/children, group depth 4, arithmetic depth 4,
-and historical lookback 2,000 execution bars. Collection/cardinality issues point
-to /features, /nodes, or the exact args/children collection. Group/arithmetic
-depth issues point to the first over-depth node in lexical node-ID order after
-graph resolution. The condition-leaf and total-node limits point to /nodes; feature
-and setup cardinality limits point to /features and /setup_modules respectively.
+and historical lookback 2,000 execution bars. Declared collection cardinality and
+resource complexity are exclusive categories: a failure in this table emits only
+the listed code at the listed path and never also emits the other code.
+
+| list-valued input | declared cardinality behavior | sole code and path |
+| --- | --- | --- |
+| features | 0..32 | OUT_OF_RANGE at /features |
+| nodes | 0..128 | OUT_OF_RANGE at /nodes |
+| ArithmeticNode.args | 2..16 | OUT_OF_RANGE at /nodes/{index}/args |
+| GroupNode.children | 1..16 | OUT_OF_RANGE at /nodes/{index}/children |
+| setup_modules | 0..5 | OUT_OF_RANGE at /setup_modules |
+| EntryWindow.days_of_week | 1..7 and unique | OUT_OF_RANGE at /constraints/entry_windows/{index}/days_of_week |
+| constraints.entry_windows | no independent item-count bound | no cardinality issue; only per-window issues or a root / resource SIZE_LIMIT |
+
+OUT_OF_RANGE is used for every declared field/list cardinality above, including an
+upper-bound excess; SIZE_LIMIT is never emitted for one of those failures.
+SIZE_LIMIT is reserved for the operation/definition byte and JSON-node totals,
+the aggregate 64-condition-leaf maximum at /nodes, and group/arithmetic depth at
+the /nodes/{index} record of the first over-depth node in lexical node-ID order
+after graph resolution. A large
+entry_windows list can therefore fail only a global resource bound as SIZE_LIMIT
+at root /; it has no implicit item-count maximum. No input list other than the
+seven rows above exists in the v1 operation envelopes or RuleDefinition graph.
+Transport-safety and raw-operation byte/node/depth gates run before the four
+validation phases and skip the unbounded subtree as specified above. Definition
+bytes/leaves/depth remain phase 4. A document may contain separate failures from
+both categories, but each constraint and isolated test case is eligible for exactly
+one code/path and is never double-reported under OUT_OF_RANGE and SIZE_LIMIT.
+
+test_collection_cardinality_code_path_matrix_is_exclusive covers each valid bound,
+each applicable immediately outside bound, and the duplicate-weekday case. For
+every bounded row, each invalid case has exactly OUT_OF_RANGE at the table path and
+no SIZE_LIMIT. The named
+test_raw_byte_node_depth_and_definition_byte_limits_use_exact_boundaries covers only
+the reserved resource constraints, asserts exactly SIZE_LIMIT at their specified
+paths with no OUT_OF_RANGE, and covers the unbounded entry_windows aggregation
+case at root /.
 
 At most 256 issues are returned. The implementation derives and sorts all distinct
 issues within the bounded walk. If more than 256 exist, it returns the first 255
@@ -897,12 +931,13 @@ All named tests in tests/strategies/test_definitions.py:
 - test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues
 - test_complete_validation_code_path_inventory_and_issue_truncation_are_stable
 - test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash
-- test_raw_byte_node_depth_and_definition_limits_use_exact_boundaries
+- test_raw_byte_node_depth_and_definition_byte_limits_use_exact_boundaries
+- test_collection_cardinality_code_path_matrix_is_exclusive
 - test_raw_hashable_structural_validation_failure_is_idempotently_replayed
 - test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row
 - test_invalid_rule_definition_fixture_returns_all_three_typed_errors
 - test_duplicate_ids_unknown_references_cycles_and_non_boolean_roots_are_rejected
-- test_node_feature_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive
+- test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive
 - test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive
 - test_type_unit_operator_matrix_is_exhaustive
 - test_integer_count_times_or_divided_by_scalar_is_type_mismatch
