@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Literal, cast
 from uuid import uuid7
 
@@ -252,6 +252,31 @@ class ArchiveStore:
         check()
         self._fsync_directory(final.parent)
         check()
+        return final
+
+    def complete_existing_finalize(
+        self,
+        owner: str,
+        uri: str,
+        digest: str,
+        length: int,
+        *,
+        check_fence: Callable[[], None],
+    ) -> Path:
+        """Repair and reverify a final left between rename and durability completion."""
+
+        check_fence()
+        final = self.resolve(owner, uri)
+        check_fence()
+        self.read_verified(owner, uri, digest, length)
+        check_fence()
+        final.chmod(0o400)
+        check_fence()
+        self._fsync_directory(final.parent)
+        check_fence()
+        self._assert_owner_only_mode(final, 0o400)
+        self.read_verified(owner, uri, digest, length)
+        check_fence()
         return final
 
     def read_verified(self, owner: str, uri: str, digest: str, length: int) -> bytes:
@@ -2028,11 +2053,38 @@ class _LeaseHeartbeatState:
     def __init__(self) -> None:
         self.cancelled = Event()
         self.failure: BaseException | None = None
+        self._cancel_lock = Lock()
+        self._cancel_current: Callable[[], None] | None = None
 
     def fail(self, error: BaseException) -> None:
         if self.failure is None:
             self.failure = error
             self.cancelled.set()
+
+    def bind_cancel(self, cancel: Callable[[], None]) -> bool:
+        with self._cancel_lock:
+            if self.cancelled.is_set():
+                return False
+            self._cancel_current = cancel
+            return True
+
+    def unbind_cancel(self, cancel: Callable[[], None]) -> None:
+        with self._cancel_lock:
+            if self._cancel_current is cancel:
+                self._cancel_current = None
+
+    def stop(self) -> None:
+        self.cancelled.set()
+        cancel_error: BaseException | None = None
+        with self._cancel_lock:
+            cancel = self._cancel_current
+            if cancel is not None:
+                try:
+                    cancel()
+                except BaseException as error:  # noqa: BLE001 - surfaced after mandatory join
+                    cancel_error = error
+        if cancel_error is not None:
+            self.fail(cancel_error)
 
     def check(self) -> None:
         if self.failure is not None:
@@ -2131,87 +2183,103 @@ class DatasetPublisher:
         operation: str,
         idempotency_key: str,
         fencing_token: int,
+        cancellation: _LeaseHeartbeatState | None = None,
     ) -> None:
         now = self.catalog._now()
         expires = now + timedelta(seconds=self.lease_seconds)
-        with self.catalog.engine.begin() as connection:
-            root = (
-                connection.execute(
-                    select(idempotency)
-                    .where(
-                        and_(
-                            idempotency.c.owner_user_id == owner,
-                            idempotency.c.operation == operation,
-                            idempotency.c.idempotency_key == idempotency_key,
-                        )
-                    )
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
-            fence = (
-                connection.execute(
-                    select(series_fences)
-                    .where(
-                        and_(
-                            series_fences.c.owner_user_id == owner,
-                            series_fences.c.series_id == series_id,
-                        )
-                    )
-                    .with_for_update()
-                )
-                .mappings()
-                .one()
-            )
+        with self.catalog.engine.connect() as connection:
+            driver_connection = connection.connection.driver_connection
+            cancel = cast(Callable[[], None] | None, getattr(driver_connection, "cancel", None))
             if (
-                root["state"] != "started"
-                or root["holder"] != self.worker_id
-                or root["lease_expires_at"] is None
-                or root["lease_expires_at"] <= now
-                or fence["fencing_token"] != fencing_token
-                or fence["holder"] != self.worker_id
-                or fence["lease_expires_at"] <= now
+                cancellation is not None
+                and cancel is not None
+                and not cancellation.bind_cancel(cancel)
             ):
-                raise MarketDataError(
-                    MarketDataCode.CONFLICT,
-                    "Publication lease was displaced.",
-                    409,
-                    retryable=True,
-                )
-            connection.execute(
-                update(idempotency)
-                .where(
-                    and_(
-                        idempotency.c.owner_user_id == owner,
-                        idempotency.c.operation == operation,
-                        idempotency.c.idempotency_key == idempotency_key,
+                return
+            try:
+                with connection.begin():
+                    connection.execute(text("SET LOCAL lock_timeout = '2000ms'"))
+                    connection.execute(text("SET LOCAL statement_timeout = '2000ms'"))
+                    root = (
+                        connection.execute(
+                            select(idempotency)
+                            .where(
+                                and_(
+                                    idempotency.c.owner_user_id == owner,
+                                    idempotency.c.operation == operation,
+                                    idempotency.c.idempotency_key == idempotency_key,
+                                )
+                            )
+                            .with_for_update()
+                        )
+                        .mappings()
+                        .one()
                     )
-                )
-                .values(lease_expires_at=expires, updated_at=now)
-            )
-            connection.execute(
-                update(series_fences)
-                .where(
-                    and_(
-                        series_fences.c.owner_user_id == owner,
-                        series_fences.c.series_id == series_id,
+                    fence = (
+                        connection.execute(
+                            select(series_fences)
+                            .where(
+                                and_(
+                                    series_fences.c.owner_user_id == owner,
+                                    series_fences.c.series_id == series_id,
+                                )
+                            )
+                            .with_for_update()
+                        )
+                        .mappings()
+                        .one()
                     )
-                )
-                .values(lease_expires_at=expires)
-            )
-            connection.execute(
-                update(prestage_writes)
-                .where(
-                    and_(
-                        prestage_writes.c.owner_user_id == owner,
-                        prestage_writes.c.series_id == series_id,
-                        prestage_writes.c.idempotency_key == idempotency_key,
-                        prestage_writes.c.state == "writing",
+                    if (
+                        root["state"] != "started"
+                        or root["holder"] != self.worker_id
+                        or root["lease_expires_at"] is None
+                        or root["lease_expires_at"] <= now
+                        or fence["fencing_token"] != fencing_token
+                        or fence["holder"] != self.worker_id
+                        or fence["lease_expires_at"] <= now
+                    ):
+                        raise MarketDataError(
+                            MarketDataCode.CONFLICT,
+                            "Publication lease was displaced.",
+                            409,
+                            retryable=True,
+                        )
+                    connection.execute(
+                        update(idempotency)
+                        .where(
+                            and_(
+                                idempotency.c.owner_user_id == owner,
+                                idempotency.c.operation == operation,
+                                idempotency.c.idempotency_key == idempotency_key,
+                            )
+                        )
+                        .values(lease_expires_at=expires, updated_at=now)
                     )
-                )
-                .values(lease_expires_at=expires)
-            )
+                    connection.execute(
+                        update(series_fences)
+                        .where(
+                            and_(
+                                series_fences.c.owner_user_id == owner,
+                                series_fences.c.series_id == series_id,
+                            )
+                        )
+                        .values(lease_expires_at=expires)
+                    )
+                    connection.execute(
+                        update(prestage_writes)
+                        .where(
+                            and_(
+                                prestage_writes.c.owner_user_id == owner,
+                                prestage_writes.c.series_id == series_id,
+                                prestage_writes.c.idempotency_key == idempotency_key,
+                                prestage_writes.c.state == "writing",
+                            )
+                        )
+                        .values(lease_expires_at=expires)
+                    )
+            finally:
+                if cancellation is not None and cancel is not None:
+                    cancellation.unbind_cancel(cancel)
         self._inject("lease_renewed")
 
     def _heartbeat_lease(
@@ -2223,12 +2291,20 @@ class DatasetPublisher:
         fencing_token: int,
         *,
         force: bool = False,
+        cancellation: _LeaseHeartbeatState | None = None,
     ) -> None:
         heartbeat_key = (owner, series_id, operation, idempotency_key, fencing_token)
         now = self.catalog._now()
         previous = self._last_lease_renewal.get(heartbeat_key)
         if force or previous is None or now - previous >= timedelta(seconds=self.renew_seconds):
-            self._renew_lease(owner, series_id, operation, idempotency_key, fencing_token)
+            self._renew_lease(
+                owner,
+                series_id,
+                operation,
+                idempotency_key,
+                fencing_token,
+                cancellation,
+            )
             self._last_lease_renewal[heartbeat_key] = self.catalog._now()
 
     @contextmanager
@@ -2256,14 +2332,21 @@ class DatasetPublisher:
                         idempotency_key,
                         fencing_token,
                         force=True,
+                        cancellation=state,
                     )
                 except BaseException as error:  # noqa: BLE001 - transferred to caller thread
+                    if state.cancelled.is_set():
+                        return
                     state.fail(error)
                     self._inject("lease_lost")
                     stop.set()
                     return
 
-        thread = Thread(target=renew_until_stopped, daemon=True)
+        thread = Thread(
+            target=renew_until_stopped,
+            name=f"market-data-lease-{id(state)}",
+            daemon=False,
+        )
         thread.start()
         body_error: BaseException | None = None
         try:
@@ -2273,9 +2356,8 @@ class DatasetPublisher:
             body_error = error
         finally:
             stop.set()
-            thread.join(timeout=max(5.0, poll_seconds * 2))
-        if thread.is_alive():
-            raise RuntimeError("Lease heartbeat worker did not stop safely.")
+            state.stop()
+            thread.join()
         if state.failure is not None:
             if body_error is not None and body_error is not state.failure:
                 raise state.failure from body_error
@@ -6623,13 +6705,24 @@ class DatasetPublisher:
                             file["final_uri"],
                             check_fence=heartbeat_state.check,
                         )
-                with continuous_reconcile_heartbeat():
+                else:
+                    with continuous_reconcile_heartbeat() as heartbeat_state:
+                        self.store.complete_existing_finalize(
+                            identity["owner_user_id"],
+                            file["final_uri"],
+                            file["sha256"],
+                            file["byte_length"],
+                            check_fence=heartbeat_state.check,
+                        )
+                with continuous_reconcile_heartbeat() as heartbeat_state:
+                    heartbeat_state.check()
                     self.store.read_verified(
                         identity["owner_user_id"],
                         file["final_uri"],
                         file["sha256"],
                         file["byte_length"],
                     )
+                    heartbeat_state.check()
                 self._renew_lease(
                     identity["owner_user_id"],
                     identity["series_id"],

@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Event, Thread
+from threading import enumerate as enumerate_threads
 from uuid import uuid7
 
 import polars as pl
@@ -5940,9 +5942,11 @@ def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
     replacements: list[tuple[Path, Path]] = []
     post_loss_chmods: list[Path] = []
     post_loss_fsyncs: list[int] = []
+    post_loss_directory_fsyncs: list[Path] = []
     original_replace = os.replace
     original_chmod = Path.chmod
     original_fsync = os.fsync
+    original_directory_fsync = archive_store._fsync_directory
 
     def replace_then_steal(source, destination) -> None:
         original_replace(source, destination)
@@ -5979,6 +5983,11 @@ def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
             post_loss_fsyncs.append(descriptor)
         original_fsync(descriptor)
 
+    def observe_directory_fsync(directory: Path) -> None:
+        if loss_started.is_set():
+            post_loss_directory_fsyncs.append(directory)
+        original_directory_fsync(directory)
+
     def observe_loss(point: str) -> None:
         if point == "lease_lost":
             loss_observed.set()
@@ -5986,6 +5995,7 @@ def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
     monkeypatch.setattr(os, "replace", replace_then_steal)
     monkeypatch.setattr(Path, "chmod", observe_chmod)
     monkeypatch.setattr(os, "fsync", observe_fsync)
+    monkeypatch.setattr(archive_store, "_fsync_directory", observe_directory_fsync)
     monkeypatch.setattr(publisher, "_inject", observe_loss)
     with pytest.raises(MarketDataError) as lost:
         publisher.publish(
@@ -6004,6 +6014,7 @@ def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
     assert not renamed_temp.exists() and final_path.exists()
     assert post_loss_chmods == []
     assert post_loss_fsyncs == []
+    assert post_loss_directory_fsyncs == []
     with catalog.engine.begin() as connection:
         publication = (
             connection.execute(
@@ -6036,6 +6047,187 @@ def test_actual_fence_loss_after_replace_cancels_before_chmod_fsync_or_publish(
     assert root["state"] == "started"
     assert latest == parent.dataset_revision.dataset_revision_id
     assert active_correction == 1
+
+    post_loss_chmods.clear()
+    post_loss_fsyncs.clear()
+    post_loss_directory_fsyncs.clear()
+    reconciler = DatasetPublisher(catalog, archive_store, worker_id=str(uuid7()))
+    reconciled = reconciler.reconcile_one(publication["publication_id"])
+    assert reconciled.terminal_state == "published"
+    assert reconciled.action == "completed"
+    assert post_loss_chmods[0] == final_path
+    with catalog.engine.begin() as connection:
+        assert (
+            connection.execute(
+                select(publications.c.state).where(
+                    publications.c.publication_id == publication["publication_id"]
+                )
+            ).scalar_one()
+            == "published"
+        )
+        final_uris = tuple(
+            connection.execute(
+                select(publication_files.c.final_uri)
+                .where(publication_files.c.publication_id == publication["publication_id"])
+                .order_by(publication_files.c.ordinal)
+            ).scalars()
+        )
+    final_paths = tuple(archive_store.resolve(context.user_id, uri) for uri in final_uris)
+    assert tuple(post_loss_chmods) == final_paths
+    assert tuple(post_loss_directory_fsyncs) == tuple(path.parent for path in final_paths)
+    if os.name != "nt":
+        assert all(path.stat().st_mode & 0o777 == 0o400 for path in final_paths)
+
+
+def test_continuous_heartbeat_waits_for_blocked_renewal_and_never_updates_after_exit(
+    catalog, contexts, archive_store, monkeypatch
+) -> None:
+    context = contexts[0]
+    _, bar, key, parent, _, series_id = _parent_with_pending_correction(
+        catalog, context, archive_store
+    )
+    publisher = DatasetPublisher(
+        catalog,
+        archive_store,
+        worker_id=str(uuid7()),
+        renew_seconds=1,
+    )
+    publication_key = str(uuid7())
+
+    def crash_before_write(point: str) -> None:
+        if point == "before_temp_create":
+            raise RuntimeError("leave renewable admission")
+
+    monkeypatch.setattr(publisher, "_inject", crash_before_write)
+    with pytest.raises(RuntimeError, match="leave renewable admission"):
+        publisher.publish(
+            context,
+            PublicationRequest(
+                series_key=key,
+                coverage_start=bar.start_at,
+                coverage_end=bar.end_at,
+                expected_parent_revision_id=parent.dataset_revision.dataset_revision_id,
+            ),
+            idempotency_key=publication_key,
+        )
+    with catalog.engine.begin() as connection:
+        fence = (
+            connection.execute(
+                select(series_fences).where(
+                    and_(
+                        series_fences.c.owner_user_id == context.user_id,
+                        series_fences.c.series_id == series_id,
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        before = connection.execute(
+            select(
+                idempotency.c.lease_expires_at,
+                idempotency.c.updated_at,
+                series_fences.c.lease_expires_at,
+                prestage_writes.c.lease_expires_at,
+            )
+            .select_from(
+                idempotency.join(
+                    series_fences,
+                    and_(
+                        series_fences.c.owner_user_id == idempotency.c.owner_user_id,
+                        series_fences.c.series_id == series_id,
+                    ),
+                ).join(
+                    prestage_writes,
+                    and_(
+                        prestage_writes.c.owner_user_id == idempotency.c.owner_user_id,
+                        prestage_writes.c.idempotency_key == idempotency.c.idempotency_key,
+                    ),
+                )
+            )
+            .where(
+                and_(
+                    idempotency.c.owner_user_id == context.user_id,
+                    idempotency.c.operation == "dataset.publish",
+                    idempotency.c.idempotency_key == publication_key,
+                )
+            )
+        ).one()
+    monkeypatch.setattr(publisher, "_inject", lambda _point: None)
+    original_renew = publisher._renew_lease
+    renewal_entered = Event()
+    body_failed = Event()
+    release_renewal = Event()
+
+    def blocked_renewal(*args, **kwargs) -> None:
+        renewal_entered.set()
+        assert release_renewal.wait(10)
+        original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "_renew_lease", blocked_renewal)
+
+    def release_after_old_join_bound() -> None:
+        assert body_failed.wait(5)
+        time.sleep(5.25)
+        release_renewal.set()
+
+    releaser = Thread(target=release_after_old_join_bound)
+    releaser.start()
+    started = time.monotonic()
+    with (
+        pytest.raises(RuntimeError, match="body failed"),
+        publisher._continuous_lease_heartbeat(
+            context.user_id,
+            series_id,
+            "dataset.publish",
+            publication_key,
+            fence["fencing_token"],
+        ),
+    ):
+        assert renewal_entered.wait(5)
+        body_failed.set()
+        raise RuntimeError("body failed")
+    elapsed = time.monotonic() - started
+    releaser.join(timeout=1)
+    assert not releaser.is_alive()
+    assert elapsed >= 5.0
+    assert not any(
+        thread.name.startswith("market-data-lease-") and thread.is_alive()
+        for thread in enumerate_threads()
+    )
+    time.sleep(0.25)
+    with catalog.engine.begin() as connection:
+        after = connection.execute(
+            select(
+                idempotency.c.lease_expires_at,
+                idempotency.c.updated_at,
+                series_fences.c.lease_expires_at,
+                prestage_writes.c.lease_expires_at,
+            )
+            .select_from(
+                idempotency.join(
+                    series_fences,
+                    and_(
+                        series_fences.c.owner_user_id == idempotency.c.owner_user_id,
+                        series_fences.c.series_id == series_id,
+                    ),
+                ).join(
+                    prestage_writes,
+                    and_(
+                        prestage_writes.c.owner_user_id == idempotency.c.owner_user_id,
+                        prestage_writes.c.idempotency_key == idempotency.c.idempotency_key,
+                    ),
+                )
+            )
+            .where(
+                and_(
+                    idempotency.c.owner_user_id == context.user_id,
+                    idempotency.c.operation == "dataset.publish",
+                    idempotency.c.idempotency_key == publication_key,
+                )
+            )
+        ).one()
+    assert after == before
 
 
 def test_fence_takeover_cancels_staged_conversion_before_competing_publication_converts_same_active_ref(
