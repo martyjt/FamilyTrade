@@ -1023,6 +1023,8 @@ def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
             dependency = params.get("level_feature_id")
             if isinstance(dependency, str):
                 answer = max(answer, feature_span(dependency, resolving))
+                if feature.name == "level_cross":
+                    answer += feature.interval_seconds
         resolving.remove(feature_id)
         spans[feature_id] = answer
         return answer

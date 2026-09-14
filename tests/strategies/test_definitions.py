@@ -1582,6 +1582,47 @@ def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warm
     assert result.valid and result.required_warmup_bars >= 500
 
 
+def test_level_features_include_referenced_rolling_dependency_warmup() -> None:
+    for name, expected in (("level_touch_v1", 501), ("level_cross", 502)):
+        value = _fixture()
+        features = value["features"]
+        nodes = value["nodes"]
+        assert isinstance(features, list) and isinstance(nodes, list)
+        features.append(
+            {
+                "feature_id": "rolling-500",
+                "kind": "level",
+                "name": "rolling_high_v1",
+                "output_type": "level",
+                "unit": "contract_price",
+                "interval_seconds": 900,
+                "parameters": {"n": 500},
+            }
+        )
+        parameters = {"level_feature_id": "rolling-500"}
+        if name == "level_touch_v1":
+            parameters["tolerance_ticks"] = 1
+        else:
+            parameters["direction"] = "above"
+        features.append(
+            {
+                "feature_id": "level",
+                "kind": "level",
+                "name": name,
+                "output_type": "boolean",
+                "unit": "boolean",
+                "interval_seconds": 900,
+                "parameters": parameters,
+            }
+        )
+        nodes.append(
+            {"kind": "feature", "node_id": "level-root", "feature_id": "level", "offset": 0}
+        )
+        value["entry_rules"]["long_root"] = "level-root"
+        result = _validate(value)
+        assert result.valid and result.required_warmup_bars >= expected
+
+
 def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> None:
     value = _fixture()
     features = value["features"]
