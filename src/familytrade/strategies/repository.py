@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+from collections.abc import Mapping
 from datetime import datetime
 from typing import cast
 from uuid import uuid7
 
+from pydantic import ValidationError
 from sqlalchemy import (
     CheckConstraint,
     Column,
@@ -21,6 +25,7 @@ from sqlalchemy import (
     and_,
     func,
     insert,
+    or_,
     select,
     update,
 )
@@ -306,12 +311,14 @@ class StrategyRepository:
                 return replay
             try:
                 parsed = StrategyDraftFromDefinitionInput.model_validate(value)
-            except Exception as error:
+            except ValidationError as error:
                 try:
                     source_input = StrategyDraftFromVersionInput.model_validate(value)
-                except Exception:
+                except ValidationError:
                     safe = self._validation()
-                    self._save_safe_error(connection, context, "strategy.create", idempotency_key, value, safe)
+                    self._save_safe_error(
+                        connection, context, "strategy.create", idempotency_key, value, safe
+                    )
                     raise safe from error
                 source = (
                     connection.execute(
@@ -381,9 +388,11 @@ class StrategyRepository:
                 return replay
             try:
                 parsed = StrategyDraftEditInput.model_validate(value)
-            except Exception as error:
+            except ValidationError as error:
                 safe = self._validation()
-                self._save_safe_error(connection, context, "strategy.edit", idempotency_key, value, safe)
+                self._save_safe_error(
+                    connection, context, "strategy.edit", idempotency_key, value, safe
+                )
                 raise safe from error
             source = (
                 connection.execute(
@@ -426,9 +435,11 @@ class StrategyRepository:
             self._mutation_gate(connection, context, idempotency_key)
             try:
                 parsed = StrategyDraftValidateInput.model_validate(value)
-            except Exception as error:
+            except ValidationError as error:
                 safe = self._validation()
-                self._save_safe_error(connection, context, "strategy.validate", idempotency_key, value, safe)
+                self._save_safe_error(
+                    connection, context, "strategy.validate", idempotency_key, value, safe
+                )
                 raise safe from error
             row = (
                 connection.execute(
@@ -525,10 +536,66 @@ class StrategyRepository:
                 {key: value for key, value in dict(row).items() if key != "updated_at"}
             )
 
+    @staticmethod
+    def _cursor(context: UserContext, status: str | None, row: Mapping[str, object]) -> str:
+        """Bind a keyset position to its owner and immutable list shape."""
+        created_at = row["created_at"]
+        assert isinstance(created_at, datetime)
+        payload = {
+            "v": 1,
+            "owner_sha256": hashlib.sha256(context.user_id.encode("utf-8")).hexdigest(),
+            "operation": "strategy.list",
+            "status": status,
+            "order": "created_at_desc_strategy_version_id_desc",
+            "after_created_at": created_at.isoformat(),
+            "after_strategy_version_id": row["strategy_version_id"],
+        }
+        return (
+            base64.urlsafe_b64encode(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
+
+    @staticmethod
+    def _parse_cursor(
+        context: UserContext, status: str | None, cursor: str
+    ) -> tuple[datetime, str]:
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {
+                "v",
+                "owner_sha256",
+                "operation",
+                "status",
+                "order",
+                "after_created_at",
+                "after_strategy_version_id",
+            }:
+                raise ValueError
+            if (
+                payload["v"] != 1
+                or payload["owner_sha256"]
+                != hashlib.sha256(context.user_id.encode("utf-8")).hexdigest()
+                or payload["operation"] != "strategy.list"
+                or payload["status"] != status
+                or payload["order"] != "created_at_desc_strategy_version_id_desc"
+                or not isinstance(payload["after_strategy_version_id"], str)
+            ):
+                raise ValueError
+            created_at = datetime.fromisoformat(payload["after_created_at"])
+            if created_at.tzinfo is None:
+                raise ValueError
+            return created_at, payload["after_strategy_version_id"]
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise StrategyRepository._validation() from error
+
     def list_versions(self, context: UserContext, value: dict[str, object]) -> StrategyPage:
         try:
             parsed = StrategyListInput.model_validate(value)
-        except Exception as error:
+        except ValidationError as error:
             raise self._validation() from error
         with self.engine.connect() as connection:
             self._authorise(connection, context, "strategy:read")
@@ -537,16 +604,30 @@ class StrategyRepository:
             )
             if parsed.status is not None:
                 query = query.where(strategy_versions.c.status == parsed.status)
+            if parsed.cursor is not None:
+                created_at, strategy_version_id = self._parse_cursor(
+                    context, parsed.status, parsed.cursor
+                )
+                query = query.where(
+                    or_(
+                        strategy_versions.c.created_at < created_at,
+                        and_(
+                            strategy_versions.c.created_at == created_at,
+                            strategy_versions.c.strategy_version_id < strategy_version_id,
+                        ),
+                    )
+                )
             rows = (
                 connection.execute(
                     query.order_by(
                         strategy_versions.c.created_at.desc(),
                         strategy_versions.c.strategy_version_id.desc(),
-                    ).limit(parsed.limit)
+                    ).limit(parsed.limit + 1)
                 )
                 .mappings()
                 .all()
             )
+            page_rows = rows[: parsed.limit]
             return StrategyPage(
                 schema_version="v1",
                 items=tuple(
@@ -557,7 +638,11 @@ class StrategyRepository:
                             if key not in {"definition", "updated_at"}
                         }
                     )
-                    for row in rows
+                    for row in page_rows
                 ),
-                next_cursor=None,
+                next_cursor=(
+                    self._cursor(context, parsed.status, dict(page_rows[-1]))
+                    if len(rows) > parsed.limit
+                    else None
+                ),
             )

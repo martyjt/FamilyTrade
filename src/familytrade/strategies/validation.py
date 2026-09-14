@@ -16,6 +16,7 @@ from familytrade.market_data.models import CalendarVersion
 from familytrade.strategies.definitions import (
     DefinitionValidationResult,
     RuleDefinition,
+    RuleNode,
     ValidationIssue,
     ValidationIssueCode,
 )
@@ -250,6 +251,278 @@ def _independent_raw_rules(value: Mapping[str, object]) -> list[ValidationIssue]
                             "Arithmetic units must match.",
                         )
                     )
+    return issues
+
+
+def _node_references(node: RuleNode) -> tuple[str, ...]:
+    """Return node edges without interpreting an unknown or partial node."""
+    if node.kind == "arithmetic":
+        return node.args
+    if node.kind == "group":
+        return node.children
+    if node.kind == "compare":
+        return (node.left, node.right)
+    if node.kind == "temporal_compare":
+        return (node.left_feature, node.right_feature)
+    return ()
+
+
+def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
+    """Validate graph reachability and the closed operand algebra.
+
+    This deliberately operates only after the strict record parser succeeded: a
+    malformed union must not be guessed into a graph variant.
+    """
+    nodes = {node.node_id: node for node in definition.nodes}
+    issues: list[ValidationIssue] = []
+    index_by_id = {node.node_id: index for index, node in enumerate(definition.nodes)}
+    for node_id, node in nodes.items():
+        index = index_by_id[node_id]
+        if node.kind == "group":
+            for item, ref in enumerate(node.children):
+                if ref not in nodes:
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}/children/{item}",
+                            ValidationIssueCode.UNKNOWN_REFERENCE,
+                            "Node is unknown.",
+                        )
+                    )
+        elif node.kind == "temporal_compare":
+            for field, ref in (
+                ("left_feature", node.left_feature),
+                ("right_feature", node.right_feature),
+            ):
+                if ref not in nodes:
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}/{field}",
+                            ValidationIssueCode.UNKNOWN_REFERENCE,
+                            "Node is unknown.",
+                        )
+                    )
+
+    # A DFS identifies every cyclic component.  Reporting its lexical minimum is
+    # stable regardless of source array order.
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+    cycles: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visited:
+            return
+        if node_id in visiting:
+            cycles.add(min(stack[stack.index(node_id) :]))
+            return
+        visiting.add(node_id)
+        stack.append(node_id)
+        for ref in _node_references(nodes[node_id]):
+            if ref in nodes:
+                visit(ref)
+        stack.pop()
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    for node_id in sorted(nodes):
+        visit(node_id)
+    for node_id in sorted(cycles):
+        issues.append(
+            _issue(
+                f"/nodes/{index_by_id[node_id]}/node_id",
+                ValidationIssueCode.CYCLE,
+                "Node dependency graph contains a cycle.",
+            )
+        )
+
+    features = {
+        feature.feature_id: (feature.output_type, feature.unit) for feature in definition.features
+    }
+    signatures: dict[str, tuple[str, str] | None] = {}
+    resolving: set[str] = set()
+
+    def signature(node_id: str) -> tuple[str, str] | None:
+        if node_id in signatures:
+            return signatures[node_id]
+        if node_id in resolving or node_id not in nodes:
+            return None
+        resolving.add(node_id)
+        node = nodes[node_id]
+        result: tuple[str, str] | None
+        if node.kind == "feature":
+            result = features.get(node.feature_id)
+        elif node.kind == "constant":
+            result = (node.value_type, node.unit)
+        elif node.kind in {"compare", "temporal_compare", "group"}:
+            result = ("boolean", "boolean")
+        elif node.kind == "arithmetic":
+            result = (node.result_type, node.unit)
+        else:  # pragma: no cover - RuleNode is a closed discriminated union.
+            result = None
+        resolving.remove(node_id)
+        signatures[node_id] = result
+        return result
+
+    numeric = {"decimal", "integer", "price", "volume", "level"}
+    for node_id, node in nodes.items():
+        index = index_by_id[node_id]
+        if node.kind == "group":
+            if any(
+                signature(ref) != ("boolean", "boolean") for ref in node.children if ref in nodes
+            ):
+                issues.append(
+                    _issue(
+                        f"/nodes/{index}/children",
+                        ValidationIssueCode.TYPE_MISMATCH,
+                        "Group children must be boolean.",
+                    )
+                )
+        elif node.kind == "compare":
+            left, right = signature(node.left), signature(node.right)
+            if left is not None and right is not None:
+                if node.op == "within":
+                    tolerance_ok = (
+                        node.tolerance is not None
+                        and _decimal(node.tolerance)
+                        and Decimal(node.tolerance) >= 0
+                    )
+                    if left[0] not in numeric or left != right:
+                        issues.append(
+                            _issue(
+                                f"/nodes/{index}/right",
+                                ValidationIssueCode.TYPE_MISMATCH
+                                if left[0] != right[0]
+                                else ValidationIssueCode.UNIT_MISMATCH,
+                                "Comparison operands are incompatible.",
+                            )
+                        )
+                    if not tolerance_ok:
+                        issues.append(
+                            _issue(
+                                f"/nodes/{index}/tolerance",
+                                ValidationIssueCode.INVALID_DECIMAL,
+                                "Tolerance must be a nonnegative decimal.",
+                            )
+                        )
+                elif left != right:
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}/right",
+                            ValidationIssueCode.TYPE_MISMATCH
+                            if left[0] != right[0]
+                            else ValidationIssueCode.UNIT_MISMATCH,
+                            "Comparison operands are incompatible.",
+                        )
+                    )
+                elif node.op in {"lt", "lte", "gt", "gte"} and left[0] not in numeric | {
+                    "timestamp"
+                }:
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}/left",
+                            ValidationIssueCode.TYPE_MISMATCH,
+                            "Ordered comparison requires numeric values.",
+                        )
+                    )
+        elif node.kind == "temporal_compare":
+            left_node, right_node = nodes.get(node.left_feature), nodes.get(node.right_feature)
+            if left_node is not None and right_node is not None:
+                if (
+                    left_node.kind != "feature"
+                    or right_node.kind != "feature"
+                    or left_node.offset != 0
+                    or right_node.offset != 0
+                ):
+                    issues.append(
+                        _issue(
+                            f"/nodes/{index}",
+                            ValidationIssueCode.TYPE_MISMATCH,
+                            "Temporal comparison requires offset-zero feature nodes.",
+                        )
+                    )
+                else:
+                    left_signature = signature(left_node.node_id)
+                    right_signature = signature(right_node.node_id)
+                    if (
+                        left_signature is None
+                        or right_signature is None
+                        or left_signature != right_signature
+                        or left_signature[0] not in numeric
+                    ):
+                        issues.append(
+                            _issue(
+                                f"/nodes/{index}",
+                                ValidationIssueCode.TYPE_MISMATCH,
+                                "Temporal comparison operands are incompatible.",
+                            )
+                        )
+        elif node.kind == "arithmetic":
+            args = [signature(ref) for ref in node.args]
+            known = [item for item in args if item is not None]
+            derived: tuple[str, str] | None = None
+            if len(known) == len(args) and all(item[0] in numeric for item in known):
+                if node.op in {"add", "subtract", "min", "max"} and len(set(known)) == 1:
+                    derived = known[0]
+                elif node.op == "multiply" and len(known) == 2:
+                    scalars = [item for item in known if item == ("decimal", "scalar")]
+                    non_scalars = [item for item in known if item != ("decimal", "scalar")]
+                    if scalars and len(non_scalars) <= 1:
+                        derived = non_scalars[0] if non_scalars else ("decimal", "scalar")
+                elif node.op == "divide" and len(known) == 2:
+                    if known[0] == known[1]:
+                        derived = ("decimal", "scalar")
+                    elif known[1] == ("decimal", "scalar") and known[0][0] != "integer":
+                        derived = known[0]
+            if derived is None:
+                issues.append(
+                    _issue(
+                        f"/nodes/{index}/args",
+                        ValidationIssueCode.TYPE_MISMATCH,
+                        "Arithmetic operands are incompatible.",
+                    )
+                )
+            elif derived != (node.result_type, node.unit):
+                issues.append(
+                    _issue(
+                        f"/nodes/{index}/result_type",
+                        ValidationIssueCode.TYPE_MISMATCH
+                        if derived[0] != node.result_type
+                        else ValidationIssueCode.UNIT_MISMATCH,
+                        "Arithmetic result declaration is incompatible.",
+                    )
+                )
+
+    roots: list[tuple[str, str | None]] = [
+        ("/entry_rules/long_root", definition.entry_rules.long_root),
+        ("/entry_rules/short_root", definition.entry_rules.short_root),
+        ("/exit_rules/long_root", definition.exit_rules.long_root),
+        ("/exit_rules/short_root", definition.exit_rules.short_root),
+    ]
+    for path, root in roots:
+        side = "long" if "/long_" in path else "short"
+        if definition.side_policy != "both" and definition.side_policy != side:
+            if root is not None:
+                issues.append(
+                    _issue(
+                        path,
+                        ValidationIssueCode.INVALID_SIDE_ROOT,
+                        "Disabled side root must be null.",
+                    )
+                )
+        elif root is None:
+            issues.append(
+                _issue(
+                    path, ValidationIssueCode.INVALID_SIDE_ROOT, "Enabled side root is required."
+                )
+            )
+        elif root not in nodes:
+            issues.append(
+                _issue(path, ValidationIssueCode.UNKNOWN_REFERENCE, "Root node is unknown.")
+            )
+        elif signature(root) != ("boolean", "boolean"):
+            issues.append(
+                _issue(path, ValidationIssueCode.ROOT_NOT_BOOLEAN, "Root must resolve to boolean.")
+            )
     return issues
 
 
@@ -539,6 +812,7 @@ def validate_rule_definition(
                             "Node is unknown.",
                         )
                     )
+    issues.extend(_graph_issues(definition))
     if (
         definition.order_policy.entry_type == "limit"
         and definition.order_policy.limit_price_source is None
