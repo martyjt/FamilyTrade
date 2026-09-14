@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import cast
 from uuid import uuid7
@@ -48,7 +49,11 @@ from familytrade.strategies.definitions import (
     StrategyValidationResult,
     StrategyVersion,
 )
-from familytrade.strategies.validation import canonical_definition_sha256, validate_rule_definition
+from familytrade.strategies.validation import (
+    canonical_definition_sha256,
+    canonical_operation_request_bytes,
+    validate_rule_definition,
+)
 
 strategy_metadata = MetaData()
 if users.metadata is not access_metadata:  # pragma: no cover
@@ -195,11 +200,73 @@ class StrategyRepository:
         connection.execute(insert(strategy_versions).values(**version.model_dump(mode="json")))
         return version
 
+    def _replay(
+        self,
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        key: str,
+        value: dict[str, object],
+    ) -> StrategyVersion | None:
+        digest = hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest()
+        row = (
+            connection.execute(
+                select(strategy_idempotency_records)
+                .where(
+                    and_(
+                        strategy_idempotency_records.c.owner_user_id == context.user_id,
+                        strategy_idempotency_records.c.operation == operation,
+                        strategy_idempotency_records.c.idempotency_key == key,
+                    )
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        if row["request_sha256"] != digest:
+            raise AccessError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "Idempotency key was already used for a different request.",
+                409,
+            )
+        if row["result"] is not None:
+            return StrategyVersion.model_validate(row["result"])
+        raise AccessError(
+            ErrorCode(row["error"]["code"]), row["error"]["message"], row["error"]["http_status"]
+        )
+
+    def _save_replay(
+        self,
+        connection: Connection,
+        context: UserContext,
+        operation: str,
+        key: str,
+        value: dict[str, object],
+        result: StrategyVersion,
+    ) -> None:
+        connection.execute(
+            insert(strategy_idempotency_records).values(
+                owner_user_id=context.user_id,
+                operation=operation,
+                idempotency_key=key,
+                request_sha256=hashlib.sha256(canonical_operation_request_bytes(value)).hexdigest(),
+                result=result.model_dump(mode="json"),
+                error=None,
+                created_at=func.clock_timestamp(),
+            )
+        )
+
     def create_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
     ) -> StrategyVersion:
         with self.engine.begin() as connection:
             self._authorise(connection, context, "strategy:write")
+            replay = self._replay(connection, context, "strategy.create", idempotency_key, value)
+            if replay is not None:
+                return replay
             try:
                 parsed = StrategyDraftFromDefinitionInput.model_validate(value)
             except Exception as error:
@@ -214,7 +281,11 @@ class StrategyRepository:
                         }
                     ]
                 )
-            return self._insert(connection, context, parsed, None)
+            result = self._insert(connection, context, parsed, None)
+            self._save_replay(
+                connection, context, "strategy.create", idempotency_key, value, result
+            )
+            return result
 
     def edit_draft(
         self, context: UserContext, value: dict[str, object], *, idempotency_key: str
