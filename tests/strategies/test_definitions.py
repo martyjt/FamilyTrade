@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from familytrade.access.credentials import EnvelopeCipher
+from familytrade.access.models import AccessError, ErrorCode
 from familytrade.access.repository import AccessRepository, access_metadata
 from familytrade.access.service import AccessService
 from familytrade.strategies.presets import get_preset
@@ -507,3 +508,18 @@ def test_clone_requires_owned_validated_source_and_sets_same_owner_lineage(
     )
     assert clone.created_from_version_id == source.strategy_version_id
     assert clone.owner_user_id == source.owner_user_id and clone.name == "Cloned crossover"
+
+
+def test_same_idempotency_key_different_raw_request_is_idempotency_conflict(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    definition = _fixture()
+    value = {"kind": "definition", "schema_version": "v1", "name": definition["name"], "definition_schema_version": "rule-strategy-v1", "definition": definition, "catalogue_version": "feature-catalogue-v1", "execution_interval_seconds": 900, "fill_interval_seconds": 60}
+    key = str(uuid7())
+    repository.create_draft(context, value, idempotency_key=key)
+    changed = copy.deepcopy(value)
+    changed["name"] = "Different"
+    with pytest.raises(AccessError) as error:
+        repository.create_draft(context, changed, idempotency_key=key)
+    assert error.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
