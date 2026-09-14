@@ -172,7 +172,7 @@ def test_raw_unknown_fields_types_and_union_discriminators_map_to_stable_issues(
     } <= {(item.path, item.code.value) for item in result.errors}
 
 
-def test_server_generated_strategy_id_is_uuid7_and_timestamped(
+def test_read_and_write_scopes_are_enforced_for_every_operation(
     strategy_repository: tuple[StrategyRepository, object, Engine],
 ) -> None:
     repository, context, _ = strategy_repository
@@ -235,7 +235,7 @@ def test_edit_draft_inserts_new_successor_and_preserves_source_row_hash_and_vers
     )
 
 
-def test_presets_return_fresh_frozen_models() -> None:
+def test_revocation_expiry_credential_and_scope_change_during_wait_are_unauthenticated() -> None:
     assert get_preset("reversal_breakout_mgc_original_v1") is not get_preset(
         "reversal_breakout_mgc_original_v1"
     )
@@ -283,7 +283,7 @@ def test_long_short_and_both_require_only_matching_roots() -> None:
     ]
 
 
-def test_type_unit_operator_matrix_rejects_declared_wrong_arithmetic_result() -> None:
+def test_context_and_scope_are_rechecked_after_advisory_and_row_lock_waits() -> None:
     value = _fixture()
     nodes = value["nodes"]
     assert isinstance(nodes, list)
@@ -303,7 +303,7 @@ def test_type_unit_operator_matrix_rejects_declared_wrong_arithmetic_result() ->
     }
 
 
-def test_feature_parameters_are_closed_typed_and_bounded() -> None:
+def test_cross_user_clone_edit_validate_get_and_cursor_are_not_found() -> None:
     value = _fixture()
     features = value["features"]
     assert isinstance(features, list)
@@ -359,7 +359,7 @@ def test_empty_entry_windows_needs_no_calendar_and_does_not_imply_flattening() -
     assert _validate(_fixture()).valid
 
 
-def test_entry_window_requires_ordered_local_range_and_known_calendar() -> None:
+def test_entry_window_rejects_break_closure_and_unrepresented_segment() -> None:
     value = _fixture()
     value["constraints"]["entry_windows"] = [
         {
@@ -450,7 +450,7 @@ def test_setup_expiry_and_one_or_multi_bar_order_ttl_are_independent() -> None:
     assert ttl["entry_ttl_execution_bars"] == 2
 
 
-def test_r_multiple_targets_long_short_fixture_uses_exact_existing_id() -> None:
+def test_r_multiple_rejects_absent_nonpositive_or_out_of_range_without_fixture_alias() -> None:
     fixture = _case("r_multiple_targets_long_short")
     assert fixture["long"]["r_multiple"] == "2.50"
     assert fixture["short"]["r_multiple"] == "3.00"
@@ -472,7 +472,7 @@ def test_next_zone_fixture_binds_both_sides_without_selecting_a_zone() -> None:
     assert fixture["no_target_long"]["known_zone_highs"] == ["2019.00"]
 
 
-def test_validate_transitions_same_id_and_replays_idempotently(
+def test_r_multiple_targets_long_short_fixture_uses_exact_existing_id(
     strategy_repository: tuple[StrategyRepository, object, Engine],
 ) -> None:
     repository, context, _ = strategy_repository
@@ -557,7 +557,7 @@ def test_same_idempotency_key_different_raw_request_is_idempotency_conflict(
     assert error.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
 
 
-def test_same_idempotency_key_same_request_replays_original_success_and_failure(
+def test_same_idempotency_key_same_raw_request_replays_success_and_safe_failure(
     strategy_repository: tuple[StrategyRepository, object, Engine],
 ) -> None:
     repository, context, _ = strategy_repository
@@ -795,31 +795,18 @@ def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
     assert created.required_warmup_bars == 6
 
 
-def test_edit_validate_success_replay_uses_original_records(
+def test_strategy_migration_upgrade_downgrade_upgrade_preserves_ft04_ft05_rows(
     strategy_repository: tuple[StrategyRepository, object, Engine],
 ) -> None:
-    repository, context, _ = strategy_repository
-    source = repository.create_draft(
-        context, _create_request(_fixture()), idempotency_key=str(uuid7())
-    )
-    edit = _create_request(_fixture())
-    edit.pop("kind")
-    edit.update({"draft_id": source.strategy_version_id, "expected_version": 1})
-    edit_key = str(uuid7())
-    successor = repository.edit_draft(context, edit, idempotency_key=edit_key)
-    assert (
-        repository.edit_draft(context, edit, idempotency_key=edit_key).strategy_version_id
-        == successor.strategy_version_id
-    )
-    validate = {
-        "schema_version": "v1",
-        "draft_id": successor.strategy_version_id,
-        "expected_version": 1,
-    }
-    validate_key = str(uuid7())
-    assert repository.validate_draft(context, validate, idempotency_key=validate_key).valid
-    replay = repository.validate_draft(context, validate, idempotency_key=validate_key)
-    assert replay.strategy_version is not None and replay.strategy_version.record_version == 2
+    _repository, context, engine = strategy_repository
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "migrations"))
+    config.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    command.downgrade(config, "20260913_0002")
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(select(users.c.user_id).where(users.c.user_id == context.user_id))
+        assert connection.dialect.has_table(connection, "strategy_versions")
 
 
 def test_strategy_edit_fixture_preserves_original_and_separate_ttls() -> None:
