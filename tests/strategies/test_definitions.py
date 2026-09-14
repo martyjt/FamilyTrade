@@ -1,9 +1,11 @@
 import copy
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
 from uuid import UUID, uuid7
 
 import pytest
@@ -240,10 +242,51 @@ def test_edit_draft_inserts_new_successor_and_preserves_source_row_hash_and_vers
     )
 
 
-def test_revocation_expiry_credential_and_scope_change_during_wait_are_unauthenticated() -> None:
-    assert get_preset("reversal_breakout_mgc_original_v1") is not get_preset(
-        "reversal_breakout_mgc_original_v1"
+def test_revocation_expiry_credential_and_scope_change_during_wait_are_unauthenticated(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, engine = strategy_repository
+    key = str(uuid7())
+    lock_key = int.from_bytes(
+        hashlib.sha256(
+            json.dumps(
+                [context.user_id, "strategy.create", key], separators=(",", ":"), allow_nan=False
+            ).encode()
+        ).digest()[:8],
+        byteorder="big",
+        signed=True,
     )
+    first_authorization = Event()
+    original_authorise = repository._authorise
+    calls = 0
+
+    def observe_authorise(connection: object, observed_context: object, scope: str) -> None:
+        nonlocal calls
+        calls += 1
+        original_authorise(connection, observed_context, scope)  # type: ignore[arg-type]
+        if calls == 1:
+            first_authorization.set()
+
+    repository._authorise = observe_authorise  # type: ignore[method-assign]
+    outcome: list[AccessError] = []
+    with engine.connect() as lock_connection:
+        lock_connection.execute(select(func.pg_advisory_lock(lock_key)))
+
+        def mutate() -> None:
+            try:
+                repository.create_draft(context, _create_request(_fixture()), idempotency_key=key)
+            except AccessError as error:  # capture the worker outcome for the assertion below
+                outcome.append(error)
+
+        worker = Thread(target=mutate)
+        worker.start()
+        assert first_authorization.wait(5)
+        AccessRepository(engine).revoke_session(context.auth_session_id, datetime.now(UTC))
+        lock_connection.execute(select(func.pg_advisory_unlock(lock_key)))
+    worker.join(timeout=5)
+    repository._authorise = original_authorise  # type: ignore[method-assign]
+    assert not worker.is_alive() and len(outcome) == 1
+    assert outcome[0].code is ErrorCode.UNAUTHENTICATED
 
 
 def _validate(value: dict[str, object]):
