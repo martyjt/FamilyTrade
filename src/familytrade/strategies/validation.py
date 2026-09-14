@@ -297,12 +297,36 @@ def _pydantic_issues(value: Mapping[str, object]) -> list[ValidationIssue]:
                 if not isinstance(part, str)
                 or part
                 not in {
-                    "feature", "constant", "arithmetic", "compare", "temporal_compare", "group",
-                    "one_position_v1", "confirmed_pivot_zones_v1", "reversal_setup_v1", "breakout_retest_v1",
+                    "feature",
+                    "constant",
+                    "arithmetic",
+                    "compare",
+                    "temporal_compare",
+                    "group",
+                    "one_position_v1",
+                    "confirmed_pivot_zones_v1",
+                    "reversal_setup_v1",
+                    "breakout_retest_v1",
                 }
             )
             result.append(_issue(_pointer(loc), code, "Invalid strategy definition field."))
         return result
+    return []
+
+
+def _nonfinite_issues(value: object, parts: tuple[object, ...] = ()) -> list[ValidationIssue]:
+    if isinstance(value, float) and not math.isfinite(value):
+        return [_issue(_pointer(parts), ValidationIssueCode.NONFINITE, "Number must be finite.")]
+    if isinstance(value, Mapping):
+        return [
+            issue for key, item in value.items() for issue in _nonfinite_issues(item, (*parts, key))
+        ]
+    if isinstance(value, (list, tuple)):
+        return [
+            issue
+            for index, item in enumerate(value)
+            for issue in _nonfinite_issues(item, (*parts, index))
+        ]
     return []
 
 
@@ -504,7 +528,11 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         }[node.value_type]
         if node.unit not in allowed_units:
             issues.append(
-                _issue(f"/nodes/{index}/unit", ValidationIssueCode.UNIT_MISMATCH, "Constant type and unit disagree.")
+                _issue(
+                    f"/nodes/{index}/unit",
+                    ValidationIssueCode.UNIT_MISMATCH,
+                    "Constant type and unit disagree.",
+                )
             )
         decimal_types = {"decimal", "price", "volume", "level"}
         if node.value_type in decimal_types:
@@ -1206,11 +1234,25 @@ def validate_rule_definition(
             canonical_definition_sha256=None,
             required_warmup_bars=None,
         )
-    issues = _pydantic_issues(value)
+    issues = _nonfinite_issues(value)
+    issues.extend(_pydantic_issues(value))
     issues.extend(_independent_raw_rules(value))
     try:
         raw_size = len(_bytes(value))
     except TypeError, ValueError:
+        if issues:
+            return DefinitionValidationResult(
+                valid=False,
+                definition=None,
+                errors=tuple(
+                    sorted(
+                        {(item.path, item.code.value): item for item in issues}.values(),
+                        key=_issue_sort_key,
+                    )
+                ),
+                canonical_definition_sha256=None,
+                required_warmup_bars=None,
+            )
         return DefinitionValidationResult(
             valid=False,
             definition=None,
