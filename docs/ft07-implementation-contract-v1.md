@@ -330,14 +330,16 @@ FillEvidence = {
   fill_bar_start_at:UTC timestamp, fill_bar_end_at:UTC timestamp,
   bar_record_id_role:"availability_anchor",
   availability_anchor_bar_record_id:string,
-  source_bar_record_ids:tuple[string,...]
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...]
 }
 
 MarkEvidence = {
   run_event_id:lowercase UUIDv7,
   fill_bar_start_at:UTC timestamp, fill_bar_end_at:UTC timestamp,
   close_bar_record_id:string,
-  source_bar_record_ids:tuple[string,...]
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...]
 }
 
 RunEvent = {
@@ -345,7 +347,7 @@ RunEvent = {
   aggregate_type:"run"|"lane", aggregate_id:lowercase UUIDv7, sequence,
   event_type, effective_at, recorded_at, payload,
   causation_id, correlation_id, state_sha256,
-  attempt_id:lowercase UUIDv7|null, fencing_token:positive int,
+  attempt_id:lowercase UUIDv7|null, fencing_token:positive int|null,
   created_at:recorded_at, record_version:1
 }
 ~~~
@@ -372,6 +374,12 @@ The implicit section 3 persisted-entity fields are explicit here: all three reco
 have `schema_version:"v1"`, `owner_user_id`, `created_at`, and
 `record_version:1`; domain record times determine `created_at` as shown rather than
 an implicit clock.
+The frozen public `RunEvent.fencing_token` is nullable. Its strict model must accept,
+serialize, and round-trip null for existing schema-compatible event bytes. FT-07's
+own engine emission is narrower: every `EmissionContext` has a positive token and
+every newly emitted Fill or RunEvent copies that positive value, so the engine never
+creates a null-token event. Null compatibility does not relax the FT-07 input
+context or claim FT-11 fence validation.
 Nullable fields are nullable only where the frozen contract says `|null`.
 `Decision.evidence` is exactly
 `{evaluation_stage:"entry_rule"|"exit_rule"|"arm"|"entry_intent",
@@ -552,6 +560,15 @@ stop_slippage_ticks,limit_slippage_ticks}` with the frozen numerical bounds.
 both_hit_policy,entry_bar_exit_policy}`. Sizing is exactly fixed contracts or stop
 risk fraction, and `RiskPolicy` has the five frozen fields including
 `max_positions:1`.
+
+`EngineConfig.fill_model.fill_interval_seconds` must equal the immutable
+`strategy_version.fill_interval_seconds` exactly. Run-level fill policy selects the
+accepted execution semantics but cannot change the validated strategy version's
+timeframe. A mismatch is `UNSUPPORTED_CONFIGURATION` during initialization before
+state, bucket, or counter creation. On a later call, a changed config is the normal
+`CONFIG_MISMATCH` against the state fingerprint. Divisibility and minimum-interval
+validation still apply after equality; there is no second runtime authority that
+may widen or narrow the strategy interval.
 
 `entry_windows` is the run-level window constraint carried by frozen `RunSpec`.
 The strategy-level constraint is
@@ -793,7 +810,8 @@ trigger component. Select the source `BarSelection` having maximum
 tuple. Use that selection's exact bar record ID for every opening-gap, touch, and
 both-hit Fill from the aggregate. `FillEvidence` is emitted one-for-one in Fill
 tuple order, repeats that anchor with its explicit role, and carries the complete
-integrated ordered source-ID tuple and aggregate bounds. Its `fill_id` must match
+integrated ordered source-ID tuple, its exact parallel dataset-provenance tuple,
+and aggregate bounds. Its `fill_id` must match
 the paired frozen Fill. This companion is engine evidence, not an added Fill or
 RunEvent-payload field. `fill_evidence` has exactly the same length and order as
 `fills`; no Fill can be emitted without its companion.
@@ -802,20 +820,33 @@ RunEvent-payload field. `fill_evidence` has exactly the same length and order as
 `MarkEvidence.close_bar_record_id` are the last ordered source ID because that
 actual canonical component supplies the aggregate close. `MarkEvidence.run_event_id`
 matches the corresponding `MARK_RECORDED` event. `MarkEvidence` carries the same
-complete source tuple/bounds, and state retains it as
-`last_mark_source_bar_record_ids`. A 60-second aggregate has a one-ID tuple. No
+complete source tuple, parallel dataset-provenance tuple, and bounds; state retains
+them as `last_mark_source_bar_record_ids` and
+`last_mark_source_dataset_provenance`. A 60-second aggregate has a one-ID tuple. No
 synthetic aggregate ID is substituted and source order is never lexicalized. Thus
 the singular frozen fields have explicit non-trigger roles while the companion
 evidence makes every derived Fill/mark reconstructable without schema mutation.
 `mark_evidence` has exactly one item per `MARK_RECORDED` event, in event order.
 
+For both companions, provenance element `i` repeats source ID `i` and the revision
+captured when that source selection entered its fill bucket. Length mismatch,
+reordering, duplicate source IDs, an anchor absent from the paired tuple, or a
+different revision for the same source is invalid before output emission. The Fill
+availability anchor's provenance is the matching tuple element; the mark close
+source's provenance is the final element. Companion provenance is part of canonical
+step/run output bytes and replay equality. Past FillEvidence need not be copied into
+EngineState because no future transition cites a past fill bar; the current mark's
+parallel pair is checkpointed because later exit/risk evidence may cite it.
+
 A derived bar's causal availability is the maximum availability of all its source
 minutes. At execution-bar end `T`, zone bars newly complete at or before `T` are
 processed oldest first, then features and setups are evaluated once for that full
-execution bar. Backtest `effective_at=decided_at=created_at=T`, because the
+execution bar. Let execution anchor `A` be that aggregate's maximum source
+availability. Backtest `effective_at=decided_at=created_at=T`, because the
 boundary-completing backtest input is recorded at `T`. Forward `effective_at` is the
-maximum causal availability of every cited source; `decided_at` is the input
-`recorded_at` and is never earlier. `Decision.created_at=decided_at`.
+maximum of `A` and every source/feature/setup `known_at` used by the evaluation;
+`decided_at` is the input `recorded_at` and is never earlier.
+`Decision.created_at=decided_at`.
 `OrderIntent.submitted_at=EmissionContext.order_submitted_at` and must be at or after
 its Decision's `decided_at`. In both modes its `active_from` is the first full
 configured fill-bar start at or after both `effective_at` and `submitted_at`. For
@@ -836,6 +867,14 @@ fills and events created while processing a completed fill bar have
 available; their modeled opening-gap time may be earlier only when the order was
 submitted and active no later than that opening instant.
 
+Every trading Decision's `source_bar_record_ids` is the ordered-unique concatenation
+of each lexical RuleResult's stored source tuple, the selected setup's stored source
+tuple when present, and the current execution aggregate's integrated source tuple,
+keeping first occurrence. The aggregate suffix is mandatory, so an evaluated
+Decision is never source-free even if every rule node is constant. This source order
+applies to HOLD, ARM, ENTRY, CLOSE, REJECT, and the CANCEL projection refined in
+section 9.
+
 Decision dataset provenance is computed from the complete ordered cited-source
 tuple, not from the current base pointer. Resolve every Decision
 `source_bar_record_id` to the matching persisted `SourceDatasetProvenance` companion
@@ -845,10 +884,10 @@ restored state containing it is `CHECKPOINT_MISMATCH`; no Decision may be emitte
 For backtest, every resolved element must equal the pinned dataset revision and
 `Decision.dataset_revision_id` is that revision. For forward paper it is the one
 shared non-null revision only when every resolved element has that exact value; it
-is null if any element is null or if two non-null revisions differ. The empty cited
-tuple yields null in forward paper and the pinned revision in backtest. The complete
-ordered source bar IDs remain authoritative, and publishing a base never patches
-prior provenance or Decision bytes.
+is null if any element is null or if two non-null revisions differ. An evaluated
+Decision with an empty cited tuple is invalid. The complete ordered source bar IDs
+remain authoritative, and publishing a base never patches prior provenance or
+Decision bytes.
 
 The checkpoint/base-transition oracle is explicit. Consume source `a` under
 published base `R1`, checkpoint/restore, then consume source `b` under later base
@@ -965,6 +1004,18 @@ does not reuse an older value and a supplementary exit root at `UNKNOWN` never
 closes a position. Computational short-circuiting may occur, but Decision evidence
 contains every reachable leaf in lexical node-ID order with its exact value,
 source IDs, known-at time, and stable reason.
+
+Rule evaluation is always anchored to one completed execution aggregate. With `A`
+defined in section 4, each `RuleResult.known_at` is the maximum of `A` and the
+`known_at` values of the feature/child evidence used by that node. A literal or a
+constant-only subtree has `source_bar_record_ids:()` exactly and `known_at=A`; it
+does not invent a source ID or use `recorded_at` as a substitute. Its containing
+Decision nevertheless cites the mandatory current aggregate suffix, so in forward
+paper both constant-only ENTRY and constant-only CLOSE have
+`effective_at=A`, carry the aggregate's exact source IDs/provenance, and cannot be
+decided or submitted before `A`. In backtest the same cases retain
+`effective_at=execution_bar_end`. This anchor also applies to constant-only FAIL or
+UNKNOWN HOLD/REJECT evidence.
 
 The runtime UNKNOWN reason inventory is exactly:
 
@@ -1443,7 +1494,8 @@ makes batch/checkpoint replay identical.
 
 A `CANCEL/SETUP_EXPIRED` Decision is fully projected from that completed execution
 bar: `execution_bar_end` is the bar end; backtest `effective_at` equals it and
-forward `effective_at` is the latest availability of its cited sources; `side` and
+forward `effective_at` is the maximum of execution anchor `A` and the snapshot's
+stored `known_at` evidence; `side` and
 `setup_id` copy the expiring snapshot; `order_intent` is null; evidence uses the
 already permitted `evaluation_stage:"arm"`, its exact evidence mode, an empty
 `results` tuple, and that snapshot as `selected_setup`. Its
@@ -1643,7 +1695,7 @@ The code, sole public message, and condition are:
 | INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. |
 | EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. |
 | BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. |
-| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset, calendar, mode, random seed, five-year span, absolute bar ceiling, or policy is unsupported/inconsistent. |
+| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset, calendar, mode, random seed, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. |
 | UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. |
 | UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. |
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
@@ -1778,6 +1830,11 @@ The named boundary and replay tests are:
 - `test_decision_dataset_revision_is_shared_base_or_null_from_all_cited_sources`
 - `test_checkpoint_preserves_bounded_source_provenance_across_base_transition`
 - `test_post_terminal_replay_duplicate_conflict_and_run_finished_precedence`
+- `test_constant_only_forward_entry_uses_execution_aggregate_causal_anchor`
+- `test_constant_only_forward_close_uses_execution_aggregate_causal_anchor`
+- `test_fill_interval_must_equal_strategy_version_without_state_creation`
+- `test_fill_and_mark_evidence_provenance_pairs_source_ids_exactly`
+- `test_run_event_nullable_fencing_token_round_trips_but_engine_emits_positive`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
