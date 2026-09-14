@@ -237,6 +237,25 @@ def test_login_and_idle_projection_ignore_ahead_app_clock(postgres_engine: Engin
     assert before + IDLE_TIMEOUT <= context.expires_at <= after + IDLE_TIMEOUT
 
 
+def test_context_current_predicate_uses_the_callers_connection(postgres_engine: Engine) -> None:
+    """The FT-06 mutation gate must be able to recheck auth without a pool checkout."""
+    service = service_for(postgres_engine, MutableClock(datetime(2026, 9, 13, 1, tzinfo=UTC)))
+    service.invite_user("connection-owner", "test-password-A!", {"lanes:read"})
+    login = service.login("connection-owner", "test-password-A!")
+    context = service.authenticate_browser(login.session_token, request_id="connection-current")
+    repository = AccessRepository(postgres_engine)
+    with postgres_engine.begin() as connection:
+        backend_pid = connection.scalar(text("select pg_backend_pid()"))
+        assert repository.context_is_current_on_connection(connection, context)
+        connection.execute(
+            update(sessions)
+            .where(sessions.c.auth_session_id == context.auth_session_id)
+            .values(revoked_at=func.clock_timestamp())
+        )
+        assert connection.scalar(text("select pg_backend_pid()")) == backend_pid
+        assert not repository.context_is_current_on_connection(connection, context)
+
+
 def test_scope_csrf_token_binding_origin_operation_and_forgery(postgres_engine: Engine) -> None:
     clock = MutableClock(datetime(2026, 9, 13, 1, 0, tzinfo=UTC))
     service = service_for(postgres_engine, clock)

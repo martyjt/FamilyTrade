@@ -24,6 +24,7 @@ from familytrade.market_data.catalog import (
     contracts,
     dataset_revisions,
     idempotency,
+    load_owned_calendar_version,
     publication_files,
     publication_revisions,
     publications,
@@ -226,6 +227,28 @@ def test_calendar_create_generates_id_and_version_one_then_append_requires_curre
     calendar, _ = seed(catalog, contexts[0])
     assert calendar.calendar_version == calendar.record_version == 1
     assert calendar.owner_user_id == contexts[0].user_id
+
+
+def test_calendar_lookup_is_owner_scoped_on_the_callers_connection(catalog, contexts) -> None:
+    calendar, _ = seed(catalog, contexts[0])
+    with catalog.engine.begin() as connection:
+        backend_pid = connection.scalar(text("select pg_backend_pid()"))
+        loaded = load_owned_calendar_version(
+            connection,
+            contexts[0].user_id,
+            calendar.calendar_id,
+            calendar.calendar_version,
+        )
+        assert loaded.calendar_id == calendar.calendar_id
+        assert connection.scalar(text("select pg_backend_pid()")) == backend_pid
+        with pytest.raises(AccessError) as hidden:
+            load_owned_calendar_version(
+                connection,
+                contexts[1].user_id,
+                calendar.calendar_id,
+                calendar.calendar_version,
+            )
+    assert hidden.value.http_status == 404
 
 
 def test_batch_same_key_same_bytes_replays_original_ids(catalog, contexts) -> None:
