@@ -94,7 +94,7 @@ base-10 strings. The public records are:
   `ProtectiveOrderState`, `ProtectiveBracketState`, `PositionState`, `RiskState`,
   `EngineState`, and `EngineCheckpoint`.
 - `OrderIntent`, `Decision`, `Fill`, `RunEvent`, `EngineStepResult`, and
-  `EngineRunResult`.
+  `EngineRunResult`, plus `FillEvidence` and `MarkEvidence` companions.
 - `EngineErrorCode` and `EngineError`.
 
 `src/familytrade/simulation/engine.py` exports exactly:
@@ -261,7 +261,7 @@ ProtectiveOrderState = {
   role:"protective_stop"|"profit_target",
   order_type:"stop_market"|"limit",
   side:"buy"|"sell", effect:"close", quantity:positive int,
-  trigger_price:positive Decimal,
+  trigger_price:finite Decimal,
   status:"ACTIVE"|"FILLED"|"CANCELLED",
   active_from:UTC timestamp, filled_at:UTC timestamp|null,
   cancelled_at:UTC timestamp|null, status_reason:string|null,
@@ -289,8 +289,11 @@ RiskState = {
 Decision = {
   schema_version:"v1", decision_id, owner_user_id, run_id, lane_id,
   strategy_version_id, dataset_revision_id, source_bar_record_ids,
-  execution_bar_end, decision_sequence, decision_type, side,
-  setup_id, reason_code, evidence, order_intent,
+  execution_bar_end, decision_sequence,
+  decision_type:"HOLD"|"ARM"|"ENTRY"|"CLOSE"|"CANCEL"|"REJECT",
+  side:"long"|"short"|null,
+  setup_id:lowercase UUIDv7|null, reason_code, evidence,
+  order_intent:OrderIntent|null,
   pre_state_sha256, post_state_sha256, causation_event_id,
   effective_at, decided_at, idempotency_key,
   created_at:decided_at, record_version:1
@@ -302,8 +305,24 @@ Fill = {
   side:"buy"|"sell", effect:"open"|"close", quantity:int,
   base_price, fill_price, slippage, commission, currency:"USD",
   model_time, realized_pnl, cash_after, position_quantity_after,
-  position_average_after, reason, causation_decision_id,
+  position_average_after, reason,
+  causation_decision_id:lowercase UUIDv7|null,
   created_at, fencing_token:positive int, record_version:1
+}
+
+FillEvidence = {
+  fill_id:lowercase UUIDv7,
+  fill_bar_start_at:UTC timestamp, fill_bar_end_at:UTC timestamp,
+  bar_record_id_role:"availability_anchor",
+  availability_anchor_bar_record_id:string,
+  source_bar_record_ids:tuple[string,...]
+}
+
+MarkEvidence = {
+  run_event_id:lowercase UUIDv7,
+  fill_bar_start_at:UTC timestamp, fill_bar_end_at:UTC timestamp,
+  close_bar_record_id:string,
+  source_bar_record_ids:tuple[string,...]
 }
 
 RunEvent = {
@@ -328,6 +347,9 @@ target.trigger_price`; for a short, the inequalities reverse. The bracket is
 created atomically with an entry fill and has exactly one live leg of each role.
 Filling either leg sets its fill fields and cancels the sibling in the same state
 transition; cancellation never fabricates a Fill.
+`trigger_price` is any finite signed Decimal that is an exact contract tick
+multiple; zero and negative futures prices are not rejected merely for their sign.
+Only the frozen side/role rounding and long/short geometry constrain it.
 
 `bracket_template.frozen_feature_values` is a canonical object whose keys are
 lexical feature IDs and whose values are the corresponding `FeatureValue` records.
@@ -395,10 +417,12 @@ rules.
   feature_runtime:tuple[FeatureRuntimeState,...],
   zones:tuple[ZoneState,...], setups:tuple[SetupState,...],
   pending_entry:OrderState|null, position:PositionState|null,
-  close_intent:OrderState|null, scheduled_force_close:OrderState|null,
+  close_intent:OrderState|null,
+  scheduled_force_close:OrderState|null,
   cash, equity, fees, realized_pnl, unrealized_pnl,
   exposure_seconds:int, last_mark:Decimal|null,
   last_mark_bar_record_id:string|null,
+  last_mark_source_bar_record_ids:tuple[string,...],
   mark_status:"none"|"fresh"|"stale",
   risk:RiskState,
   next_decision_sequence:int, next_order_sequence:int,
@@ -437,8 +461,9 @@ force-close use the terminal transitions in section 8. This includes the exact
 `EngineStepResult` is exactly
 `{state,decisions:tuple[Decision,...],intents:tuple[OrderIntent,...],
 protective_orders:tuple[ProtectiveOrderState,...],fills:tuple[Fill,...],
+fill_evidence:tuple[FillEvidence,...],mark_evidence:tuple[MarkEvidence,...],
 events:tuple[RunEvent,...],replayed:boolean}`.
-`EngineRunResult` has the same five aggregate output tuples plus final `state` and
+`EngineRunResult` has the same seven aggregate output tuples plus final `state` and
 `checkpoint`; concatenating successful step deltas in order must equal the batch
 tuples byte-for-byte.
 
@@ -494,15 +519,18 @@ activation across a DST fold, gap, maintenance interval, or `scheduled_closed`
 span. Window close cancels a pending entry and setup; it never closes an open
 position or cancels protection.
 
-Entry-window eligibility applies to the entire configured fill bar, not only its
-opening instant. The half-open fill interval `[bar.start_at,bar.end_at)` must be
-contained in one stored open segment and in one window from each non-empty run and
-strategy tuple. If an effective window opens or closes inside that fill bar, the
-bar is ineligible. An internal close boundary cancels the pending entry before any
-gap/touch evaluation; an internal open boundary permits no retroactive fill and the
-pending entry may wait for the next wholly contained bar subject to its unchanged
-TTL. This conservative causal rule needs no implicit intrabar/window ordering and
-leaves protective exits eligible.
+Entry-window ordering follows the frozen opening-gap-before-intrabar model. An
+entry is open-window eligible at fill-bar start only when that instant is in one
+window from each non-empty run and strategy tuple. If it is already active then,
+opening-gap evaluation occurs at `bar.start_at` and may fill because that modeled
+instant is causally before any later window close. If it remains unfilled and an
+effective window closes strictly inside the bar, cancel it at that exact boundary
+before evaluating any aggregate OHLC intrabar touch, whose position relative to the
+close is unknowable. A close exactly at bar start cancels before opening-gap
+evaluation; a close exactly at bar end cancels before an intrabar touch modeled at
+that end. An internal window open permits no retroactive gap/touch fill; an order
+may activate only on a later fill-bar start that is in the effective window, subject
+to unchanged TTL. Protection is never constrained by entry windows.
 
 All config owner IDs agree. The validated strategy definition/hash/catalogue,
 contract ID/version, contract calendar ID/version, and supplied calendar ID/version
@@ -697,14 +725,27 @@ use the same first/max/min/last/sum and segment-anchor rule.
 
 For any derived fill bar, use the integrated
 `AggregatedFullBar.source_bar_record_ids` tuple in its existing timestamp order. The
-singular frozen `Fill.bar_record_id` is the
-first ordered source ID for an opening-gap fill because it supplies the modeled
-open; it is the last ordered source ID for an intrabar touch/both-hit fill because
-the model becomes determined at aggregate end. `MARK_RECORDED.bar_record_id` and
-`EngineState.last_mark_bar_record_id` are always the last ordered source ID because
-they represent the derived close. A 60-second fill bar has the same first/last ID.
-No synthetic aggregate ID is substituted, source order is never lexicalized, and
-no extra source-tuple field is added to the frozen Fill or MARK payload.
+singular frozen `Fill.bar_record_id` is an availability anchor, never a claimed
+trigger component. Select the source `BarSelection` having maximum
+`availability_at`; if tied, select the greatest position in the integrated source
+tuple. Use that selection's exact bar record ID for every opening-gap, touch, and
+both-hit Fill from the aggregate. `FillEvidence` is emitted one-for-one in Fill
+tuple order, repeats that anchor with its explicit role, and carries the complete
+integrated ordered source-ID tuple and aggregate bounds. Its `fill_id` must match
+the paired frozen Fill. This companion is engine evidence, not an added Fill or
+RunEvent-payload field. `fill_evidence` has exactly the same length and order as
+`fills`; no Fill can be emitted without its companion.
+
+`MARK_RECORDED.bar_record_id`, `EngineState.last_mark_bar_record_id`, and
+`MarkEvidence.close_bar_record_id` are the last ordered source ID because that
+actual canonical component supplies the aggregate close. `MarkEvidence.run_event_id`
+matches the corresponding `MARK_RECORDED` event. `MarkEvidence` carries the same
+complete source tuple/bounds, and state retains it as
+`last_mark_source_bar_record_ids`. A 60-second aggregate has a one-ID tuple. No
+synthetic aggregate ID is substituted and source order is never lexicalized. Thus
+the singular frozen fields have explicit non-trigger roles while the companion
+evidence makes every derived Fill/mark reconstructable without schema mutation.
+`mark_evidence` has exactly one item per `MARK_RECORDED` event, in event order.
 
 A derived bar's causal availability is the maximum availability of all its source
 minutes. At execution-bar end `T`, zone bars newly complete at or before `T` are
@@ -714,8 +755,10 @@ causal availability of every cited source; `decided_at` is the input `recorded_a
 and is never earlier. `Decision.created_at=decided_at`.
 `OrderIntent.submitted_at=EmissionContext.order_submitted_at`. Its `active_from` is
 the first full configured fill-bar start at or after `effective_at` in backtest and
-at or after `order_submitted_at` in forward paper, also subject to the whole-bar
-entry-window rule. `Fill.created_at=EmissionContext.output_recorded_at` on the input
+at or after `order_submitted_at` in forward paper. For entries, that start must be
+inside the effective entry window; the entry-window ordering in section 3 then
+governs a window close inside the active fill bar. `Fill.created_at` is
+`EmissionContext.output_recorded_at` on the input
 that determines the fill, while `Fill.model_time` remains the frozen fill-bar start
 for an opening gap and end for an intrabar touch. Every RunEvent caused by the input
 uses `recorded_at=created_at=output_recorded_at`. Thus the delayed fixture binds
@@ -890,6 +933,60 @@ activation, absolute expiry, order state, and OCO cancellation.
 for one complete configured fill bar. V1 has one all-or-none entry order, at most one
 position, and one protective stop-market/target-limit bracket per run state.
 
+Every close `OrderIntent`, regardless of cause, is exactly
+`kind:"close",order_type:"market",effect:"close"`, has the opposite side and full
+quantity of the current position, has all six raw/executable entry/stop/target price
+fields null, has `bracket_template:null`, and copies
+`fill_model.entry_bar_exit_policy` and `.both_hit_policy` as required serialized
+policy fields even though neither changes market-close fill semantics. No close
+intent is created while flat.
+
+The three close causes bind timing and expiry as follows:
+
+| Cause | Creation and activation | `expires_at` |
+| --- | --- | --- |
+| Passed supplementary exit rule | Created by its `CLOSE` Decision; `effective_at` is Decision effective time and `submitted_at` is the input's explicit order-submission time. `active_from` is the first stored-calendar open-segment-anchored fill-bar start at or after `effective_at` in backtest or `submitted_at` in forward paper. | `contract.liquidation_start_at` (exclusive). |
+| Contract liquidation | Created as the persisted `close_intent` when input chronology first reaches `contract.liquidation_start_at`, preserving the frozen create-at-liquidation rule. It has `effective_at=contract.liquidation_start_at` and `submitted_at` from that boundary-advancing input's explicit emission context. In backtest, `active_from` is the first not-yet-processed eligible fill-bar start at or after liquidation; in forward paper it is the first eligible fill-bar start at or after both liquidation and `submitted_at`. | `contract.last_trade_at` (exclusive). |
+| Backtest force close | `scheduled_force_close` uses the section 8 pre-scheduling rule and moves to `close_intent` at `config.force_close_at`. | `config.end_at` (exclusive). |
+
+At most one live `close_intent` exists. Creation appends its exact `OrderIntent` to
+`intents` once and creates `OrderState` as `PENDING`; when `active_from` is reached,
+it becomes `ACTIVE` before fill evaluation. Submission, activation, cancellation,
+and expiry each emit the corresponding exact `ORDER_STATE` transition. An exit-rule
+close persists unchanged
+across missing data, maintenance, scheduled closure, delayed delivery, and entry
+window closure. At liquidation the pre-existing exit close expires before it is
+replaced by the newly created liquidation close. An active liquidation
+or force close likewise persists
+across closed/data-delay intervals until its exclusive expiry. Protection remains
+active while any market close is pending and retains opening-gap precedence.
+Whichever close/protective Fill first flattens the position cancels every other
+active or scheduled close with `POSITION_FLAT`; cancellation emits no Fill and
+retains null `fill_sequence`. Repeated exit PASS while a close is already active
+emits one `HOLD` Decision with `CLOSE_PENDING` and no duplicate order. At
+exclusive expiry, an unfilled exit-rule order is replaced by the newly created
+liquidation order; unfilled liquidation becomes `BLOCKED_EXPIRY_UNRESOLVED`; and
+unfilled force close becomes `BLOCKED_UNCLOSED` only on Finish as section 8 states.
+Every exclusive expiry first moves the unfilled order to `EXPIRED` with
+`ORDER_EXPIRED`, emits that transition, then clears the live pointer; the terminal
+state retains the open position and the emitted intent/event evidence. A
+`POSITION_FLAT` cancellation similarly emits `CANCELLED` before clearing the live
+or scheduled pointer. No cancellation or expiry emits a Fill or commission.
+
+An entry Fill and either protective Fill cite the originating entry Decision in
+`causation_decision_id`; an exit-rule market close cites its `CLOSE` Decision.
+Contract-liquidation and force-close lifecycle Fills use null because no trading
+Decision is fabricated for either policy action.
+
+For liquidation, "chronology first reaches" means boundary actions occur before
+processing a bar whose `start_at` equals the boundary and before processing a
+quality interval whose range begins there. Such a close can therefore participate
+in that bar's opening-gap precedence only when its mode-specific `active_from` is
+not later than that start. If liquidation falls strictly inside a fill bar, creation
+occurs at the exact boundary but cannot backdate a market fill to the earlier bar
+open; the close waits for the next eligible fill-bar start. A closed, missing, or
+delayed interval can create and persist the intent but cannot fill it.
+
 Entry TTL is execution-bar wall-clock time. All full fill bars in the half-open
 active interval are eligible; expiry occurs before a fill bar or decision at the
 exclusive expiry boundary. Missing bars and scheduled closures do not extend it.
@@ -992,12 +1089,16 @@ strictly below the effective limit above. Latches cancel entry/setup state but p
 later recovery in equity does not clear a same-day daily-loss latch.
 
 At `entry_cutoff_at`, cancel entries/setups and block new ones. At
-`liquidation_start_at`, cancel entry state, create the close intent, and set status
-to `CLOSING`. It remains `CLOSING` while that close is pending and protective exits
-remain active under normal precedence. It fills at
-the next eligible fill bar under normal gap/precedence rules; no stale or closed
-market fill is invented. After close, state is stopped for that actual contract.
-If no eligible close exists before `last_trade_at`, terminal status is
+`liquidation_start_at`, cancel entry state and first inspect the position. If flat,
+create no close intent, emit no close Decision/Fill, never enter `CLOSING`, and
+terminate `STOPPED` with `CONTRACT_CLOSED`. A later
+FinishRunEvent is a nonidentical post-terminal input and returns `RUN_FINISHED`.
+If a position is open, create the liquidation `close_intent` under section 7 and set
+`CLOSING`. It remains byte-identical across scheduled closure or missing/invalid
+data while protection stays active, then fills at the next eligible fill bar under
+normal gap/precedence rules; no stale or closed-market fill is invented. After
+close, state is `STOPPED` for that actual contract. If no eligible close exists
+before exclusive `last_trade_at`, terminal status is
 `BLOCKED_EXPIRY_UNRESOLVED` with the position and last mark visible. A config,
 checkpoint, or event naming a different contract ID or record version is
 `UNSUPPORTED_CONTRACT_CHANGE`; the engine never stitches, rolls, or transfers a
@@ -1034,7 +1135,9 @@ never backdated from an end-of-bar decision. A
 successful close or protective exit cancels its sibling/close as applicable, sets
 `force_close_state:"completed"`, keeps entry creation blocked, and returns the
 nonterminal engine status to `ACTIVE` while awaiting the required finish input. A
-flat position at the boundary moves directly to `completed`.
+flat position at the boundary creates no close intent or Fill, never enters
+`CLOSING`, and moves directly to `completed`; only the later Finish input makes the
+run `FINISHED`.
 
 Only the exactly-once `FinishRunEvent` creates `RUN_FINISHED` and terminal
 `FINISHED` for a successful `mark_open` or completed force-close run. If the force
@@ -1065,18 +1168,59 @@ null; exact source bar IDs remain authoritative. A later publication or correcti
 never patches prior bytes. A bar at or before the committed cursor with a different
 record ID is rejected and cannot recompute cash, decisions, fills, or indicators.
 
+The closed Decision emission contract is:
+
+- `HOLD`: an actually evaluated entry/exit/filter/setup outcome produces no stateful
+  trading action, including FAIL, UNKNOWN, no eligible zone, cooldown, or
+  `CLOSE_PENDING`. No full evaluation means no HOLD.
+- `ARM`: one setup atomically enters/updates its armed or signalled state without
+  emitting an order.
+- `ENTRY`: exactly one entry `OrderIntent` is emitted; it is the only Decision type
+  permitted to carry `order_intent.kind:"entry"`.
+- `CLOSE`: an exit-rule PASS emits one market-close `OrderIntent`; it is the only
+  Decision type permitted to carry `order_intent.kind:"close"`. Contract and
+  force-close schedules are deterministic lifecycle actions and emit no Decision.
+- `CANCEL`: a policy boundary cancels an existing setup or pending entry/exit order
+  without a Fill. Mechanical OCO sibling cancellation is only `ORDER_STATE`, not a
+  second trading Decision.
+- `REJECT`: an otherwise actionable candidate is rejected by conflict, target/
+  geometry, sizing, or risk policy and emits no order/fill.
+
+At one accepted input, derive atomic candidates from the one prescribed pre-state,
+then serialize Decisions by `(stage_rank,side_rank,family_rank,setup_id,reason_code)`.
+Stage ranks are boundary cancellation `0`, exit evaluation/action `1`, entry-rule
+evaluation `2`, setup arm/signal `3`, entry-intent/conflict `4`, and sizing/risk
+rejection `5`. Side ranks are long `0`, short `1`, null `2`; family ranks are
+breakout `0`, reversal `1`, none `2`; null setup ID sorts after UUIDs. This ordering
+does not change the already-derived conflict/winner outcome.
+
+For each serialized Decision, `pre_state_sha256` hashes state immediately before
+that Decision, including the current `next_decision_sequence`. Generate
+`decision_id` from that sequence/pre-hash/correlation tuple; then derive its
+idempotency key and any order ID, apply only that Decision's semantic state changes,
+increment `next_decision_sequence` once, and compute `post_state_sha256`. A HOLD or
+REJECT still changes the sequence and therefore has a new post hash. With multiple
+Decisions, each prior post hash is byte-identical to the next pre hash. Any fill,
+mark, or other transition prescribed before decision evaluation is already in the
+first Decision's pre-state. No fill, mark, or RunEvent-sequence transition occurs
+between serialized Decisions: all Decisions for the input are applied in the order
+above before their `DECISION_RECORDED` events are appended in that same order and
+before any consequent later transition. This removes UUID/hash circularity and
+makes batch/checkpoint replay identical.
+
 The stable domain reason inventory is closed for v1:
 
 - Evaluation/setup: `ENTRY_RULE_PASS`, `ENTRY_RULE_FAIL`, `EXIT_RULE_PASS`,
   `EXIT_RULE_FAIL`, `SETUP_SIGNAL`, `ARM_LONG`, `ARM_SHORT`,
   `ENTRY_INTENT_LONG`, `ENTRY_INTENT_SHORT`, `FILTER_FAIL`, `FILTER_UNKNOWN`,
   `NOT_APPROACHING`, `NOT_RETESTED`, `NO_ELIGIBLE_ZONE`, `COOLDOWN_ACTIVE`,
+  `CLOSE_PENDING`,
   `CONFLICT_OPPOSING_ARMS`, `CONFLICT_OPPOSING_SIDES`, `BREAKOUT_WINS`,
   `SETUP_EXPIRED`, `NO_TARGET_ZONE`, `INVALID_TARGET_DISTANCE`, and
   `INVALID_BRACKET`, plus the section 5 UNKNOWN codes.
 - Order/cancellation: `ORDER_SUBMITTED`, `ORDER_ACTIVATED`, `ORDER_EXPIRED`,
   `ENTRY_WINDOW_CLOSED`, `ENTRY_CUTOFF`, `CONTRACT_LIQUIDATION`,
-  `FORCE_CLOSE`, `RISK_SIZE_ZERO`, `ENTRY_GEOMETRY_GAP`, `RISK_GAP`,
+  `FORCE_CLOSE`, `POSITION_FLAT`, `RISK_SIZE_ZERO`, `ENTRY_GEOMETRY_GAP`, `RISK_GAP`,
   `DAILY_LOSS_LIMIT`, `DAILY_ENTRY_LIMIT`, and
   `CUMULATIVE_DRAWDOWN_LIMIT`.
 - Fill: `MARKET_ENTRY`, `LIMIT_ENTRY_GAP`, `LIMIT_ENTRY_TOUCH`, `STOP_GAP`,
@@ -1111,9 +1255,12 @@ Protective records never appear in the `intents` tuple or in
 This makes bracket persistence unambiguous without changing the frozen payload or
 `OrderIntent` schema.
 
-Events are returned in exact processing order. Within one input: opening exit,
-market close, intrabar exit, entry evaluation/fill, decisions/order transitions,
-close mark, risk latch, then state/finish record. Each sequence increments once.
+Events are returned in exact processing order. Within one input: exact-time boundary
+cancellation/submission/activation transitions; each completed fill bar's opening
+gap precedence and then permitted intrabar precedence; execution-bar Decisions and
+then their order transitions; close mark; risk latch; then state/finish record. The
+serialized Decision group follows section 9, so its `DECISION_RECORDED` events are
+adjacent and ordered exactly like `decisions`. Each event sequence increments once.
 `attempt_id` and `fencing_token` are copied unchanged from `EmissionContext` into
 each Fill/RunEvent. The correlation ID is a deterministic UUIDv7 in the
 `correlation` domain for the input identity. A later issue may validate ownership and persist
@@ -1271,14 +1418,22 @@ The named boundary and replay tests are:
 - `test_uuid_vector_integer_quantity_matches_normative_value`
 - `test_cumulative_bar_caps_across_steps_chunks_restore_and_five_calendar_year_span`
 - `test_checkpoint_restores_accumulators_and_runtime_indexes_byte_exactly`
-- `test_aggregated_fill_and_mark_choose_first_or_last_ordered_source_id`
+- `test_aggregate_fill_uses_availability_anchor_and_complete_ordered_source_evidence`
+- `test_aggregate_mark_uses_close_component_and_complete_ordered_source_evidence`
 - `test_forward_decided_submitted_active_and_created_times_match_delayed_fixture`
 - `test_effective_daily_entry_cap_is_minimum_of_strategy_and_risk_policy`
-- `test_entry_window_boundary_inside_fill_bar_cancels_before_fill`
+- `test_window_close_inside_fill_bar_allows_opening_gap_then_cancels_before_touch`
+- `test_window_close_at_fill_bar_start_and_end_orders_gap_and_touch_exactly`
+- `test_internal_window_open_never_retroactively_activates_an_entry`
 - `test_force_close_waits_for_exactly_once_finish_before_finished`
+- `test_all_close_intent_shapes_activation_persistence_cancellation_and_expiry_are_exact`
+- `test_flat_at_liquidation_stops_without_close_or_closing_and_finish_returns_run_finished`
+- `test_flat_at_force_close_waits_for_finish_without_close_or_closing`
 - `test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state`
 - `test_rule_result_and_decision_evidence_match_frozen_schema_exactly`
 - `test_order_fill_sequence_is_null_until_fill_and_advances_only_on_commit`
+- `test_decision_type_emission_order_uuid_and_pre_post_hash_chain_are_exact`
+- `test_signed_zero_and_negative_protective_triggers_require_finite_tick_geometry`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
