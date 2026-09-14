@@ -24,7 +24,11 @@ from familytrade.access.repository import AccessRepository, access_metadata, use
 from familytrade.access.service import AccessService
 from familytrade.market_data.catalog import market_data_metadata
 from familytrade.market_data.models import CalendarVersion, CalendarWindow
-from familytrade.strategies.definitions import StrategyDraftValidateInput, StrategyListInput
+from familytrade.strategies.definitions import (
+    StrategyDraftValidateInput,
+    StrategyListInput,
+    ValidationIssueCode,
+)
 from familytrade.strategies.presets import get_preset
 from familytrade.strategies.repository import (
     StrategyRepository,
@@ -1058,6 +1062,13 @@ def test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_
 def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable() -> None:
     result = _validate({})
     assert result.errors and all(issue.path.startswith("/") for issue in result.errors)
+    assert {issue.code for issue in result.errors} <= set(ValidationIssueCode)
+    assert tuple((issue.path, issue.code.value) for issue in result.errors) == tuple(
+        sorted(
+            ((issue.path, issue.code.value) for issue in result.errors),
+            key=lambda item: (item[0], item[1]),
+        )
+    )
     with pytest.raises(ValidationError):
         StrategyDraftValidateInput.model_validate(
             {"schema_version": "v1", "draft_id": "not-a-uuid", "expected_version": -1}
