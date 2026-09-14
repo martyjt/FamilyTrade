@@ -8,7 +8,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import time
 from decimal import Decimal, InvalidOperation
 from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -691,8 +691,8 @@ def _window_issues(
             or any(day not in range(1, 8) for day in window.days_of_week)
         )
         try:
-            start = datetime.strptime(window.start_local, "%H:%M:%S").time()
-            end = datetime.strptime(window.end_local, "%H:%M:%S").time()
+            start = time.fromisoformat(window.start_local)
+            end = time.fromisoformat(window.end_local)
             invalid = invalid or start >= end
         except ValueError:
             invalid = True
