@@ -10,7 +10,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
-from sqlalchemy import create_engine, func, select, text, update
+from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
@@ -770,8 +770,13 @@ def test_different_keys_may_create_distinct_successors_from_same_unchanged_sourc
     edited = _create_request(_fixture())
     edited.pop("kind")
     edited.update({"draft_id": source.strategy_version_id, "expected_version": 1})
-    first = repository.edit_draft(context, edited, idempotency_key=str(uuid7()))
-    second = repository.edit_draft(context, edited, idempotency_key=str(uuid7()))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(
+            executor.map(
+                lambda _: repository.edit_draft(context, edited, idempotency_key=str(uuid7())),
+                range(2),
+            )
+        )
     assert first.strategy_version_id != second.strategy_version_id
     assert repository.get_version(context, source.strategy_version_id).record_version == 1
 
@@ -819,8 +824,15 @@ def test_list_is_owner_scoped_stably_ordered_bounded_and_cursor_bound(
 
 def test_strategy_metadata_owner_fks_bind_exact_access_users_column_object() -> None:
     for table in (strategy_metadata.tables["strategy_versions"], strategy_idempotency_records):
-        foreign_keys = [foreign_key.column for foreign_key in table.foreign_keys]
-        assert users.c.user_id in foreign_keys
+        owner_fks = [
+            foreign_key
+            for foreign_key in table.foreign_keys
+            if foreign_key.parent is table.c.owner_user_id
+        ]
+        access_owner_fks = [
+            foreign_key for foreign_key in owner_fks if foreign_key.column is users.c.user_id
+        ]
+        assert len(access_owner_fks) == 1
 
 
 def test_same_key_concurrent_create_edit_and_validate_commit_one_complete_outcome(
@@ -893,12 +905,19 @@ def test_pool_size_one_mutations_never_checkout_a_second_connection(
         max_overflow=0,
         pool_pre_ping=True,
     )
+    checked_out: list[int] = []
+
+    @event.listens_for(single, "checkout")
+    def record_checkout(dbapi_connection: object, *_: object) -> None:
+        checked_out.append(id(dbapi_connection))
+
     try:
         single_repository = StrategyRepository(single, access_repository=AccessRepository(single))
         result = single_repository.create_draft(
             context, _create_request(_fixture()), idempotency_key=str(uuid7())
         )
         assert result.owner_user_id == context.user_id
+        assert len(set(checked_out)) == 1
     finally:
         single.dispose()
 
