@@ -280,3 +280,19 @@ def test_r_multiple_targets_long_short_fixture_uses_exact_existing_id() -> None:
     fixture = _case("r_multiple_targets_long_short")
     assert fixture["long"]["r_multiple"] == "2.50"
     assert fixture["short"]["r_multiple"] == "3.00"
+
+
+def test_generic_market_relative_bracket_fixture_is_valid_without_resolving_prices() -> None:
+    fixture = _case("generic_market_entry_resolves_relative_bracket")
+    assert fixture["frozen_exit_policy"] == {
+        "stop": {"kind": "fixed_ticks", "ticks": 20},
+        "target": {"kind": "risk_multiple", "multiple": "2.00"},
+    }
+    assert fixture["eligible_bar"]["open"] == "2000.00"
+
+
+def test_next_zone_fixture_binds_both_sides_without_selecting_a_zone() -> None:
+    fixture = _case("next_zone_targets_long_short_and_missing")
+    assert fixture["long"]["known_zones"][1]["id"] == "L-old-near"
+    assert fixture["short"]["known_zones"][1]["id"] == "S-near"
+    assert fixture["no_target_long"]["known_zone_highs"] == ["2019.00"]
