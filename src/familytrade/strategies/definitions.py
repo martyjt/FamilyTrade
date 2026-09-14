@@ -223,15 +223,15 @@ class ConfirmedPivotZonesSetup(FrozenModel):
     kind: Literal["confirmed_pivot_zones_v1"]
     zone_interval_seconds: int
     use_atr: bool
-    atr_length: int = Field(ge=1, le=500)
+    atr_length: int = Field(ge=2, le=500)
     pivot_left: int = Field(ge=1, le=50)
     pivot_right: int = Field(ge=1, le=50)
     merge_multiple: str
     max_width_multiple: str
     minimum_touches: int = Field(ge=1, le=100_000)
-    max_zones: int = Field(ge=1, le=1000)
+    max_zones: int = Field(ge=1, le=50)
     zone_max_age_bars: int = Field(ge=1, le=100_000)
-    cooldown_execution_bars: int = Field(ge=0, le=100_000)
+    cooldown_execution_bars: int = Field(ge=0, le=1000)
 
 
 class ReversalSetup(FrozenModel):
@@ -242,7 +242,7 @@ class ReversalSetup(FrozenModel):
     require_directional_approach: bool
     stop_buffer_multiple: str
     recent_peak_stop: bool
-    peak_lookback: int = Field(ge=1, le=2000)
+    peak_lookback: int = Field(ge=1, le=500)
     target_mode: Literal["measured_move", "next_zone", "r_multiple"]
     measured_move_multiple: str
     r_multiple: str
@@ -357,7 +357,7 @@ class StrategyListInput(FrozenModel):
     schema_version: Literal["v1"]
     status: Literal["draft", "validated"] | None = None
     cursor: str | None = None
-    limit: int = Field(default=50, ge=1, le=100)
+    limit: int = Field(default=50, ge=1, le=200)
 
 
 class StrategyVersion(FrozenModel):

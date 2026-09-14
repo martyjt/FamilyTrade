@@ -1127,7 +1127,39 @@ def test_type_unit_operator_matrix_is_exhaustive() -> None:
 
 
 def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    nodes.extend(
+        [
+            {
+                "kind": "constant",
+                "node_id": "count",
+                "value_type": "integer",
+                "unit": "count",
+                "value": 2,
+            },
+            {
+                "kind": "constant",
+                "node_id": "scalar",
+                "value_type": "decimal",
+                "unit": "scalar",
+                "value": "2",
+            },
+            {
+                "kind": "arithmetic",
+                "node_id": "bad-count-scale",
+                "op": "multiply",
+                "args": ["count", "scalar"],
+                "result_type": "integer",
+                "unit": "count",
+            },
+        ]
+    )
+    result = _validate(value)
+    assert ("/nodes/9/args", "TYPE_MISMATCH") in {
+        (item.path, item.code.value) for item in result.errors
+    }
 
 
 def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -> None:
@@ -1162,7 +1194,12 @@ def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> Non
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    features = value["features"]
+    assert isinstance(features, list)
+    features[0]["interval_seconds"] = 700
+    result = _validate(value)
+    assert any(item.code.value == "INVALID_INTERVAL" for item in result.errors)
 
 
 def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> None:

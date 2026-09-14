@@ -132,7 +132,31 @@ def _canonical(value: object, *, definition: bool = False) -> object:
             key = unicodedata.normalize("NFC", raw_key)
             if key in normalized:
                 raise ValueError("duplicate normalized object key")
-            normalized[key] = _canonical(raw_value, definition=definition)
+            item = _canonical(raw_value, definition=definition)
+            if (
+                definition
+                and key
+                in {
+                    "multiple",
+                    "merge_multiple",
+                    "max_width_multiple",
+                    "approach_multiple",
+                    "stop_buffer_multiple",
+                    "measured_move_multiple",
+                    "r_multiple",
+                    "break_multiple",
+                    "pullback_multiple",
+                    "tolerance",
+                }
+                and _decimal(item)
+            ):
+                decimal = Decimal(cast(str, item))
+                item = format(decimal.normalize(), "f")
+                if "." in item:
+                    item = item.rstrip("0").rstrip(".")
+                if item in {"", "-0"}:
+                    item = "0"
+            normalized[key] = item
         return normalized
     if isinstance(value, (list, tuple)):
         return [_canonical(item, definition=definition) for item in value]
@@ -586,7 +610,11 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                 elif node.op == "multiply" and len(known) == 2:
                     scalars = [item for item in known if item == ("decimal", "scalar")]
                     non_scalars = [item for item in known if item != ("decimal", "scalar")]
-                    if scalars and len(non_scalars) <= 1:
+                    if (
+                        scalars
+                        and len(non_scalars) <= 1
+                        and all(item[0] != "integer" for item in known)
+                    ):
                         derived = non_scalars[0] if non_scalars else ("decimal", "scalar")
                 elif node.op == "divide" and len(known) == 2:
                     if known[0] == known[1]:
@@ -698,6 +726,27 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                         "Setup filter root is unknown.",
                     )
                 )
+        for field in (
+            "merge_multiple",
+            "max_width_multiple",
+            "approach_multiple",
+            "stop_buffer_multiple",
+            "measured_move_multiple",
+            "r_multiple",
+            "break_multiple",
+            "pullback_multiple",
+        ):
+            multiple = getattr(module, field, None)
+            if multiple is not None and (
+                not _decimal(multiple) or not (Decimal(0) < Decimal(multiple) <= Decimal(100))
+            ):
+                issues.append(
+                    _issue(
+                        f"/setup_modules/{index}/{field}",
+                        ValidationIssueCode.OUT_OF_RANGE,
+                        "Multiple must be in (0, 100].",
+                    )
+                )
     if enabled_emitting and not {"one_position_v1", "confirmed_pivot_zones_v1"} <= kinds:
         issues.append(
             _issue(
@@ -753,6 +802,16 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                 "Setup price source has no enabled emitting setup.",
             )
         )
+    for path, multiple in (
+        ("/exit_policy/stop/multiple", getattr(definition.exit_policy.stop, "multiple", None)),
+        ("/exit_policy/target/multiple", getattr(definition.exit_policy.target, "multiple", None)),
+    ):
+        if multiple is not None and (
+            not _decimal(multiple) or not (Decimal(0) < Decimal(multiple) <= Decimal(100))
+        ):
+            issues.append(
+                _issue(path, ValidationIssueCode.OUT_OF_RANGE, "Multiple must be in (0, 100].")
+            )
     return issues
 
 
