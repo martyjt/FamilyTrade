@@ -8,8 +8,10 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
 
@@ -160,6 +162,43 @@ def _bytes(value: object, *, definition: bool = False) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _raw_safety_exceeded(value: object) -> bool:
+    """Apply the bounded direct-Mapping gate before any recursive parser work.
+
+    Counting intentionally mirrors the contract: the root plus every object key,
+    object value, and array item is a JSON node.  Container depth starts at one
+    for the supplied root mapping.
+    """
+    stack: list[tuple[object, int]] = [(value, 1)]
+    nodes = 0
+    seen_containers: set[int] = set()
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > 8192 or depth > 64:
+            return True
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in seen_containers:
+                return True
+            seen_containers.add(identity)
+            for key, child in item.items():
+                # keys are nodes too, and a JSON object's values are one depth
+                # below the object that contains them.
+                stack.append((key, depth + 1))
+                stack.append((child, depth + 1))
+        elif isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in seen_containers:
+                return True
+            seen_containers.add(identity)
+            stack.extend((child, depth + 1) for child in item)
+    try:
+        return len(_bytes(value)) > 524_288
+    except TypeError, ValueError, RecursionError:
+        return False
 
 
 def canonical_operation_request_bytes(value: Mapping[str, object]) -> bytes:
@@ -557,6 +596,121 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
     return issues
 
 
+def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
+    """Check the static setup dependency and price-source contract.
+
+    The check deliberately models availability only.  It never attempts to
+    calculate a setup, select a zone, resolve a price, or create an order.
+    """
+    issues: list[ValidationIssue] = []
+    seen: set[str] = set()
+    kinds: set[str] = set()
+    enabled_emitting = False
+    for index, module in enumerate(definition.setup_modules):
+        if module.kind in seen:
+            issues.append(
+                _issue(
+                    f"/setup_modules/{index}/kind",
+                    ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                    "Setup kind is duplicated.",
+                )
+            )
+        seen.add(module.kind)
+        kinds.add(module.kind)
+        if module.kind in {"reversal_setup_v1", "breakout_retest_v1"} and module.enabled:
+            enabled_emitting = True
+    if enabled_emitting and not {"one_position_v1", "confirmed_pivot_zones_v1"} <= kinds:
+        issues.append(
+            _issue(
+                "/setup_modules",
+                ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                "Enabled setup requires zones and one-position modules.",
+            )
+        )
+    required_roots = (
+        definition.entry_rules.long_root is not None
+        or definition.entry_rules.short_root is not None
+    )
+    combination = definition.entry_combination
+    invalid_combination = (
+        (combination == "rules_only" and (not required_roots or enabled_emitting))
+        or (combination == "setups_only" and (required_roots or not enabled_emitting))
+        or (combination == "setup_and_rules" and (not required_roots or not enabled_emitting))
+        or (combination == "setup_or_rules" and not (required_roots or enabled_emitting))
+    )
+    if invalid_combination:
+        issues.append(
+            _issue(
+                "/entry_combination",
+                ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                "Entry combination does not match configured rules and setups.",
+            )
+        )
+
+    def setup_price_is_backed(source: object) -> bool:
+        return getattr(source, "kind", None) != "setup_price" or enabled_emitting
+
+    if not setup_price_is_backed(definition.order_policy.limit_price_source):
+        issues.append(
+            _issue(
+                "/order_policy/limit_price_source",
+                ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                "Setup price source has no enabled emitting setup.",
+            )
+        )
+    if not setup_price_is_backed(definition.exit_policy.stop):
+        issues.append(
+            _issue(
+                "/exit_policy/stop",
+                ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                "Setup price source has no enabled emitting setup.",
+            )
+        )
+    if not setup_price_is_backed(definition.exit_policy.target):
+        issues.append(
+            _issue(
+                "/exit_policy/target",
+                ValidationIssueCode.INVALID_MODULE_COMBINATION,
+                "Setup price source has no enabled emitting setup.",
+            )
+        )
+    return issues
+
+
+def _window_issues(
+    definition: RuleDefinition, calendar_versions: Mapping[CalendarKey, CalendarVersion]
+) -> list[ValidationIssue]:
+    """Validate local-window shape and its explicitly supplied calendar binding."""
+    issues: list[ValidationIssue] = []
+    for index, window in enumerate(definition.constraints.entry_windows):
+        path = f"/constraints/entry_windows/{index}"
+        invalid = (
+            len(window.days_of_week) not in range(1, 8)
+            or tuple(sorted(window.days_of_week)) != window.days_of_week
+            or len(set(window.days_of_week)) != len(window.days_of_week)
+            or any(day not in range(1, 8) for day in window.days_of_week)
+        )
+        try:
+            start = datetime.strptime(window.start_local, "%H:%M:%S").time()
+            end = datetime.strptime(window.end_local, "%H:%M:%S").time()
+            invalid = invalid or start >= end
+        except ValueError:
+            invalid = True
+        calendar = calendar_versions.get((window.calendar_id, window.calendar_version))
+        if calendar is None:
+            invalid = True
+        else:
+            try:
+                ZoneInfo(calendar.exchange_timezone)
+            except ZoneInfoNotFoundError:
+                invalid = True
+        if invalid:
+            issues.append(
+                _issue(path, ValidationIssueCode.INVALID_WINDOW, "Entry window is invalid.")
+            )
+    return issues
+
+
 def _warmup(definition: RuleDefinition, execution_interval_seconds: int) -> int:
     spans: dict[str, int] = {}
     for feature in definition.features:
@@ -652,6 +806,16 @@ def validate_rule_definition(
     calendar_versions: Mapping[CalendarKey, CalendarVersion],
 ) -> DefinitionValidationResult:
     """Validate configuration statically; this intentionally never evaluates it."""
+    if _raw_safety_exceeded(value):
+        return DefinitionValidationResult(
+            valid=False,
+            definition=None,
+            errors=(
+                _issue("/", ValidationIssueCode.SIZE_LIMIT, "Input exceeds the safety limit."),
+            ),
+            canonical_definition_sha256=None,
+            required_warmup_bars=None,
+        )
     issues = _pydantic_issues(value)
     issues.extend(_independent_raw_rules(value))
     try:
@@ -899,6 +1063,8 @@ def validate_rule_definition(
                         )
                     )
     issues.extend(_graph_issues(definition))
+    issues.extend(_module_issues(definition))
+    issues.extend(_window_issues(definition, calendar_versions))
     if (
         definition.order_policy.entry_type == "limit"
         and definition.order_policy.limit_price_source is None
