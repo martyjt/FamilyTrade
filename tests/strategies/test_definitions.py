@@ -195,3 +195,32 @@ def test_entry_window_requires_ordered_local_range_and_known_calendar() -> None:
     assert ("/constraints/entry_windows/0", "INVALID_WINDOW") in {
         (item.path, item.code.value) for item in result.errors
     }
+
+
+def test_closed_value_type_unit_and_constant_vocabulary_is_exhaustive() -> None:
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    nodes.extend(
+        [
+            {
+                "kind": "constant",
+                "node_id": "bad-decimal",
+                "value_type": "decimal",
+                "unit": "scalar",
+                "value": "01",
+            },
+            {
+                "kind": "constant",
+                "node_id": "bad-volume",
+                "value_type": "volume",
+                "unit": "contract_volume",
+                "value": "-1",
+            },
+        ]
+    )
+    result = _validate(value)
+    assert {
+        ("/nodes/7/value", "INVALID_DECIMAL"),
+        ("/nodes/8/value", "OUT_OF_RANGE"),
+    } <= {(item.path, item.code.value) for item in result.errors}

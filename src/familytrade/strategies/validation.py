@@ -408,6 +408,57 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
     features = {
         feature.feature_id: (feature.output_type, feature.unit) for feature in definition.features
     }
+    for node_id, node in nodes.items():
+        if node.kind != "constant":
+            continue
+        index = index_by_id[node_id]
+        path = f"/nodes/{index}/value"
+        value = node.value
+        decimal_types = {"decimal", "price", "volume", "level"}
+        if node.value_type in decimal_types:
+            if not _decimal(value):
+                issues.append(
+                    _issue(
+                        path,
+                        ValidationIssueCode.INVALID_DECIMAL,
+                        "Constant must be a canonical decimal string.",
+                    )
+                )
+            else:
+                decimal_value = Decimal(cast(str, value))
+                if node.value_type == "volume" and decimal_value < 0:
+                    issues.append(
+                        _issue(path, ValidationIssueCode.OUT_OF_RANGE, "Volume cannot be negative.")
+                    )
+                elif node.unit == "ratio_0_100" and not (0 <= decimal_value <= 100):
+                    issues.append(
+                        _issue(path, ValidationIssueCode.OUT_OF_RANGE, "Ratio is out of range.")
+                    )
+        elif (
+            node.value_type == "integer" and (not isinstance(value, int) or isinstance(value, bool))
+        ) or (node.value_type == "boolean" and not isinstance(value, bool)):
+            issues.append(
+                _issue(path, ValidationIssueCode.INVALID_TYPE, "Constant has an invalid type.")
+            )
+        elif node.value_type == "timestamp" and (
+            not isinstance(value, str) or not value.endswith("Z")
+        ):
+            issues.append(
+                _issue(path, ValidationIssueCode.INVALID_TYPE, "Timestamp must be UTC RFC3339.")
+            )
+        elif node.value_type == "side" and value not in {"long", "short"}:
+            issues.append(
+                _issue(path, ValidationIssueCode.INVALID_ENUM, "Side constant is invalid.")
+            )
+        elif node.value_type == "regime" and value not in {
+            "bullish",
+            "bearish",
+            "sideways",
+            "unknown",
+        }:
+            issues.append(
+                _issue(path, ValidationIssueCode.INVALID_ENUM, "Regime constant is invalid.")
+            )
     signatures: dict[str, tuple[str, str] | None] = {}
     resolving: set[str] = set()
 
