@@ -8,6 +8,7 @@ from uuid import UUID, uuid7
 import pytest
 from alembic import command
 from alembic.config import Config
+from pydantic import ValidationError
 from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
@@ -16,6 +17,7 @@ from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, ErrorCode
 from familytrade.access.repository import AccessRepository, users
 from familytrade.access.service import AccessService
+from familytrade.strategies.definitions import StrategyDraftValidateInput, StrategyListInput
 from familytrade.strategies.presets import get_preset
 from familytrade.strategies.repository import (
     StrategyRepository,
@@ -845,6 +847,12 @@ def test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_
 def test_complete_validation_code_path_inventory_and_issue_truncation_are_stable() -> None:
     result = _validate({})
     assert result.errors and all(issue.path.startswith("/") for issue in result.errors)
+    with pytest.raises(ValidationError):
+        StrategyDraftValidateInput.model_validate(
+            {"schema_version": "v1", "draft_id": "not-a-uuid", "expected_version": -1}
+        )
+    with pytest.raises(ValidationError):
+        StrategyListInput.model_validate({"schema_version": "v1", "limit": 0})
 
 
 def test_nfc_normalized_duplicate_object_keys_are_rejected_before_request_hash() -> None:
