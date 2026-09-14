@@ -88,8 +88,8 @@ base-10 strings. The public records are:
   `RiskPolicy`, and their tagged unions.
 - `EngineConfig`, `EmissionContext`, `CompletedBarEvent`, `DataQualityEvent`,
   `FinishRunEvent`, and `EngineInputEvent`.
-- `FeatureValue`, `FeatureRuntimeState`, `RuleResult`, `IntervalBucket`,
-  `AccumulatorPoint`, every `FeatureAccumulator`, `IntervalIndex`,
+- `SourceDatasetProvenance`, `FeatureValue`, `FeatureRuntimeState`, `RuleResult`,
+  `IntervalBucket`, `AccumulatorPoint`, every `FeatureAccumulator`, `IntervalIndex`,
   `ZoneState`, `SetupSnapshot`, `SetupState`, `OrderState`,
   `ProtectiveOrderState`, `ProtectiveBracketState`, `PositionState`, `RiskState`,
   `EngineState`, and `EngineCheckpoint`.
@@ -133,16 +133,24 @@ are routine and are not public compatibility promises.
 The reusable value/evidence records are:
 
 ~~~text
+SourceDatasetProvenance = {
+  bar_record_id:string,
+  published_base_revision_id:lowercase UUIDv7|null
+}
+
 FeatureValue = {
   feature_id, interval_seconds, evaluation_bar_end,
   value_type, unit, value:Decimal|int|bool|string|null,
   status:"KNOWN"|"UNKNOWN", reason_code:string|null,
-  source_bar_record_ids:tuple[string,...], known_at:UTC timestamp
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...],
+  known_at:UTC timestamp
 }
 
 AccumulatorPoint = {
   evaluation_bar_end:UTC timestamp, known_at:UTC timestamp, value:Decimal,
-  source_bar_record_ids:tuple[string,...]
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...]
 }
 
 FeatureAccumulator = exactly one of {
@@ -159,8 +167,11 @@ FeatureAccumulator = exactly one of {
   {kind:"relative_volume_v1",prior_volumes:tuple[AccumulatorPoint,...],
     prior_volume_sum:Decimal},
   {kind:"session_vwap_v1",trading_day:date|null,
-    typical_volume_numerator:Decimal,volume_denominator:Decimal},
+    typical_volume_numerator:Decimal,volume_denominator:Decimal,
+    source_bar_record_ids:tuple[string,...],
+    source_dataset_provenance:tuple[SourceDatasetProvenance,...]},
   {kind:"pivot_v1",candidate_bars:tuple[BarSelection,...],
+    candidate_source_dataset_provenance:tuple[SourceDatasetProvenance,...],
     confirmed_highs:tuple[AccumulatorPoint,...],
     confirmed_lows:tuple[AccumulatorPoint,...]},
   {kind:"session_level_v1",current_trading_day:date|null,
@@ -168,7 +179,9 @@ FeatureAccumulator = exactly one of {
     previous_trading_day:date|null,previous_high:Decimal|null,
     previous_low:Decimal|null,previous_complete:bool,
     current_source_bar_record_ids:tuple[string,...],
-    previous_source_bar_record_ids:tuple[string,...]},
+    current_source_dataset_provenance:tuple[SourceDatasetProvenance,...],
+    previous_source_bar_record_ids:tuple[string,...],
+    previous_source_dataset_provenance:tuple[SourceDatasetProvenance,...]},
   {kind:"dependency_v1",dependency_feature_ids:tuple[string,...],
     previous_values:tuple[FeatureValue,...]}
 }
@@ -203,7 +216,8 @@ ZoneState = {
   created_zone_index:int, last_touch_zone_index:int,
   last_filled_execution_index:int|null,
   pivot_bar_end, confirmation_bar_end, known_at,
-  source_bar_record_ids:tuple[string,...]
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...]
 }
 
 SetupSnapshot = {
@@ -212,7 +226,8 @@ SetupSnapshot = {
   source_zone_ids:tuple[lowercase UUIDv7,...], arm_execution_index:int|null,
   signal_execution_index:int|null, unit, entry, stop, target,
   target_mode, frozen_feature_values:tuple[FeatureValue,...],
-  source_bar_record_ids:tuple[string,...], known_at
+  source_bar_record_ids:tuple[string,...],
+  source_dataset_provenance:tuple[SourceDatasetProvenance,...], known_at
 }
 
 SetupState = {
@@ -382,6 +397,38 @@ them `broken_until_reseed`; a broken session VWAP or prior-session accumulator i
 `broken_until_session` until the next stored trading-day start. Checkpoint restore
 does not recompute any accumulator from unavailable earlier inputs.
 
+Every persisted FT-07 evidence record above other than the frozen `RuleResult` that
+carries `source_bar_record_ids` also carries the parallel
+`source_dataset_provenance` tuple (or the explicitly named current, previous, or
+mark variant). The two tuples have identical length and order; element
+`i` repeats source ID `i` and records the non-null published-base revision supplied
+with that selected archived bar, or null for an active/unpublished source. Source
+IDs are ordered by first causal use and are unique within a record. The same source
+ID must have the same provenance everywhere in live state. `IntervalBucket`
+similarly requires `selections` and `published_base_revision_ids` to have identical
+length/order, with each revision belonging to the selection at that index.
+`pivot_v1.candidate_source_dataset_provenance` likewise has one element per
+`candidate_bars` selection in candidate order and repeats that selection's exact
+record ID/revision pair.
+
+Provenance is retained with its owning accumulator point, feature history value,
+zone, setup snapshot, in-progress bucket, session accumulator, or last-mark
+evidence; it is never inferred from `last_published_base_revision_id` and a later
+base transition never rewrites it. There is no separate provenance archive. When
+the already-bounded owning evidence is evicted, its companion provenance is evicted
+atomically. Across all live records the number of distinct provenance elements is
+therefore at most `canonical_bar_count`, itself at most the configured
+`max_canonical_bars` and absolutely at most `2000000`; within a record it is exactly
+the number of cited source IDs. Duplicate companion entries, missing entries,
+changed mappings, or excess entries make a restored checkpoint
+`CHECKPOINT_MISMATCH` and make a newly supplied conflicting input
+`DUPLICATE_CONFLICT`, with no state change.
+
+`RuleResult` remains byte-for-byte the frozen shape and gains no provenance field.
+While a Decision is assembled, each RuleResult source ID must resolve through the
+persisted feature/setup/zone/current-bucket provenance above. The Decision stores
+the frozen RuleResult only after the complete cited-source reduction has succeeded.
+
 `fill_sequence` is null for every pending, active, expired, or cancelled regular or
 protective order. On a committed Fill, the order snapshot receives the current
 global `next_fill_sequence`, the Fill uses that same integer, and state increments
@@ -423,6 +470,7 @@ rules.
   exposure_seconds:int, last_mark:Decimal|null,
   last_mark_bar_record_id:string|null,
   last_mark_source_bar_record_ids:tuple[string,...],
+  last_mark_source_dataset_provenance:tuple[SourceDatasetProvenance,...],
   mark_status:"none"|"fresh"|"stale",
   risk:RiskState,
   next_decision_sequence:int, next_order_sequence:int,
@@ -588,10 +636,15 @@ explicit pure-call inputs. `attempt_id` and `fencing_token` are opaque output
 metadata; the pure engine does not claim, acquire, renew, validate, or persist a
 lease. `order_submitted_at` binds any order created by this input and
 `output_recorded_at` binds every resulting Fill/RunEvent record. In forward paper,
-`event.recorded_at <= order_submitted_at <= output_recorded_at`; in backtest all
-three are equal. Inputs that create no order still carry the fields for one strict
-event shape, but no order timestamp is emitted. This closes required record times
-without an implicit clock or FT-08/FT-10/FT-11 behavior.
+`event.recorded_at <= order_submitted_at <= output_recorded_at`. Backtest timing is
+modeled rather than wall-clock: a completed-bar input requires
+`recorded_at=order_submitted_at=output_recorded_at=selection.bar.end_at`; a quality
+input requires all three equal `end_at`; and a finish input requires all three equal
+`effective_at=config.end_at`. Any other backtest combination is
+`VALIDATION_ERROR` before state changes. Inputs that create no order still carry
+the fields for one strict event shape, but no order timestamp is emitted. This
+closes required record times without an implicit clock or FT-08/FT-10/FT-11
+behavior.
 
 `CompletedBarEvent` is exactly:
 
@@ -699,7 +752,8 @@ replay of the immediately preceding input returns the unchanged state,
 empty decision/intent/protective/fill/evidence/event deltas, and `replayed:true`.
 A different semantic input overlapping a consumed logical interval is
 `DUPLICATE_CONFLICT`; any older semantically nonidentical input is
-`EVENT_OUT_OF_ORDER`.
+`EVENT_OUT_OF_ORDER` while state is nonterminal. Terminal precedence is closed in
+section 8.
 `run_engine` removes its allowed adjacent semantic replay before the cumulative
 resource preflight. Incremental chunks may overlap by their last event, so batch and
 incremental results are identical across a caller-boundary duplicate. Arbitrary
@@ -758,12 +812,14 @@ evidence makes every derived Fill/mark reconstructable without schema mutation.
 A derived bar's causal availability is the maximum availability of all its source
 minutes. At execution-bar end `T`, zone bars newly complete at or before `T` are
 processed oldest first, then features and setups are evaluated once for that full
-execution bar. Backtest `effective_at=T`. Forward `effective_at` is the maximum
-causal availability of every cited source; `decided_at` is the input `recorded_at`
-and is never earlier. `Decision.created_at=decided_at`.
-`OrderIntent.submitted_at=EmissionContext.order_submitted_at`. Its `active_from` is
-the first full configured fill-bar start at or after `effective_at` in backtest and
-at or after `order_submitted_at` in forward paper. For entries, that start must be
+execution bar. Backtest `effective_at=decided_at=created_at=T`, because the
+boundary-completing backtest input is recorded at `T`. Forward `effective_at` is the
+maximum causal availability of every cited source; `decided_at` is the input
+`recorded_at` and is never earlier. `Decision.created_at=decided_at`.
+`OrderIntent.submitted_at=EmissionContext.order_submitted_at` and must be at or after
+its Decision's `decided_at`. In both modes its `active_from` is the first full
+configured fill-bar start at or after both `effective_at` and `submitted_at`. For
+entries, that start must be
 inside the effective entry window; the entry-window ordering in section 3 then
 governs a window close inside the active fill bar. `Fill.created_at` is
 `EmissionContext.output_recorded_at` on the input
@@ -773,11 +829,33 @@ uses `recorded_at=created_at=output_recorded_at`. Thus the delayed fixture binds
 Decision `10:15:02.100000Z`, close submission `10:15:02.200000Z`, activation
 `10:16:00Z`, and no fill in the already-open 10:15 bar without an implicit clock.
 A close-based signal therefore never fills in its signal bar, and delayed delivery
-never reaches back into an already-open bar.
-For forward evidence, a Decision uses null `dataset_revision_id` when any cited
-selection is active or the cited minutes do not share one non-null published base;
-otherwise it uses that shared published base. A backtest always uses its pinned
-revision. The complete ordered source bar IDs remain authoritative in both modes.
+never reaches back into an already-open bar. The same invariant applies to lifecycle
+closes: `submitted_at <= active_from <= Fill.model_time` for every Fill. Backtest
+fills and events created while processing a completed fill bar have
+`created_at=output_recorded_at` equal the canonical input end that made that fill bar
+available; their modeled opening-gap time may be earlier only when the order was
+submitted and active no later than that opening instant.
+
+Decision dataset provenance is computed from the complete ordered cited-source
+tuple, not from the current base pointer. Resolve every Decision
+`source_bar_record_id` to the matching persisted `SourceDatasetProvenance` companion
+in the current bucket, feature/accumulator/history, zone, setup, or last-mark
+evidence. Missing or inconsistent lookup is an internal invariant failure and a
+restored state containing it is `CHECKPOINT_MISMATCH`; no Decision may be emitted.
+For backtest, every resolved element must equal the pinned dataset revision and
+`Decision.dataset_revision_id` is that revision. For forward paper it is the one
+shared non-null revision only when every resolved element has that exact value; it
+is null if any element is null or if two non-null revisions differ. The empty cited
+tuple yields null in forward paper and the pinned revision in backtest. The complete
+ordered source bar IDs remain authoritative, and publishing a base never patches
+prior provenance or Decision bytes.
+
+The checkpoint/base-transition oracle is explicit. Consume source `a` under
+published base `R1`, checkpoint/restore, then consume source `b` under later base
+`R2` and source `c` as active/null. A Decision citing only `a` projects `R1`; only
+`b` projects `R2`; `a,b`, `a,c`, or `b,c` projects null. The restored provenance for
+`a` remains `R1` byte-for-byte. Tuple order is the Decision's existing ordered
+source-ID order and does not affect this equality reduction.
 
 Record IDs are deterministic lowercase UUIDv7 values without randomness. Define
 `deterministic_uuid7(domain,timestamp,fields)` as follows: canonicalize
@@ -835,10 +913,12 @@ committed domain result: it consumes no counter, recomputes/emits no record, ret
 empty deltas, and leaves the original Fill/RunEvent transport fields and all IDs
 unchanged. The replacement attempt/fence values are not copied into old outputs.
 Any difference in any retained field is not replay: the same/overlapping logical
-interval is `DUPLICATE_CONFLICT`, and an older interval is `EVENT_OUT_OF_ORDER`,
-both with byte-identical state. On a new non-replay input, the supplied attempt/fence
-remain opaque output metadata and do not enter any domain UUID tuple. This is an
-identity exclusion only, not a pure-engine lease/fence validation claim.
+interval is `DUPLICATE_CONFLICT`; while nonterminal, an older non-overlapping interval
+is `EVENT_OUT_OF_ORDER`; after terminal, section 8 instead returns `RUN_FINISHED` for
+every distinct non-overlapping input. All errors leave state byte-identical. On a new
+non-replay input, the supplied attempt/fence remain opaque output metadata and do
+not enter any domain UUID tuple. This is an identity exclusion only, not a
+pure-engine lease/fence validation claim.
 
 These canonical vectors are normative:
 
@@ -977,8 +1057,8 @@ The three close causes bind timing and expiry as follows:
 
 | Cause | Creation and activation | `expires_at` |
 | --- | --- | --- |
-| Passed supplementary exit rule | Created by its `CLOSE` Decision; `effective_at` is Decision effective time and `submitted_at` is the input's explicit order-submission time. `active_from` is the first stored-calendar open-segment-anchored fill-bar start at or after `effective_at` in backtest or `submitted_at` in forward paper. | `contract.liquidation_start_at` (exclusive). |
-| Contract liquidation | Created as the persisted `close_intent` when input chronology first reaches `contract.liquidation_start_at`, preserving the frozen create-at-liquidation rule. It has `effective_at=contract.liquidation_start_at` and `submitted_at` from that boundary-advancing input's explicit emission context. In backtest, `active_from` is the first not-yet-processed eligible fill-bar start at or after liquidation; in forward paper it is the first eligible fill-bar start at or after both liquidation and `submitted_at`. | `contract.last_trade_at` (exclusive). |
+| Passed supplementary exit rule | Created by its `CLOSE` Decision; `effective_at` is Decision effective time and `submitted_at` is the input's explicit order-submission time. In both modes, `active_from` is the first not-yet-processed stored-calendar open-segment-anchored fill-bar start at or after both values. | `contract.liquidation_start_at` (exclusive). |
+| Contract liquidation | Created as the persisted `close_intent` when accepted input chronology first reaches `contract.liquidation_start_at`, preserving the frozen create-at-liquidation rule. It has `effective_at=contract.liquidation_start_at`, `submitted_at` from that boundary-advancing input's explicit emission context, and in both modes `active_from` is the first not-yet-processed eligible fill-bar start at or after both values. | `contract.last_trade_at` (exclusive). |
 | Backtest force close | `scheduled_force_close` uses the section 8 pre-scheduling rule and moves to `close_intent` at `config.force_close_at`. | `config.end_at` (exclusive). |
 
 At most one live `close_intent` exists. Creation appends its exact `OrderIntent` to
@@ -1012,14 +1092,16 @@ An entry Fill and either protective Fill cite the originating entry Decision in
 Contract-liquidation and force-close lifecycle Fills use null because no trading
 Decision is fabricated for either policy action.
 
-For liquidation, "chronology first reaches" means boundary actions occur before
-processing a bar whose `start_at` equals the boundary and before processing a
-quality interval whose range begins there. Such a close can therefore participate
-in that bar's opening-gap precedence only when its mode-specific `active_from` is
-not later than that start. If liquidation falls strictly inside a fill bar, creation
-occurs at the exact boundary but cannot backdate a market fill to the earlier bar
-open; the close waits for the next eligible fill-bar start. A closed, missing, or
-delayed interval can create and persist the intent but cannot fill it.
+For liquidation, "chronology first reaches" means the transition is modeled at the
+liquidation boundary, but its order is submitted only at the explicit submission
+time of the accepted input that advances chronology there. It can participate in a
+bar's opening-gap precedence only if a previously accepted boundary input created
+it with `submitted_at <= active_from <= that bar.start_at`. A completed bar whose
+start itself first exposes the boundary is not such an input: it is recorded at its
+end in backtest (or no earlier than availability in forward), so the newly created
+close cannot fill at that already-past open and waits for the next eligible fill-bar
+start. The same is true when liquidation falls strictly inside a fill bar. A closed,
+missing, or delayed interval can create and persist the intent but cannot fill it.
 
 Entry TTL is an exact half-open count of execution-grid periods. Let `E` be the
 creating Decision's `execution_bar_end`, `S=OrderIntent.submitted_at`,
@@ -1034,9 +1116,9 @@ first period, followed by `N-1` whole periods. The accepted fixture has
 
 The grid continues in UTC from `E`; missing/invalid bars, maintenance, scheduled
 closure, session breaks, and delayed delivery never shift `ttl_start` or extend
-expiry. `active_from` remains the first configured fill-bar start at or after `S`
-in forward paper and at or after `E` in backtest, subject to stored-calendar/open
-and entry-window eligibility. A fill is eligible only at a modeled instant in
+expiry. In both modes, `active_from` remains the first not-yet-processed configured
+fill-bar start at or after both `E` and `S`, subject to stored-calendar/open and
+entry-window eligibility. A fill is eligible only at a modeled instant in
 `[active_from,expires_at)`. If expiry lies strictly inside an active fill bar, an
 opening-gap fill before expiry remains valid, then the order expires at the exact
 boundary before any unknowable intrabar touch. Expiry at bar start precedes its
@@ -1285,9 +1367,17 @@ bar was missing/invalid or the position/close remains unresolved, that finish
 atomically sets `force_close_state:"blocked"` and `BLOCKED_UNCLOSED`; it never
 backdates a fill. Replaying a semantically identical FinishRunEvent, including one
 differing only in excluded attempt/fence metadata, returns unchanged
-terminal state with `replayed:true` and emits no second terminal event. Every
-semantically nonidentical post-terminal input is `RUN_FINISHED`. Forward paper cannot
-force-close. Actual-contract liquidation remains the separate `STOPPED`/
+terminal state with `replayed:true` and emits no second terminal event. Post-terminal
+classification then follows one exact order for every input kind: first, an
+immediately preceding semantic replay after excluding only attempt/fence returns
+the replay result; second, a semantically changed retained payload with the same
+logical identity or any overlap with the consumed terminal cursor returns
+`DUPLICATE_CONFLICT`; third, every other semantically distinct input returns
+`RUN_FINISHED`. Thus a new/disjoint later input and a non-overlapping older input are
+both `RUN_FINISHED`, never `EVENT_OUT_OF_ORDER`, after terminal status. All three
+outcomes leave terminal state and counters byte-identical; only the first has
+`replayed:true`. Forward paper cannot force-close. Actual-contract liquidation
+remains the separate `STOPPED`/
 `BLOCKED_EXPIRY_UNRESOLVED` path above and does not wait for a run finish event.
 
 FT-07 returns the state needed by later analysis but does not implement FT-12
@@ -1303,11 +1393,12 @@ Decision records the contemporaneous feature/rule/setup inputs, all lexical leaf
 results, stable reason code, source bar IDs, availability/known-at times, pre/post
 state hashes, causation event ID, modeled effective time, and recorded time.
 
-Backtest decisions always name the pinned dataset revision. Forward decisions name
-the event's published base revision when it covers all cited archived bars, else
-null; exact source bar IDs remain authoritative. A later publication or correction
-never patches prior bytes. A bar at or before the committed cursor with a different
-record ID is rejected and cannot recompute cash, decisions, fills, or indicators.
+Backtest decisions always name the validated pinned dataset revision. Forward
+decisions use the per-cited-source provenance reduction in section 4: one shared
+published base or null for mixed/active evidence. Exact source bar IDs remain
+authoritative. A later publication or correction never patches prior bytes. A bar
+at or before the committed cursor with a different record ID is rejected and cannot
+recompute cash, decisions, fills, or indicators.
 
 The closed Decision emission contract is:
 
@@ -1509,8 +1600,9 @@ then other `POSITION_FLAT` cancellations in ascending order sequence.
 `EngineState` contains only deterministic engine state:
 
 - Config fingerprint, status, last consumed logical interval/record/payload/input
-  hash, exact source IDs needed by open aggregates/evidence, and next deterministic
-  decision/order/fill/event/zone/setup/correlation sequences.
+  hash, exact source IDs and their parallel immutable dataset provenance needed by
+  open aggregates/evidence, and next deterministic decision/order/fill/event/zone/
+  setup/correlation sequences.
 - In-progress interval buckets; quantized feature recurrence/history sufficient for
   the validated maximum lookback; confirmed pivots/zones; setup state and frozen
   candidate snapshots.
@@ -1556,9 +1648,9 @@ The code, sole public message, and condition are:
 | UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. |
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
 | CHECKPOINT_MISMATCH | Engine checkpoint is invalid. | Format/engine version, state hash, or typed checkpoint invariant fails. |
-| EVENT_OUT_OF_ORDER | Engine event is out of order. | A non-replay event is at or before the consumed cursor or recorded time regresses. |
-| DUPLICATE_CONFLICT | Logical bar has conflicting content. | The consumed logical identity reappears with different retained semantic input bytes. |
-| RUN_FINISHED | Engine run is already terminal. | A semantically nonidentical input is supplied after a finished/stopped/blocked terminal state. |
+| EVENT_OUT_OF_ORDER | Engine event is out of order. | While nonterminal, a distinct non-overlapping input is older than the consumed cursor or recorded time regresses. |
+| DUPLICATE_CONFLICT | Logical bar has conflicting content. | After the immediate replay check, a consumed logical identity reappears with different retained semantic input bytes or a changed input overlaps the consumed interval; this specific conflict also precedes the terminal guard. |
+| RUN_FINISHED | Engine run is already terminal. | After replay and duplicate/overlap checks, any other semantically distinct input is supplied to a finished/stopped/blocked terminal state. |
 
 `EngineError` is `{code,message,details}`. Messages are fixed by code and never
 include owner-private values or exception text. Details contain only JSON Pointer
@@ -1681,6 +1773,11 @@ The named boundary and replay tests are:
 - `test_exposure_seconds_gap_intrabar_quality_checkpoint_and_replay_matrix`
 - `test_run_event_aggregate_identity_payload_hash_and_fill_evidence_mode_bytes`
 - `test_attempt_fence_only_semantic_replay_and_retained_field_conflicts`
+- `test_backtest_record_decide_submit_output_and_created_times_equal_modeled_boundaries`
+- `test_entry_exit_liquidation_and_force_close_opening_gaps_never_precede_submission`
+- `test_decision_dataset_revision_is_shared_base_or_null_from_all_cited_sources`
+- `test_checkpoint_preserves_bounded_source_provenance_across_base_transition`
+- `test_post_terminal_replay_duplicate_conflict_and_run_finished_precedence`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
