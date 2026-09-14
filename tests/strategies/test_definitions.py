@@ -122,3 +122,16 @@ def test_type_unit_operator_matrix_rejects_declared_wrong_arithmetic_result() ->
     assert ("/nodes/7/result_type", "TYPE_MISMATCH") in {
         (item.path, item.code.value) for item in result.errors
     }
+
+
+def test_feature_parameters_are_closed_typed_and_bounded() -> None:
+    value = _fixture()
+    features = value["features"]
+    assert isinstance(features, list)
+    features[0]["parameters"] = {"n": True, "input": "not-a-price", "extra": 1}
+    result = _validate(value)
+    assert {
+        ("/features/0/parameters/n", "INVALID_TYPE"),
+        ("/features/0/parameters/input", "INVALID_ENUM"),
+        ("/features/0/parameters/extra", "UNSUPPORTED_PARAMETER"),
+    } <= {(item.path, item.code.value) for item in result.errors}

@@ -9,6 +9,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
+from typing import cast
 
 from pydantic import ValidationError
 
@@ -43,6 +44,36 @@ _FEATURES: dict[str, tuple[str, str, set[str]]] = {
     "rolling_low_v1": ("level", "contract_price", {"n"}),
     "level_touch_v1": ("boolean", "boolean", {"level_feature_id", "tolerance_ticks"}),
     "level_cross": ("boolean", "boolean", {"level_feature_id", "direction"}),
+}
+
+_FEATURE_PARAMETER_RULES: dict[str, dict[str, tuple[str, object]]] = {
+    "sma_v1": {
+        "n": ("integer", (2, 500)),
+        "input": ("enum", {"open", "high", "low", "close", "hl2", "typical", "volume"}),
+    },
+    "ema_v1": {
+        "n": ("integer", (2, 500)),
+        "input": ("enum", {"open", "high", "low", "close", "hl2", "typical", "volume"}),
+    },
+    "rsi_wilder_v1": {"n": ("integer", (2, 500)), "input": ("literal", "close")},
+    "atr_wilder_v1": {"n": ("integer", (2, 500))},
+    "relative_volume_v1": {"n": ("integer", (2, 500))},
+    "confirmed_pivot_v1": {
+        "pivot_kind": ("enum", {"high", "low"}),
+        "left": ("integer", (1, 50)),
+        "right": ("integer", (1, 50)),
+    },
+    "swing_regime_v1": {"left": ("integer", (1, 50)), "right": ("integer", (1, 50))},
+    "rolling_high_v1": {"n": ("integer", (2, 500))},
+    "rolling_low_v1": {"n": ("integer", (2, 500))},
+    "level_touch_v1": {
+        "level_feature_id": ("reference", None),
+        "tolerance_ticks": ("integer", (0, 100)),
+    },
+    "level_cross": {
+        "level_feature_id": ("reference", None),
+        "direction": ("enum", {"above", "below"}),
+    },
 }
 
 
@@ -723,7 +754,62 @@ def validate_rule_definition(
                     "Feature interval is invalid.",
                 )
             )
-        elif execution_interval_seconds % item.interval_seconds:
+        parameter_rules = _FEATURE_PARAMETER_RULES.get(item.name, {})
+        for parameter, (rule, bound) in parameter_rules.items():
+            parameter_path = f"{path}/parameters/{parameter}"
+            if parameter not in item.parameters:
+                issues.append(
+                    _issue(
+                        parameter_path,
+                        ValidationIssueCode.REQUIRED,
+                        "Feature parameter is required.",
+                    )
+                )
+                continue
+            parameter_value = item.parameters[parameter]
+            if rule == "integer":
+                lower, upper = cast(tuple[int, int], bound)
+                if not isinstance(parameter_value, int) or isinstance(parameter_value, bool):
+                    issues.append(
+                        _issue(
+                            parameter_path,
+                            ValidationIssueCode.INVALID_TYPE,
+                            "Feature parameter has an invalid type.",
+                        )
+                    )
+                elif not (lower <= parameter_value <= upper):
+                    issues.append(
+                        _issue(
+                            parameter_path,
+                            ValidationIssueCode.OUT_OF_RANGE,
+                            "Feature parameter is out of range.",
+                        )
+                    )
+            elif (rule == "enum" and parameter_value not in cast(set[str], bound)) or (
+                rule == "literal" and parameter_value != bound
+            ):
+                issues.append(
+                    _issue(
+                        parameter_path,
+                        ValidationIssueCode.INVALID_ENUM,
+                        "Feature parameter enum is invalid.",
+                    )
+                )
+            elif rule == "reference" and (
+                not isinstance(parameter_value, str) or parameter_value not in features
+            ):
+                issues.append(
+                    _issue(
+                        parameter_path,
+                        ValidationIssueCode.UNKNOWN_REFERENCE,
+                        "Feature reference is unknown.",
+                    )
+                )
+        if (
+            item.interval_seconds in {60, 300, 900, 1800, 3600}
+            and item.interval_seconds <= execution_interval_seconds
+            and execution_interval_seconds % item.interval_seconds
+        ):
             issues.append(
                 _issue(
                     path + "/interval_seconds",
