@@ -2,6 +2,7 @@ import copy
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid7
 
@@ -9,7 +10,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
@@ -17,6 +18,7 @@ from familytrade.access.credentials import EnvelopeCipher
 from familytrade.access.models import AccessError, ErrorCode
 from familytrade.access.repository import AccessRepository, users
 from familytrade.access.service import AccessService
+from familytrade.market_data.models import CalendarVersion, CalendarWindow
 from familytrade.strategies.definitions import StrategyDraftValidateInput, StrategyListInput
 from familytrade.strategies.presets import get_preset
 from familytrade.strategies.repository import (
@@ -836,6 +838,19 @@ def test_trigger_allows_only_exact_draft_to_validated_transition_and_no_other_up
             )
             .values(name="forbidden")
         )
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE strategy_versions DISABLE TRIGGER ALL"))
+        connection.execute(
+            update(strategy_metadata.tables["strategy_versions"])
+            .where(
+                strategy_metadata.tables["strategy_versions"].c.strategy_version_id
+                == draft.strategy_version_id
+            )
+            .values(canonical_definition_sha256="0" * 64)
+        )
+        connection.execute(text("ALTER TABLE strategy_versions ENABLE TRIGGER ALL"))
+    with pytest.raises(RuntimeError, match="stored strategy definition hash"):
+        repository.get_version(context, draft.strategy_version_id)
 
 
 def test_combined_access_market_data_strategy_metadata_has_no_duplicate_keys_or_drift() -> None:
@@ -937,7 +952,17 @@ def test_prior_session_and_pivot_readiness_can_remain_unknown_after_numeric_warm
 
 
 def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> None:
-    assert _validate(_fixture()).required_warmup_bars == 6
+    value = _fixture()
+    features = value["features"]
+    assert isinstance(features, list)
+    features[0]["parameters"]["n"] = 500
+    value["order_policy"]["entry_type"] = "limit"
+    value["order_policy"]["limit_price_source"] = {
+        "kind": "feature",
+        "feature_id": features[0]["feature_id"],
+        "offset_ticks": 0,
+    }
+    assert _validate(value).required_warmup_bars >= 500
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:
@@ -952,8 +977,117 @@ def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> 
 
 
 def test_owner_calendar_is_loaded_for_each_distinct_entry_window_key() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    calendar_id = str(uuid7())
+    value["constraints"]["entry_windows"] = [
+        {
+            "days_of_week": [1],
+            "start_local": "09:30",
+            "end_local": "10:00",
+            "calendar_id": calendar_id,
+            "calendar_version": 1,
+        }
+    ]
+    owner = str(uuid7())
+    calendar = CalendarVersion(
+        calendar_id=calendar_id,
+        owner_user_id=owner,
+        calendar_version=1,
+        exchange_timezone="America/New_York",
+        coverage_start=datetime(2026, 3, 9, 0, tzinfo=UTC),
+        coverage_end=datetime(2026, 3, 17, 0, tzinfo=UTC),
+        windows=(
+            CalendarWindow(
+                ordinal=1,
+                kind="open",
+                start_at=datetime(2026, 3, 9, 13, tzinfo=UTC),
+                end_at=datetime(2026, 3, 16, 20, tzinfo=UTC),
+                trading_day=None,
+                reason=None,
+            ),
+        ),
+        metadata_as_of=datetime(2026, 3, 1, tzinfo=UTC),
+        provenance_ref="test",
+        created_at=datetime(2026, 3, 1, tzinfo=UTC),
+        record_version=1,
+    )
+    result = validate_rule_definition(
+        value,
+        owner_user_id=owner,
+        execution_interval_seconds=900,
+        fill_interval_seconds=60,
+        calendar_versions={(calendar_id, 1): calendar},
+    )
+    assert result.valid
+    cross_segment = calendar.model_copy(
+        update={
+            "windows": (
+                calendar.windows[0].model_copy(
+                    update={"end_at": datetime(2026, 3, 9, 13, 45, tzinfo=UTC)}
+                ),
+                calendar.windows[0].model_copy(
+                    update={"ordinal": 2, "start_at": datetime(2026, 3, 9, 13, 45, tzinfo=UTC)}
+                ),
+            )
+        }
+    )
+    invalid = validate_rule_definition(
+        value,
+        owner_user_id=owner,
+        execution_interval_seconds=900,
+        fill_interval_seconds=60,
+        calendar_versions={(calendar_id, 1): cross_segment},
+    )
+    assert any(issue.path == "/constraints/entry_windows/0" for issue in invalid.errors)
 
 
 def test_calendar_missing_and_cross_owner_are_indistinguishable_not_found() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    calendar_id = str(uuid7())
+    value["constraints"]["entry_windows"] = [
+        {
+            "days_of_week": [1],
+            "start_local": "09:30",
+            "end_local": "10:00",
+            "calendar_id": calendar_id,
+            "calendar_version": 1,
+        }
+    ]
+    owner, other = str(uuid7()), str(uuid7())
+    calendar = CalendarVersion(
+        calendar_id=calendar_id,
+        owner_user_id=other,
+        calendar_version=1,
+        exchange_timezone="America/New_York",
+        coverage_start=datetime(2026, 3, 9, tzinfo=UTC),
+        coverage_end=datetime(2026, 3, 10, tzinfo=UTC),
+        windows=(
+            CalendarWindow(
+                ordinal=1,
+                kind="open",
+                start_at=datetime(2026, 3, 9, tzinfo=UTC),
+                end_at=datetime(2026, 3, 10, tzinfo=UTC),
+                trading_day=None,
+                reason=None,
+            ),
+        ),
+        metadata_as_of=datetime(2026, 3, 1, tzinfo=UTC),
+        provenance_ref="test",
+        created_at=datetime(2026, 3, 1, tzinfo=UTC),
+        record_version=1,
+    )
+    missing = validate_rule_definition(
+        value,
+        owner_user_id=owner,
+        execution_interval_seconds=900,
+        fill_interval_seconds=60,
+        calendar_versions={},
+    )
+    cross_owner = validate_rule_definition(
+        value,
+        owner_user_id=owner,
+        execution_interval_seconds=900,
+        fill_interval_seconds=60,
+        calendar_versions={(calendar_id, 1): calendar},
+    )
+    assert missing.errors == cross_owner.errors

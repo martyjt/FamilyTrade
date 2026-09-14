@@ -338,7 +338,9 @@ class StrategyRepository:
             )
         if row["result"] is not None:
             if "validation_result" in row["result"]:
-                return StrategyValidationResult.model_validate(row["result"]["validation_result"])
+                return StrategyValidationResult.model_validate_json(
+                    json.dumps(row["result"]["validation_result"])
+                )
             return StrategyVersion.model_validate_json(json.dumps(row["result"]))
         return self._error_from_record(cast(dict[str, object], row["error"]))
 
@@ -473,11 +475,7 @@ class StrategyRepository:
                 raise AccessError(
                     ErrorCode.CONFLICT, "Source strategy version must be validated.", 409
                 )
-            stored = StrategyVersion.model_validate(
-                _as_model_input(
-                    {key: item for key, item in dict(source).items() if key != "updated_at"}
-                )
-            )
+            stored = self._stored_version(cast(Mapping[str, object], source))
             parsed = StrategyDraftFromDefinitionInput.model_validate(
                 _as_model_input(
                     {
@@ -653,9 +651,7 @@ class StrategyRepository:
             raise stale_version(parsed.expected_version, cast(int, row["record_version"]))
         if row["status"] != "draft":
             raise AccessError(ErrorCode.CONFLICT, "Draft is already validated.", 409)
-        stored = StrategyVersion.model_validate(
-            _as_model_input({key: item for key, item in dict(row).items() if key != "updated_at"})
-        )
+        stored = self._stored_version(cast(Mapping[str, object], row))
         try:
             checked = self._check(
                 connection,
@@ -710,11 +706,7 @@ class StrategyRepository:
         )
         return StrategyValidationResult(
             valid=True,
-            strategy_version=StrategyVersion.model_validate(
-                _as_model_input(
-                    {key: item for key, item in dict(updated).items() if key != "updated_at"}
-                )
-            ),
+            strategy_version=self._stored_version(cast(Mapping[str, object], updated)),
             errors=(),
         )
 

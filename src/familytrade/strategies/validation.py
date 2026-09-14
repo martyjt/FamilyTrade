@@ -757,7 +757,9 @@ def _module_issues(definition: RuleDefinition) -> list[ValidationIssue]:
 
 
 def _window_issues(
-    definition: RuleDefinition, calendar_versions: Mapping[CalendarKey, CalendarVersion]
+    definition: RuleDefinition,
+    owner_user_id: str,
+    calendar_versions: Mapping[CalendarKey, CalendarVersion],
 ) -> list[ValidationIssue]:
     """Validate local-window shape and its explicitly supplied calendar binding."""
     issues: list[ValidationIssue] = []
@@ -769,12 +771,14 @@ def _window_issues(
             or len(set(window.days_of_week)) != len(window.days_of_week)
             or any(day not in range(1, 8) for day in window.days_of_week)
         )
+        times_valid = True
         try:
             start = time.fromisoformat(window.start_local)
             end = time.fromisoformat(window.end_local)
             invalid = invalid or start >= end
         except ValueError:
             invalid = True
+            times_valid = False
         calendar = calendar_versions.get((window.calendar_id, window.calendar_version))
         if calendar is None:
             invalid = True
@@ -784,9 +788,10 @@ def _window_issues(
                 if (
                     calendar.calendar_id != window.calendar_id
                     or calendar.calendar_version != window.calendar_version
+                    or calendar.owner_user_id != owner_user_id
                 ):
                     invalid = True
-                else:
+                elif times_valid:
                     first = calendar.coverage_start.astimezone(zone).date()
                     last = calendar.coverage_end.astimezone(zone).date()
                     day = first
@@ -1212,7 +1217,7 @@ def validate_rule_definition(
                     )
     issues.extend(_graph_issues(definition))
     issues.extend(_module_issues(definition))
-    issues.extend(_window_issues(definition, calendar_versions))
+    issues.extend(_window_issues(definition, owner_user_id, calendar_versions))
     if (
         definition.order_policy.entry_type == "limit"
         and definition.order_policy.limit_price_source is None
