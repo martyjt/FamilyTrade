@@ -454,13 +454,18 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
         index = index_by_id[node_id]
         path = f"/nodes/{index}/value"
         value = node.value
-        expected_unit = {
-            "price": "contract_price",
-            "volume": "contract_volume",
-            "integer": "count",
-            "boolean": "boolean",
-        }.get(node.value_type)
-        if expected_unit is not None and node.unit != expected_unit:
+        allowed_units = {
+            "decimal": {"scalar", "ratio", "ratio_0_100"},
+            "price": {"contract_price"},
+            "volume": {"contract_volume"},
+            "level": {"contract_price"},
+            "integer": {"count"},
+            "boolean": {"boolean"},
+            "timestamp": {"utc_timestamp"},
+            "side": {"side"},
+            "regime": {"regime"},
+        }[node.value_type]
+        if node.unit not in allowed_units:
             issues.append(
                 _issue(path, ValidationIssueCode.UNIT_MISMATCH, "Constant type and unit disagree.")
             )
