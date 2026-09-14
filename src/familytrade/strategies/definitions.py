@@ -221,7 +221,7 @@ class OnePositionSetup(FrozenModel):
 
 class ConfirmedPivotZonesSetup(FrozenModel):
     kind: Literal["confirmed_pivot_zones_v1"]
-    zone_interval_seconds: int
+    zone_interval_seconds: Literal[60, 300, 900]
     use_atr: bool
     atr_length: int = Field(ge=2, le=500)
     pivot_left: int = Field(ge=1, le=50)
@@ -229,7 +229,7 @@ class ConfirmedPivotZonesSetup(FrozenModel):
     merge_multiple: str
     max_width_multiple: str
     minimum_touches: int = Field(ge=1, le=100_000)
-    max_zones: int = Field(ge=1, le=50)
+    max_zones: int = Field(ge=2, le=200)
     zone_max_age_bars: int = Field(ge=1, le=100_000)
     cooldown_execution_bars: int = Field(ge=0, le=1000)
 

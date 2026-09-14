@@ -549,7 +549,7 @@ def test_confirmed_pivot_zones_warmup_includes_minimum_touch_spacing_boundaries(
             "merge_multiple": "1",
             "max_width_multiple": "1",
             "minimum_touches": 10,
-            "max_zones": 1,
+                "max_zones": 2,
             "zone_max_age_bars": 1,
             "cooldown_execution_bars": 0,
         }
