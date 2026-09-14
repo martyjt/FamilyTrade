@@ -95,7 +95,8 @@ base-10 strings. The public records are:
   `EngineState`, and `EngineCheckpoint`.
 - `OrderIntent`, `Decision`, `Fill`, `RunEvent`, `EngineStepResult`, and
   `EngineRunResult`, plus `FillEvidence` and `MarkEvidence` companions.
-- `EngineErrorCode` and `EngineError`.
+- `EngineErrorCode` and `EngineError`. `EngineFailure` is the sole public exception
+  wrapper and is not a serialized Pydantic record.
 
 `src/familytrade/simulation/engine.py` exports exactly:
 
@@ -122,6 +123,35 @@ def restore_engine(
     checkpoint: EngineCheckpoint,
 ) -> EngineState
 ~~~
+
+Each signature is success-only and every one of the five callables raises
+`EngineFailure` for a closed `EngineError`; none returns an error union, null, or
+partially successful result. The wrapper is exactly:
+
+~~~text
+class EngineFailure(Exception):
+    error: EngineError
+
+    def __init__(self, error: EngineError) -> None:
+        super().__init__(error.message)
+        self.error = error
+~~~
+
+Its only public attribute beyond normal `Exception.args` is `error`, and
+`args == (error.message,)`. Callers inspect `failure.error.code`, `.message`, and
+`.details`; no HTTP status, request envelope, retry flag, traceback text, or owner
+data is added. This matches the repository's typed-operation-exception pattern while
+keeping the frozen `EngineError` payload unchanged.
+
+Strict Pydantic construction is a separate ingress layer. Constructing any public
+model from a malformed mapping raises raw `pydantic.ValidationError` before an
+engine callable is invoked; the engine never catches or translates that error.
+The callables accept model instances only. Every domain, cross-record, fingerprint,
+cursor, replay-conflict, terminal, checkpoint, and resource/preflight failure found
+after typed ingress raises `EngineFailure(EngineError(...))`. `run_engine` raises on
+the first failing item and returns no prior deltas/checkpoint; immutable caller input
+and `initial_state` remain byte-identical. Unexpected programming defects are not
+misreported as an `EngineError` and propagate as their original exception.
 
 These callables perform no I/O, database access, filesystem access, network call,
 environment read, logging, random generation, or implicit clock read. All output is
@@ -262,7 +292,8 @@ OrderState = {
   status:"PENDING"|"ACTIVE"|"FILLED"|"EXPIRED"|"CANCELLED",
   status_reason:string, activated_at:UTC timestamp|null,
   fill_sequence:int|null, source_setup_id:string|null,
-  originating_decision_id:lowercase UUIDv7|null
+  originating_decision_id:lowercase UUIDv7|null,
+  creation_cause:"ENTRY"|"EXIT_RULE"|"CONTRACT_LIQUIDATION"|"FORCE_CLOSE"
 }
 
 PositionState = {
@@ -475,6 +506,15 @@ latest-transition field merely because it caused creation. Activation overwrites
 `ORDER_SUBMITTED`; Fill, expiry, and cancellation overwrite `ORDER_ACTIVATED`.
 Restore requires the exact reason allowed for the stored status and order role;
 null, an unknown string, or a mismatched status/reason is `CHECKPOINT_MISMATCH`.
+
+`creation_cause` is the separate immutable discriminator. Every entry order uses
+`ENTRY`; a supplementary-rule close uses `EXIT_RULE`; actual-contract liquidation/
+expiry uses `CONTRACT_LIQUIDATION`; and the pre-scheduled backtest close uses
+`FORCE_CLOSE`. Activation, Fill, expiry, cancellation, and movement from
+`scheduled_force_close` to `close_intent` never change it. Thus the scheduled force
+close is checkpointed as `status:"PENDING",status_reason:"ORDER_SUBMITTED",
+creation_cause:"FORCE_CLOSE"`: the transition reason and immutable cause are not
+conflated.
 `activated_at`, `filled_at`, and `cancelled_at` are modeled transition times derived
 from the eligible bar/boundary, never persistence times. Durable record timing is
 carried only by Decision/OrderIntent/Fill/RunEvent under the explicit section 4
@@ -546,7 +586,8 @@ advance.
   next_zone_sequence:int, next_setup_sequence:int,
   next_correlation_sequence:int,
   force_close_state:"not_applicable"|"waiting"|"pending"|"completed"|"blocked",
-  finished_reason:string|null
+  finished_reason:null|"MARK_OPEN"|"FORCE_CLOSED"|"CONTRACT_CLOSED"|
+    "BLOCKED_UNCLOSED"|"BLOCKED_EXPIRY_UNRESOLVED"
 }
 ~~~
 
@@ -748,8 +789,8 @@ bar counts one; each missing/invalid quality interval counts its expected open
 canonical 60-second slots; closed quality and finish count zero. Semantic replay counts
 zero. Before a step, or before any batch item is applied, the engine checks current
 state count plus the accepted non-replay delta. Exceeding the configured cap raises
-`BATCH_LIMIT_EXCEEDED` before that input/batch creates state, decision, fill, event,
-or checkpoint; supplied state remains byte-identical. After the strict ingress
+`EngineFailure` carrying `BATCH_LIMIT_EXCEEDED` before that input/batch creates
+state, decision, fill, event, or checkpoint; supplied state remains byte-identical. After the strict ingress
 guard, `run_engine` deduplicates only its allowed adjacent semantic replay before
 this cumulative preflight, so splitting
 the same run into chunks cannot bypass either limit. A configured cap above the
@@ -759,10 +800,12 @@ Pre-start warm-up bars count identically; warm-up is not a cap bypass.
 `EmissionContext` is
 `{attempt_id:lowercase UUIDv7|null,fencing_token:positive int,
 order_submitted_at:UTC timestamp,output_recorded_at:UTC timestamp}`. All values are
-explicit pure-call inputs. `attempt_id` and `fencing_token` are opaque output
-metadata; the pure engine does not claim, acquire, renew, validate, or persist a
-lease. `order_submitted_at` binds any order created by this input and
-`output_recorded_at` binds every resulting Fill/RunEvent record. In forward paper,
+explicit pure-call inputs. Transport projection is asymmetric by the frozen shapes:
+`Fill` copies only `fencing_token`, while `RunEvent` copies both `attempt_id` and
+`fencing_token`; a Fill has no `attempt_id` field. The pure engine does not claim,
+acquire, renew, validate, or persist a lease. `order_submitted_at` binds any order
+created by this input and `output_recorded_at` binds every resulting Fill/RunEvent
+record. In forward paper,
 `event.recorded_at <= order_submitted_at <= output_recorded_at`. Backtest timing is
 modeled rather than wall-clock: a completed-bar input requires
 `recorded_at=order_submitted_at=output_recorded_at=selection.bar.end_at`; a quality
@@ -818,7 +861,7 @@ no engine-event discriminator and direct submission fails the strict union as
 input hashing, cursor/correlation advancement, or any state/output. The same ingress
 guard requires every `CompletedBarEvent.selection.correction_observations == ()`
 exactly. Any non-empty nested tuple, regardless of its `applied` or `reason` values,
-returns the same error at the same pre-hash boundary. FT-09 owns correction
+raises the same `EngineFailure` at the same pre-hash boundary. FT-09 owns correction
 observation and its frozen `CORRECTION_OBSERVED` event. Before an interval is
 processed, the caller routes every observation to FT-09, then constructs the one
 integrated `BarSelection` whose `bar`, `origin`, and `availability_at` name the
@@ -826,8 +869,9 @@ causal corrected choice and whose `correction_observations` is empty; FT-07 cons
 only that immutable selection.
 After the interval is committed, FT-09 records the late observation and does not
 call FT-07. If a caller instead submits a replacement `CompletedBarEvent` for the
-already consumed interval, the normal retained-byte/overlap rule returns
-`DUPLICATE_CONFLICT`, with no state change or `CORRECTION_OBSERVED` output. For an
+already consumed interval, the normal retained-byte/overlap rule raises
+`EngineFailure` carrying `DUPLICATE_CONFLICT`, with no state change or
+`CORRECTION_OBSERVED` output. For an
 accepted CompletedBarEvent, the semantic projection includes the complete integrated
 selection—`bar`, `origin`, `availability_at`, and the explicit empty
 `correction_observations` array—plus the outer revision and timing fields. The
@@ -884,7 +928,8 @@ FT-07 input.
 trading-day baseline to starting cash; zeros fees, P&L, exposure, drawdown,
 cumulative canonical-bar counter, and sequences; sets all last-slot indexes null;
 sets `force_close_state` to `waiting` only for force-close and `not_applicable`
-otherwise; and creates no position, order, setup, or feature value.
+otherwise; sets `status:"ACTIVE",finished_reason:null`; and creates no position,
+order, setup, or feature value.
 Canonical events whose bar end is at or before `config.start_at` are warm-up only:
 they update buckets, indicators, pivots, zones, and session state but emit no entry,
 exit, order, Fill, cash change, exposure, or trading decision. The first entry
@@ -897,15 +942,15 @@ creating stale orders.
 Every `step_engine`/batch item uses this exact preflight order:
 
 1. Validate the config/state fingerprint and strict outer input shape, including the
-   pre-hash empty-correction guard in section 3. Failure returns its typed error with
-   no semantic hash or state/output.
+   pre-hash empty-correction guard in section 3. Failure raises `EngineFailure`
+   carrying its typed `EngineError`, with no semantic hash or state/output.
 2. Derive logical identity and `semantic_input_bytes`. If it is the immediately
    preceding semantic replay, return unchanged state and empty deltas first.
 3. If the retained semantic bytes changed for the same identity or overlap the
-   consumed cursor, return `DUPLICATE_CONFLICT` second.
+   consumed cursor, raise `EngineFailure` carrying `DUPLICATE_CONFLICT` second.
 4. If state is `FINISHED`, `STOPPED`, `BLOCKED_UNCLOSED`, or
-   `BLOCKED_EXPIRY_UNRESOLVED`, return `RUN_FINISHED` third for every remaining
-   distinct input.
+   `BLOCKED_EXPIRY_UNRESOLVED`, raise `EngineFailure` carrying `RUN_FINISHED` third
+   for every remaining distinct input.
 5. Only for nonterminal state apply recorded-time/cursor/resource checks and the
    event-kind-specific validation below, including Finish mode, exact-once,
    `effective_at`, coverage, and unaccounted-open-interval checks.
@@ -913,7 +958,8 @@ Every `step_engine`/batch item uses this exact preflight order:
 Steps 2-4 therefore precede all normal `FinishRunEvent` validation. An exact retry
 of the Finish that created `FINISHED` replays; a changed same-identity Finish is a
 duplicate conflict; every remaining distinct Finish after `FINISHED` or after an
-actual-contract `STOPPED`/blocked terminal returns `RUN_FINISHED`, even if its mode,
+actual-contract `STOPPED`/blocked terminal raises `EngineFailure` carrying
+`RUN_FINISHED`, even if its mode,
 effective time, recorded time, or coverage would have failed normal Finish
 validation. None of these classifications advances a counter or emits another
 event. Structurally malformed input and forbidden nested corrections remain step-1
@@ -1074,7 +1120,7 @@ The domain, UUID timestamp, and ordered `fields` tuple are closed:
 | Entry order | `entry-order` | `OrderIntent.effective_at` | `run_id,lane_id,order_sequence,decision_id,setup_id,side,order_type,quantity` |
 | Protective stop | `protective-stop-order` | entry `Fill.model_time` | `run_id,lane_id,order_sequence,entry_order_id,entry_fill_id,side,quantity,trigger_price` |
 | Protective target | `protective-target-order` | entry `Fill.model_time` | `run_id,lane_id,order_sequence,entry_order_id,entry_fill_id,side,quantity,trigger_price` |
-| Market close order | `close-order` | `OrderIntent.effective_at` | `run_id,lane_id,order_sequence,decision_id|null,entry_fill_id,side,quantity,reason` |
+| Market close order | `close-order` | `OrderIntent.effective_at` | `run_id,lane_id,order_sequence,decision_id|null,entry_fill_id,side,quantity,creation_cause` |
 | Fill | `fill` | `model_time` | `run_id,lane_id,fill_sequence,order_id,bar_record_id,effect,reason,pre_state_sha256` |
 | Zone | `zone` | `known_at` | `run_id,lane_id,creation_sequence,contract_id,zone_interval_seconds,kind,pivot_bar_end,confirmation_bar_end` |
 | Setup | `setup` | `known_at` | `run_id,lane_id,setup_sequence,family,side,source_zone_ids,arm_execution_index,signal_execution_index` |
@@ -1112,10 +1158,13 @@ Two inputs are byte-identical for replay exactly when their
 a retry differing only in attempt ID and/or fencing token replays the already
 committed domain result: it consumes no counter, recomputes/emits no record, returns
 empty deltas, and leaves the original Fill/RunEvent transport fields and all IDs
-unchanged. The replacement attempt/fence values are not copied into old outputs.
+unchanged—Fill retains its original fencing token, while RunEvent retains its
+original attempt ID and fencing token. The replacement attempt/fence values are not
+copied into old outputs.
 Any difference in any retained field is not replay: the same/overlapping logical
-interval is `DUPLICATE_CONFLICT`; while nonterminal, an older non-overlapping interval
-is `EVENT_OUT_OF_ORDER`; after terminal, section 8 instead returns `RUN_FINISHED` for
+interval raises `EngineFailure` carrying `DUPLICATE_CONFLICT`; while nonterminal, an
+older non-overlapping interval raises one carrying `EVENT_OUT_OF_ORDER`; after
+terminal, section 8 instead raises one carrying `RUN_FINISHED` for
 every distinct non-overlapping input. All errors leave state byte-identical. On a new
 non-replay input, the supplied attempt/fence remain opaque output metadata and do
 not enter any domain UUID tuple. This is an identity exclusion only, not a
@@ -1128,9 +1177,14 @@ These canonical vectors are normative:
 | `correlation` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"completed_bar_v1","2026-01-02T03:04:00Z","2026-01-02T03:05:00Z","0000000000000000000000000000000000000000000000000000000000000000"]` | `019b7caa-6360-7464-861e-19052358e1e7` |
 | `decision` / `2026-01-02T03:05:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,0,"018f4c00-0000-7000-8000-000000000002","2026-01-02T03:05:00Z","ENTRY","long","018f4c00-0000-7000-8000-000000000003","0000000000000000000000000000000000000000000000000000000000000000","019b7caa-6360-7464-861e-19052358e1e7"]` | `019b7caa-6360-740c-8624-091a15fdd2b9` |
 | `protective-stop-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,1,"018f4c00-0000-7000-8000-000000000010","018f4c00-0000-7000-8000-000000000011","sell",1,"1999.8"]` | `019b7cab-4dc0-7d0e-b4c8-ad805426627d` |
+| `close-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,4,"019b7caa-6360-740c-8624-091a15fdd2b9","018f4c00-0000-7000-8000-000000000011","sell",1,"EXIT_RULE"]` | `019b7cab-4dc0-7982-9ff1-821fd7d8e8c5` |
+| `close-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,4,null,"018f4c00-0000-7000-8000-000000000011","sell",1,"CONTRACT_LIQUIDATION"]` | `019b7cab-4dc0-7bff-86c1-89c5c9aa735c` |
+| `close-order` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,4,null,"018f4c00-0000-7000-8000-000000000011","sell",1,"FORCE_CLOSE"]` | `019b7cab-4dc0-7546-8e12-22c442e256bb` |
 | `run-event` / `2026-01-02T03:06:00Z` | `["018f4c00-0000-7000-8000-000000000001",null,"run","018f4c00-0000-7000-8000-000000000001",0,"FILL_RECORDED","8d2c44a2b0bf6a6f589a16d67ae99a43ecd45197ef6d5b66fb228bb283334c73","018f4c00-0000-7000-8000-000000000011","019b7caa-6360-7464-861e-19052358e1e7","0000000000000000000000000000000000000000000000000000000000000000"]` | `019b7cab-4dc0-758a-b2fb-4df46dcfbc51` |
 
-The RunEvent vector's payload canonical bytes are
+The three close vectors bind the exact final tuple bytes and prove that lifecycle
+identity uses explicit null Decision ID but distinct immutable cause. The RunEvent
+vector's payload canonical bytes are
 `{"evidence_mode":"historical","fill_id":"018f4c00-0000-7000-8000-000000000011","fill_sequence":0,"kind":"FILL_RECORDED","order_id":"018f4c00-0000-7000-8000-000000000010"}`.
 Their SHA-256 is the payload-hash field shown in the vector. The table and vectors,
 not host UUID or clock APIs, are the cross-platform oracle.
@@ -1340,6 +1394,17 @@ The three close causes bind timing and expiry as follows:
 At those creation transitions the exit-rule row stores its creating `CLOSE`
 Decision ID, while the liquidation and force-close rows store null. Moving a
 scheduled force close into `close_intent` preserves that null byte-for-byte.
+
+The market-close UUID tuple's final member is exactly the internal immutable
+`creation_cause`, not `status_reason`, Fill reason, free text, or the later terminal
+reason. Its three reachable close values are the canonical strings `"EXIT_RULE"`,
+`"CONTRACT_LIQUIDATION"`, and `"FORCE_CLOSE"`, respectively. The exit-rule tuple has
+its non-null `decision_id`; the latter two have explicit null. `entry_fill_id` is
+always the current position's originating entry Fill ID. The liquidation value also
+covers the contract-expiry close window through exclusive `last_trade_at`; there is
+no fourth `CONTRACT_EXPIRY` identity. These values are present before deriving
+`order_id`, stored on `OrderState`, checkpointed, and immutable across activation,
+replacement/movement, and delayed Fill.
 
 At most one live `close_intent` exists. Creation appends its exact `OrderIntent` to
 `intents` once. `OrderState` is `PENDING` when `active_from` is later and becomes
@@ -1693,8 +1758,8 @@ At `entry_cutoff_at`, cancel entries/setups and block new ones. At
 `liquidation_start_at`, cancel entry state and first inspect the position. If flat,
 create no close intent, emit no close Decision/Fill, never enter `CLOSING`, and
 terminate `STOPPED` with `CONTRACT_CLOSED`. A later
-FinishRunEvent is a semantically distinct post-terminal input and returns
-`RUN_FINISHED`.
+FinishRunEvent is a semantically distinct post-terminal input and raises
+`EngineFailure` carrying `RUN_FINISHED`.
 If a position is open, create the liquidation `close_intent` under section 7 and set
 `CLOSING`. It remains byte-identical across scheduled closure or missing/invalid
 data while protection stays active, then fills at the next eligible fill bar under
@@ -1737,7 +1802,8 @@ synthetic exit. For `force_close`, initialize `force_close_state:"waiting"` and
 block any entry whose lifetime could reach `force_close_at`. Atomically with any
 earlier entry fill, create `scheduled_force_close` as a frozen market-close
 `OrderState` with `effective_at=active_from=force_close_at`, the entry input's
-explicit `submitted_at`, status `PENDING`, reason `FORCE_CLOSE`, and no bracket.
+explicit `submitted_at`, `status:"PENDING"`,
+`status_reason:"ORDER_SUBMITTED"`, `creation_cause:"FORCE_CLOSE"`, and no bracket.
 It is separate from `close_intent`, so it neither sets `CLOSING` early nor competes
 with protection. A prior ordinary/protective close cancels it and returns
 `force_close_state` to `waiting`, allowing a later pre-boundary entry to receive its
@@ -1764,14 +1830,66 @@ terminal state with `replayed:true` and emits no second terminal event. Post-ter
 classification then follows one exact order for every input kind: first, an
 immediately preceding semantic replay after excluding only attempt/fence returns
 the replay result; second, a semantically changed retained payload with the same
-logical identity or any overlap with the consumed terminal cursor returns
-`DUPLICATE_CONFLICT`; third, every other semantically distinct input returns
-`RUN_FINISHED`. Thus a new/disjoint later input and a non-overlapping older input are
+logical identity or any overlap with the consumed terminal cursor raises
+`EngineFailure` carrying `DUPLICATE_CONFLICT`; third, every other semantically
+distinct input raises one carrying `RUN_FINISHED`. Thus a new/disjoint later input and a non-overlapping older input are
 both `RUN_FINISHED`, never `EVENT_OUT_OF_ORDER`, after terminal status. All three
 outcomes leave terminal state and counters byte-identical; only the first has
 `replayed:true`. Forward paper cannot force-close. Actual-contract liquidation
 remains the separate `STOPPED`/
 `BLOCKED_EXPIRY_UNRESOLVED` path above and does not wait for a run finish event.
+
+`EngineState.finished_reason` is null in every `ACTIVE` or `CLOSING` state,
+including a completed force close that is still awaiting Finish. The terminal map
+is exhaustive:
+
+| Terminal path | Final status | `finished_reason` | Emits `RUN_FINISHED` now |
+| --- | --- | --- | --- |
+| early `mark_open` Finish, whether flat or preserving an open/pending snapshot | `FINISHED` | `MARK_OPEN` | yes, `reason:"MARK_OPEN"` |
+| completed `force_close` Finish, including already flat at the force boundary | `FINISHED` | `FORCE_CLOSED` | yes, `reason:"FORCE_CLOSED"` |
+| unresolved `force_close` Finish | `BLOCKED_UNCLOSED` | `BLOCKED_UNCLOSED` | yes, `reason:"BLOCKED_UNCLOSED"` |
+| actual-contract liquidation boundary reached while flat | `STOPPED` | `CONTRACT_CLOSED` | no |
+| actual-contract liquidation close Fill flattens the position | `STOPPED` | `CONTRACT_CLOSED` | no |
+| actual-contract close remains unresolved at exclusive `last_trade_at` | `BLOCKED_EXPIRY_UNRESOLVED` | `BLOCKED_EXPIRY_UNRESOLVED` | no |
+
+No other status/reason pairing is valid on restore. A later input to any terminal
+row follows replay/conflict/`EngineFailure(RUN_FINISHED)` precedence and never emits
+a second event or changes `finished_reason`.
+
+FT-07 emits the frozen terminal payload only for the three `yes` rows, narrowed to
+this exact projection:
+
+~~~text
+{
+  kind:"RUN_FINISHED",
+  status:"FINISHED"|"BLOCKED_UNCLOSED",
+  end_policy:"mark_open"|"force_close",
+  cash:Decimal, equity:Decimal, realized_pnl:Decimal, unrealized_pnl:Decimal,
+  position_open:bool, pending_entry:bool, mark_status:"none"|"fresh"|"stale",
+  reason:"MARK_OPEN"|"FORCE_CLOSED"|"BLOCKED_UNCLOSED"
+}
+~~~
+
+`position_open` is exactly `state.position is not null` and `pending_entry` is
+exactly `state.pending_entry is not null` after the terminal domain transition;
+neither field is an object, count, nullable value, or truthy coercion. A completed
+force-close payload has both false. An unresolved force-close payload has
+`position_open:true,pending_entry:false`. An early mark-open payload projects each
+boolean from its preserved terminal snapshot. `reason` equals the just-stored
+`finished_reason`; all monetary and mark fields project the same post-transition
+state. The engine sets status/reason first, constructs these exact payload bytes,
+then reserves the RunEvent counter/hash/UUID. `STOPPED` and
+`BLOCKED_EXPIRY_UNRESOLVED` have no terminal payload; their state reason is still
+checkpointed and hashed.
+
+For an actual-contract close Fill, `status:"STOPPED"` and
+`finished_reason:"CONTRACT_CLOSED"` are part of that same atomic Fill transition
+before its `ORDER_STATE`/`FILL_RECORDED` event reservations, so each event state hash
+contains the terminal pair. The flat-at-liquidation transition stores the same pair
+directly. At exclusive `last_trade_at`, first commit the close order's
+`EXPIRED/ORDER_EXPIRED` transition and emit its `ORDER_STATE`; then clear the pointer
+and store `BLOCKED_EXPIRY_UNRESOLVED` in both status and finished reason without a
+fabricated terminal event. These orderings are checkpoint/replay invariant.
 
 FT-07 returns the state needed by later analysis but does not implement FT-12
 metrics. It must expose cash, equity, fees, realized/unrealized P&L, position,
@@ -1825,7 +1943,8 @@ that Decision, including the current `next_decision_sequence`. Generate
 `decision_id` from that sequence/pre-hash/correlation tuple; then derive its
 idempotency key and any order ID, apply only that Decision's semantic state changes,
 and, for an `ENTRY` or `CLOSE` carrying an intent, set the created `OrderState`'s
-`originating_decision_id` to that exact `decision_id`. Then increment
+`originating_decision_id` to that exact `decision_id` and `creation_cause` to
+`ENTRY` or `EXIT_RULE`, respectively. Then increment
 `next_decision_sequence` once and compute `post_state_sha256`. The causal field is
 therefore present in the Decision post-state and every checkpoint made after order
 creation. A HOLD or REJECT still changes the sequence and therefore has a new post
@@ -1897,7 +2016,8 @@ The FT-07 event payload kinds are the relevant strict subset:
   "SCHEDULED_CLOSED",source_bar_record_ids}`. Its combinations are exactly the
   `DataQualityEvent` combinations in section 3.
 - `RUN_FINISHED` with `{kind,status,end_policy,cash,equity,realized_pnl,
-  unrealized_pnl,position_open,pending_entry,mark_status,reason|null}`.
+  unrealized_pnl,position_open:bool,pending_entry:bool,mark_status,reason}` and the
+  exact non-null terminal projection in section 8.
 
 `CORRECTION_OBSERVED` is intentionally absent from this FT-07 subset. Its frozen
 shape and meaning are unchanged, but FT-09 owns validation, hashing, persistence,
@@ -1945,8 +2065,10 @@ risk latch, and state/finish record. A boundary outside a completed bar retains 
 exact modeled position among those actions. The
 serialized Decision group follows section 9, so its `DECISION_RECORDED` events are
 adjacent and ordered exactly like `decisions`. Each event sequence increments once.
-`attempt_id` and `fencing_token` are copied unchanged from `EmissionContext` into
-each Fill/RunEvent. The correlation ID is a deterministic UUIDv7 in the
+`fencing_token` is copied unchanged from `EmissionContext` into each Fill and
+RunEvent; `attempt_id` is copied unchanged only into RunEvent. No internal helper or
+companion evidence adds an attempt field to Fill. The correlation ID is a
+deterministic UUIDv7 in the
 `correlation` domain for the input identity. A later issue may validate ownership and persist
 these immutable records atomically but may not reinterpret them.
 
@@ -1956,7 +2078,7 @@ increments `next_correlation_sequence`, and applies the validated input cursor,
 canonical-bar, interval-bucket, and prior ordered transitions before any dependent
 Fill/Decision snapshot. All following hashes are section 13.1 hashes of the complete
 typed `EngineState`, including every next-sequence counter, scheduled order, and
-live `originating_decision_id` field.
+live `originating_decision_id` and `creation_cause` field.
 
 For a prospective Fill, let `f=state.next_fill_sequence` and let
 `fill_pre_state_sha256` be the state hash after activation and every earlier action/
@@ -1975,12 +2097,13 @@ close field before clearing that pointer. The Fill's `*_after` fields project th
 post-transition state. No Fill event is emitted until the whole transition is
 complete, so no hashed state exposes an unprotected newly opened position.
 
-The ordered UUID field tuples in section 4 do not gain another member. Entry and
+The ordered UUID field tuples in section 4 do not gain another member: the former
+close tuple label `reason` is now bound exactly to `creation_cause`. Entry and
 exit-rule order identity already includes the creating `decision_id`; lifecycle
 close identity already includes explicit null. The standalone normative UUID rows
 remain exact. State hashes and any Fill/RunEvent UUID whose supplied pre-state hash
 contains a live order are nevertheless recomputed from the enriched canonical state;
-the causal field is committed through that hash rather than appended twice. In
+the internal fields are committed through that hash rather than appended twice. In
 particular, a same-bar protective Fill hashes the two inherited IDs in the complete
 post-entry bracket state.
 
@@ -2042,12 +2165,14 @@ except contract identity/version changes use `UNSUPPORTED_CONTRACT_CHANGE`.
 
 Restore additionally enforces the internal causal invariants before returning any
 state: every entry `OrderState` has a non-null lowercase UUIDv7
-`originating_decision_id`; each protective leg has a non-null lowercase UUIDv7 and
-both legs of one bracket equal each other; `scheduled_force_close` has null; and a
-close intent has either the non-null originating exit-rule Decision ID or null for
-contract liquidation/force close. Unknown keys, a missing field, a malformed ID,
-an entry null, unequal protective IDs, or a non-null scheduled-force-close value is
-`CHECKPOINT_MISMATCH` with no restored state. The records have the exact strict
+`originating_decision_id` and `creation_cause:"ENTRY"`; each protective leg has a
+non-null lowercase UUIDv7 and both legs of one bracket equal each other;
+`scheduled_force_close` has null origin and `creation_cause:"FORCE_CLOSE"`; and a
+close intent has either non-null origin plus `EXIT_RULE`, or null origin plus exactly
+`CONTRACT_LIQUIDATION|FORCE_CLOSE`. Unknown keys, a missing field, a malformed ID,
+an invalid cause/origin pairing, an entry null, unequal protective IDs, or a
+non-null scheduled-force-close origin is `CHECKPOINT_MISMATCH` with no restored
+state. The records have the exact strict
 shape shown in section 2; their canonical object keys remain lexically sorted under
 frozen section 13.1, and the fields are included in `state_sha256`. Restore does not
 need or permit an unbounded Decision history or pending-causation map.
@@ -2087,6 +2212,25 @@ include owner-private values or exception text. Details contain only JSON Pointe
 paths, stable reason names, and public IDs already supplied to this pure call. Every
 error leaves state byte-identical. Domain rejections such as no target, rule UNKNOWN,
 risk gap, or order expiry are Decisions/events and state transitions, not exceptions.
+
+The callable/code surface is exact:
+
+| Callable | `EngineFailure.error.code` values reachable after typed ingress |
+| --- | --- |
+| `initialize_engine` | `UNSUPPORTED_CONFIGURATION`, `UNSUPPORTED_FILL_INTERVAL` |
+| `step_engine` | `VALIDATION_ERROR`, `INVALID_BAR_EVENT`, `EVENT_AFTER_END`, `BATCH_LIMIT_EXCEEDED`, `UNSUPPORTED_CONTRACT_CHANGE`, `CONFIG_MISMATCH`, `EVENT_OUT_OF_ORDER`, `DUPLICATE_CONFLICT`, `RUN_FINISHED` |
+| `run_engine` | the `initialize_engine` set when `initial_state is null`, plus the complete `step_engine` set for the supplied/created state and ordered items |
+| `checkpoint_engine` | `UNSUPPORTED_CONTRACT_CHANGE`, `CONFIG_MISMATCH` |
+| `restore_engine` | `UNSUPPORTED_CONTRACT_CHANGE`, `CONFIG_MISMATCH`, `CHECKPOINT_MISMATCH` |
+
+An error code outside the row is an implementation defect. Pydantic
+`ValidationError` covers only construction of a strict argument model—field type,
+required/extra key, intrinsic field bound, UTC/UUID/Decimal form, tagged-union
+shape, and model-local invariant. It is never an alternate transport for a callable
+row above. Conversely, once all arguments are model instances, even the first
+preflight failure is always the exact `EngineFailure.error` transport. Tests must
+assert exception type and complete canonical `EngineError` bytes as well as
+unchanged input-state bytes.
 
 ## 11. Exact fixture and acceptance matrix
 
@@ -2187,7 +2331,7 @@ The named boundary and replay tests are:
 - `test_internal_window_open_never_retroactively_activates_an_entry`
 - `test_force_close_waits_for_exactly_once_finish_before_finished`
 - `test_all_close_intent_shapes_activation_persistence_cancellation_and_expiry_are_exact`
-- `test_flat_at_liquidation_stops_without_close_or_closing_and_finish_returns_run_finished`
+- `test_flat_at_liquidation_stops_without_close_or_closing_and_finish_raises_run_finished`
 - `test_flat_at_force_close_waits_for_finish_without_close_or_closing`
 - `test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state`
 - `test_rule_result_and_decision_evidence_match_frozen_schema_exactly`
@@ -2237,6 +2381,13 @@ The named boundary and replay tests are:
 - `test_rule_result_unknown_dependency_and_group_precedence`
 - `test_rule_result_filter_projection_and_lexical_leaf_evidence`
 - `test_rule_result_all_any_none_truth_reason_matrix`
+- `test_scheduled_force_close_retains_force_cause_but_pending_reason_is_submitted`
+- `test_fill_and_run_event_transport_fields_match_frozen_shapes_exactly`
+- `test_public_callables_raise_engine_failure_and_never_return_error_union`
+- `test_raw_pydantic_ingress_validation_is_not_wrapped_as_engine_failure`
+- `test_engine_failure_code_matrix_and_run_batch_visibility_are_exact`
+- `test_close_order_creation_cause_uuid_tuples_and_restore_are_exact`
+- `test_terminal_finished_reason_payload_booleans_bytes_and_hash_order_are_exact`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
