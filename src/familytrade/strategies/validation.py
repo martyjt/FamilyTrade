@@ -673,23 +673,33 @@ def _graph_issues(definition: RuleDefinition) -> list[ValidationIssue]:
                 _issue(path, ValidationIssueCode.ROOT_NOT_BOOLEAN, "Root must resolve to boolean.")
             )
 
-    def group_depth(node_id: str, seen: set[str]) -> int:
+    def expression_depth(node_id: str, seen: set[str]) -> int:
         if node_id in seen or node_id not in nodes:
             return 0
         node = nodes[node_id]
-        if node.kind != "group":
+        if node.kind not in {"group", "arithmetic"}:
             return 0
-        return 1 + max((group_depth(child, seen | {node_id}) for child in node.children), default=0)
+        children = node.children if node.kind == "group" else node.args
+        return 1 + max((expression_depth(child, seen | {node_id}) for child in children), default=0)
 
-    for node_id, node in nodes.items():
-        if node.kind == "group" and group_depth(node_id, set()) > 4:
-            issues.append(
-                _issue(
-                    f"/nodes/{index_by_id[node_id]}",
-                    ValidationIssueCode.SIZE_LIMIT,
-                    "Group nesting exceeds four levels.",
-                )
+    over_depth = [
+        node_id
+        for node_id in sorted(nodes)
+        if nodes[node_id].kind in {"group", "arithmetic"} and expression_depth(node_id, set()) > 4
+    ]
+    if over_depth:
+        node_id = over_depth[0]
+        issues.append(
+            _issue(
+                f"/nodes/{index_by_id[node_id]}",
+                ValidationIssueCode.SIZE_LIMIT,
+                "Expression nesting exceeds four levels.",
             )
+        )
+    if sum(node.kind in {"compare", "temporal_compare"} for node in nodes.values()) > 64:
+        issues.append(
+            _issue("/nodes", ValidationIssueCode.SIZE_LIMIT, "Condition leaf limit exceeded.")
+        )
     return issues
 
 
@@ -877,10 +887,13 @@ def _window_issues(
                                 for segment in calendar.windows
                                 if segment.start_at <= start_at and end_at <= segment.end_at
                             ]
-                            if start_at < calendar.coverage_start or end_at > calendar.coverage_end or not any(
-                                segment.kind == "open" for segment in containing
-                            ) and not any(
-                                segment.kind == "scheduled_closed" for segment in containing
+                            if (
+                                start_at < calendar.coverage_start
+                                or end_at > calendar.coverage_end
+                                or not any(segment.kind == "open" for segment in containing)
+                                and not any(
+                                    segment.kind == "scheduled_closed" for segment in containing
+                                )
                             ):
                                 invalid = True
                         day += timedelta(days=1)

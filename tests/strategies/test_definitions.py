@@ -1119,7 +1119,22 @@ def test_unhashable_or_nonfinite_raw_input_is_rejected_without_idempotency_row(
 
 
 def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_inclusive() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    for index in range(5):
+        nodes.append(
+            {
+                "kind": "group",
+                "node_id": f"z{index}",
+                "op": "all",
+                "children": [f"z{index + 1}" if index < 4 else "long-entry"],
+            }
+        )
+    result = _validate(value)
+    assert [
+        (item.path, item.code.value) for item in result.errors if item.code.value == "SIZE_LIMIT"
+    ] == [("/nodes/7", "SIZE_LIMIT")]
 
 
 def test_type_unit_operator_matrix_is_exhaustive() -> None:
