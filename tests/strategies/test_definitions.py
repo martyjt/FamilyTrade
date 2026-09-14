@@ -169,6 +169,45 @@ def test_create_draft_derives_owner_uuid_time_hash_and_warmup(
     assert created.required_warmup_bars == 6 and len(created.canonical_definition_sha256) == 64
 
 
+def test_edit_draft_inserts_new_successor_and_preserves_source_row_hash_and_version(
+    strategy_repository: tuple[StrategyRepository, object, Engine],
+) -> None:
+    repository, context, _ = strategy_repository
+    definition = _fixture()
+    create = {
+        "kind": "definition",
+        "schema_version": "v1",
+        "name": definition["name"],
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    source = repository.create_draft(context, create, idempotency_key=str(uuid7()))
+    edited_definition = _fixture()
+    edited_definition["name"] = "Edited crossover"
+    edit = {
+        "schema_version": "v1",
+        "draft_id": source.strategy_version_id,
+        "expected_version": 1,
+        "name": "Edited crossover",
+        "definition_schema_version": "rule-strategy-v1",
+        "definition": edited_definition,
+        "catalogue_version": "feature-catalogue-v1",
+        "execution_interval_seconds": 900,
+        "fill_interval_seconds": 60,
+    }
+    successor = repository.edit_draft(context, edit, idempotency_key=str(uuid7()))
+    reread = repository.get_version(context, source.strategy_version_id)
+    assert successor.strategy_version_id != source.strategy_version_id
+    assert successor.created_from_version_id == source.strategy_version_id
+    assert (
+        reread.record_version == 1
+        and reread.canonical_definition_sha256 == source.canonical_definition_sha256
+    )
+
+
 def test_presets_return_fresh_frozen_models() -> None:
     assert get_preset("reversal_breakout_mgc_original_v1") is not get_preset(
         "reversal_breakout_mgc_original_v1"

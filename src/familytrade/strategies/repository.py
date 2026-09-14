@@ -423,7 +423,7 @@ class StrategyRepository:
             if replay is not None:
                 return replay
             try:
-                parsed = StrategyDraftEditInput.model_validate(value)
+                parsed = StrategyDraftEditInput.model_validate(_as_model_input(value))
             except ValidationError as error:
                 safe = self._validation()
                 self._save_safe_error(
