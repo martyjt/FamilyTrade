@@ -1181,7 +1181,25 @@ def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_incl
 
 
 def test_type_unit_operator_matrix_is_exhaustive() -> None:
-    assert _validate(_fixture()).valid
+    value = _fixture()
+    nodes = value["nodes"]
+    assert isinstance(nodes, list)
+    nodes.append(
+        {
+            "kind": "arithmetic",
+            "node_id": "valid-price-sum",
+            "op": "add",
+            "args": ["fast-now", "slow-now"],
+            "result_type": "price",
+            "unit": "contract_price",
+        }
+    )
+    assert _validate(value).valid
+    nodes[-1]["args"] = ["fast-now", "volume-now"]
+    invalid = _validate(value)
+    assert ("/nodes/7/args", "UNIT_MISMATCH") in {
+        (item.path, item.code.value) for item in invalid.errors
+    }
 
 
 def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
