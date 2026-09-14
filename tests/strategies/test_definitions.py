@@ -1230,12 +1230,19 @@ def test_integer_count_times_or_divided_by_scalar_is_type_mismatch() -> None:
                 "result_type": "integer",
                 "unit": "count",
             },
+            {
+                "kind": "arithmetic",
+                "node_id": "bad-count-divide",
+                "op": "divide",
+                "args": ["count", "scalar"],
+                "result_type": "integer",
+                "unit": "count",
+            },
         ]
     )
     result = _validate(value)
-    assert ("/nodes/9/args", "TYPE_MISMATCH") in {
-        (item.path, item.code.value) for item in result.errors
-    }
+    issues = {(item.path, item.code.value) for item in result.errors}
+    assert {("/nodes/9/args", "TYPE_MISMATCH"), ("/nodes/10/args", "TYPE_MISMATCH")} <= issues
 
 
 def test_temporal_compare_adds_one_feature_interval_and_requires_offset_zero() -> None:
@@ -1299,6 +1306,16 @@ def test_feature_and_fill_intervals_divide_execution_interval() -> None:
     features[0]["interval_seconds"] = 700
     result = _validate(value)
     assert any(item.code.value == "INVALID_INTERVAL" for item in result.errors)
+    fill_result = validate_rule_definition(
+        _fixture(),
+        owner_user_id="owner",
+        execution_interval_seconds=900,
+        fill_interval_seconds=700,
+        calendar_versions={},
+    )
+    assert ("/", "INTERVAL_NOT_DIVISIBLE") in {
+        (item.path, item.code.value) for item in fill_result.errors
+    }
 
 
 def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> None:
