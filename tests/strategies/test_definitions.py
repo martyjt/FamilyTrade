@@ -1322,6 +1322,28 @@ def test_condition_leaf_group_arithmetic_depth_size_and_lookback_limits_are_incl
         if not expected:
             assert ("/nodes/7", "SIZE_LIMIT") in {(i.path, i.code.value) for i in result.errors}
 
+    for count, expected in ((4, True), (5, False)):
+        value = _fixture()
+        chain = value["nodes"]
+        previous = "fast-now"
+        for index in range(count):
+            node_id = f"sum-{index}"
+            chain.append(
+                {
+                    "kind": "arithmetic",
+                    "node_id": node_id,
+                    "op": "add",
+                    "args": [previous, "slow-now"],
+                    "result_type": "price",
+                    "unit": "contract_price",
+                }
+            )
+            previous = node_id
+        result = _validate(value)
+        assert result.valid is expected
+        if not expected:
+            assert ("/nodes/11", "SIZE_LIMIT") in {(i.path, i.code.value) for i in result.errors}
+
     for offset, expected in ((1997, True), (1998, False)):
         value = _fixture()
         nodes = value["nodes"]
