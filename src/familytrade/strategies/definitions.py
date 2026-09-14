@@ -194,7 +194,7 @@ class SetupTarget(FrozenModel):
 
 class FixedTicksTarget(FrozenModel):
     kind: Literal["fixed_ticks"]
-    ticks: int
+    ticks: int = Field(ge=1, le=100_000)
 
 
 class RiskMultipleTarget(FrozenModel):
