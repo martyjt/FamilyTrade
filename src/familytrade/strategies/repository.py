@@ -284,7 +284,7 @@ class StrategyRepository:
                 409,
             )
         if row["result"] is not None:
-            return StrategyVersion.model_validate(_as_model_input(row["result"]))
+            return StrategyVersion.model_validate_json(json.dumps(row["result"]))
         raise AccessError(
             ErrorCode(row["error"]["code"]), row["error"]["message"], row["error"]["http_status"]
         )
