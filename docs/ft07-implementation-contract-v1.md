@@ -261,7 +261,8 @@ OrderState = {
   order_sequence:int,
   status:"PENDING"|"ACTIVE"|"FILLED"|"EXPIRED"|"CANCELLED",
   status_reason:string|null, activated_at:UTC timestamp|null,
-  fill_sequence:int|null, source_setup_id:string|null
+  fill_sequence:int|null, source_setup_id:string|null,
+  originating_decision_id:lowercase UUIDv7|null
 }
 
 PositionState = {
@@ -281,7 +282,8 @@ ProtectiveOrderState = {
   active_from:UTC timestamp, filled_at:UTC timestamp|null,
   cancelled_at:UTC timestamp|null, status_reason:string|null,
   entry_order_id:lowercase UUIDv7, entry_fill_id:lowercase UUIDv7,
-  order_sequence:int, fill_sequence:int|null
+  order_sequence:int, fill_sequence:int|null,
+  originating_decision_id:lowercase UUIDv7
 }
 
 ProtectiveBracketState = {
@@ -448,6 +450,34 @@ from the eligible bar/boundary, never persistence times. Durable record timing i
 carried only by Decision/OrderIntent/Fill/RunEvent under the explicit section 4
 rules.
 
+`originating_decision_id` is FT-07-owned checkpointed causal state (and part of the
+FT-07 protective snapshot), not a field added to any frozen FT-02 public model. An
+entry `OrderState` stores the exact creating `ENTRY` Decision ID whether
+the entry is rules-only (`source_setup_id:null`) or setup-backed. A supplementary
+exit-rule close stores its exact creating `CLOSE` Decision ID. Contract-liquidation
+and force-close lifecycle orders store null because those actions deliberately
+create no Decision. Each protective record inherits the non-null originating entry
+Decision ID from the filled entry order. No order UUID is decoded to recover this
+value, and `source_setup_id` is never used as a substitute.
+
+These are the only causal-retention locations. The exact `EngineState` topology
+permits at most one field on each of `pending_entry`, `close_intent`, and
+`scheduled_force_close`, plus one on each of the two protective legs: at most five
+live values and no history or auxiliary map. Cancellation, expiry, or Fill retains
+the value in that transition's internal order snapshot and emitted protective
+snapshot, then removes it atomically when the existing live pointer/bracket is
+cleared. Once a Fill has been emitted, the frozen Fill itself is the durable causal
+projection and no completed-order causation archive remains in state.
+
+No `originating_correlation_id` or originating pre-state hash is retained. The
+frozen Fill asks only for `causation_decision_id`; the Fill/RunEvent correlation is
+derived from the accepted fill-causing input, while the canonical current-state
+hash already commits the retained Decision ID. Adding either extra value would be
+redundant state rather than information required to reconstruct a frozen field.
+Semantic replay never recreates or rebinds an order: it returns the existing state,
+including these causal fields, byte-identically with empty deltas and no sequence
+advance.
+
 `EngineState` is exactly:
 
 ~~~text
@@ -527,8 +557,8 @@ tuples byte-for-byte.
 Creation emits stop then target. A protective fill emits the filled leg then the
 cancelled sibling, while a close-intent fill emits cancelled stop then cancelled
 target; within each same-action group stop precedes target. This output preserves
-role, type, trigger, entry causation, and lifecycle even after the live bracket is
-removed from terminal/current state.
+role, type, trigger, entry causation, originating entry Decision ID, and lifecycle
+even after the live bracket is removed from terminal/current state.
 
 ## 3. Exact configuration and input event contract
 
@@ -1214,6 +1244,10 @@ The three close causes bind timing and expiry as follows:
 | Contract liquidation | Created as the persisted `close_intent` when accepted input chronology first reaches `contract.liquidation_start_at`, preserving the frozen create-at-liquidation rule. It has `effective_at=contract.liquidation_start_at`, `submitted_at` from that boundary-advancing input's explicit emission context, and in both modes `active_from` is the first not-yet-processed eligible fill-bar start at or after both values. | `contract.last_trade_at` (exclusive). |
 | Backtest force close | `scheduled_force_close` uses the section 8 pre-scheduling rule and moves to `close_intent` at `config.force_close_at`. | `config.end_at` (exclusive). |
 
+At those creation transitions the exit-rule row stores its creating `CLOSE`
+Decision ID, while the liquidation and force-close rows store null. Moving a
+scheduled force close into `close_intent` preserves that null byte-for-byte.
+
 At most one live `close_intent` exists. Creation appends its exact `OrderIntent` to
 `intents` once. `OrderState` is `PENDING` when `active_from` is later and becomes
 `ACTIVE` before fill evaluation when that boundary is reached; if already effective,
@@ -1240,10 +1274,16 @@ state retains the open position and the emitted intent/event evidence. A
 `POSITION_FLAT` cancellation similarly emits `CANCELLED` before clearing the live
 or scheduled pointer. No cancellation or expiry emits a Fill or commission.
 
-An entry Fill and either protective Fill cite the originating entry Decision in
-`causation_decision_id`; an exit-rule market close cites its `CLOSE` Decision.
-Contract-liquidation and force-close lifecycle Fills use null because no trading
-Decision is fabricated for either policy action.
+Fill causation is copied from live internal order state before that state is changed
+or removed. An entry Fill copies `pending_entry.originating_decision_id`; either
+protective Fill copies the selected protective leg's inherited
+`originating_decision_id`; and an exit-rule market close copies
+`close_intent.originating_decision_id`. Each is therefore the exact originating
+`ENTRY` or `CLOSE` Decision even when one or more checkpoints separate Decision and
+Fill. Contract-liquidation and force-close lifecycle orders have null
+`originating_decision_id`, so their Fills copy null because no trading Decision is
+fabricated for either policy action. A non-null causal value is never reconstructed
+from `order_id`, `entry_order_id`, `source_setup_id`, correlation, or event history.
 
 For liquidation, "chronology first reaches" means the transition is modeled at the
 liquidation boundary, but its order is submitted only at the explicit submission
@@ -1691,8 +1731,12 @@ For each serialized Decision, `pre_state_sha256` hashes state immediately before
 that Decision, including the current `next_decision_sequence`. Generate
 `decision_id` from that sequence/pre-hash/correlation tuple; then derive its
 idempotency key and any order ID, apply only that Decision's semantic state changes,
-increment `next_decision_sequence` once, and compute `post_state_sha256`. A HOLD or
-REJECT still changes the sequence and therefore has a new post hash. With multiple
+and, for an `ENTRY` or `CLOSE` carrying an intent, set the created `OrderState`'s
+`originating_decision_id` to that exact `decision_id`. Then increment
+`next_decision_sequence` once and compute `post_state_sha256`. The causal field is
+therefore present in the Decision post-state and every checkpoint made after order
+creation. A HOLD or REJECT still changes the sequence and therefore has a new post
+hash. With multiple
 Decisions, each prior post hash is byte-identical to the next pre hash. Any fill,
 mark, or other transition prescribed before decision evaluation is already in the
 first Decision's pre-state. No fill, mark, or RunEvent-sequence transition occurs
@@ -1818,19 +1862,34 @@ the engine reserves the current correlation sequence, derives the correlation ID
 increments `next_correlation_sequence`, and applies the validated input cursor,
 canonical-bar, interval-bucket, and prior ordered transitions before any dependent
 Fill/Decision snapshot. All following hashes are section 13.1 hashes of the complete
-typed `EngineState`, including every next-sequence counter and scheduled order.
+typed `EngineState`, including every next-sequence counter, scheduled order, and
+live `originating_decision_id` field.
 
 For a prospective Fill, let `f=state.next_fill_sequence` and let
 `fill_pre_state_sha256` be the state hash after activation and every earlier action/
 event for the input, but before any part of this Fill transition. The Fill UUID tuple
 in section 4 uses exactly that internal hash and `f`. After deriving `fill_id`, apply
-one atomic Fill transition: set the filled order's `fill_sequence=f`; update its
+one atomic Fill transition: first copy the selected order's checkpointed
+`originating_decision_id` into `Fill.causation_decision_id`; set the filled order's
+`fill_sequence=f`; update its
 status, cash, fees, per-fill/cumulative P&L, signed position, risk counters, and
-bracket/OCO state; allocate entry-created order IDs stop, target, then scheduled
-force close when applicable; increment `next_order_sequence` for each allocation;
-and finally set `next_fill_sequence=f+1`. The Fill's `*_after` fields project this
+bracket/OCO state. For an entry Fill, copy the same non-null ID into both protective
+records before the pending-entry pointer is cleared; allocate entry-created order IDs
+stop, target, then scheduled force close when applicable, with the scheduled
+force-close causal field null; increment `next_order_sequence` for each allocation;
+and finally set `next_fill_sequence=f+1`. For an exit or lifecycle close, capture the
+close field before clearing that pointer. The Fill's `*_after` fields project this
 post-transition state. No Fill event is emitted until the whole transition is
 complete, so no hashed state exposes an unprotected newly opened position.
+
+The ordered UUID field tuples in section 4 do not gain another member. Entry and
+exit-rule order identity already includes the creating `decision_id`; lifecycle
+close identity already includes explicit null. The standalone normative UUID rows
+remain exact. State hashes and any Fill/RunEvent UUID whose supplied pre-state hash
+contains a live order are nevertheless recomputed from the enriched canonical state;
+the causal field is committed through that hash rather than appended twice. In
+particular, a same-bar protective Fill hashes the two inherited IDs in the complete
+post-entry bracket state.
 
 Each RunEvent then uses a separate deterministic reservation. Let
 `e=state.next_event_sequence` after its domain transition and all earlier emitted
@@ -1887,6 +1946,18 @@ typed invariant, and returns the identical state. Unknown format/engine version 
 `CHECKPOINT_MISMATCH`; a changed strategy hash, contract ID/version, calendar
 ID/version, dataset binding, policy, owner, mode, or run ID is `CONFIG_MISMATCH`,
 except contract identity/version changes use `UNSUPPORTED_CONTRACT_CHANGE`.
+
+Restore additionally enforces the internal causal invariants before returning any
+state: every entry `OrderState` has a non-null lowercase UUIDv7
+`originating_decision_id`; each protective leg has a non-null lowercase UUIDv7 and
+both legs of one bracket equal each other; `scheduled_force_close` has null; and a
+close intent has either the non-null originating exit-rule Decision ID or null for
+contract liquidation/force close. Unknown keys, a missing field, a malformed ID,
+an entry null, unequal protective IDs, or a non-null scheduled-force-close value is
+`CHECKPOINT_MISMATCH` with no restored state. The records have the exact strict
+shape shown in section 2; their canonical object keys remain lexically sorted under
+frozen section 13.1, and the fields are included in `state_sha256`. Restore does not
+need or permit an unbounded Decision history or pending-causation map.
 
 Checkpoint serialization and restore are pure payload behavior only. FT-07 creates
 no production checkpoint row/file, migration, lease, fence, lock, transaction,
@@ -2061,6 +2132,12 @@ The named boundary and replay tests are:
 - `test_terminal_dispatch_precedes_normal_finish_validation_for_every_terminal_state`
 - `test_completed_bar_rejects_nested_corrections_before_hash_cursor_and_state`
 - `test_retry_differing_only_by_nested_corrections_is_invalid_not_replay`
+- `test_rules_only_entry_fill_after_checkpoint_retains_originating_entry_decision`
+- `test_setup_entry_fill_after_checkpoint_retains_originating_entry_decision`
+- `test_protective_fill_after_checkpoint_inherits_originating_entry_decision`
+- `test_exit_rule_close_fill_after_checkpoint_retains_originating_close_decision`
+- `test_lifecycle_close_fill_after_checkpoint_has_null_causation_decision`
+- `test_order_causation_fields_are_bounded_strict_and_checkpoint_byte_exact`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
