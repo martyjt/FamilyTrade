@@ -1531,6 +1531,10 @@ def test_mixed_feature_intervals_convert_once_without_ceiling_inflation() -> Non
 
 
 def test_feature_and_fill_intervals_divide_execution_interval() -> None:
+    for interval in (60, 300, 900):
+        value = _fixture()
+        value["features"][0]["interval_seconds"] = interval
+        assert _validate(value).valid
     value = _fixture()
     features = value["features"]
     assert isinstance(features, list)
@@ -1547,6 +1551,25 @@ def test_feature_and_fill_intervals_divide_execution_interval() -> None:
     assert ("/", "INTERVAL_NOT_DIVISIBLE") in {
         (item.path, item.code.value) for item in fill_result.errors
     }
+    for fill in (60, 300, 900):
+        assert validate_rule_definition(
+            _fixture(),
+            owner_user_id="owner",
+            execution_interval_seconds=900,
+            fill_interval_seconds=fill,
+            calendar_versions={},
+        ).valid
+    for fill in (700, 1_800):
+        result = validate_rule_definition(
+            _fixture(),
+            owner_user_id="owner",
+            execution_interval_seconds=900,
+            fill_interval_seconds=fill,
+            calendar_versions={},
+        )
+        assert ("/", "INTERVAL_NOT_DIVISIBLE") in {
+            (item.path, item.code.value) for item in result.errors
+        }
 
 
 def test_reversal_entry_filter_and_breakout_arm_entry_filters_are_distinct() -> None:
