@@ -1055,19 +1055,41 @@ def test_trigger_allows_only_exact_draft_to_validated_transition_and_no_other_up
     draft = repository.create_draft(
         context, _create_request(_fixture()), idempotency_key=str(uuid7())
     )
+    versions = strategy_metadata.tables["strategy_versions"]
+    # The one permitted database-level mutation is exactly draft/v1 -> validated/v2.
+    with engine.begin() as connection:
+        connection.execute(
+            update(versions)
+            .where(versions.c.strategy_version_id == draft.strategy_version_id)
+            .values(status="validated", record_version=2, updated_at=func.clock_timestamp())
+        )
+        stored = connection.execute(
+            select(versions.c.status, versions.c.record_version).where(
+                versions.c.strategy_version_id == draft.strategy_version_id
+            )
+        ).one()
+    assert stored == ("validated", 2)
+    # Every other direct update (including a nominally equivalent status update) and delete is barred.
     with pytest.raises(DBAPIError), engine.begin() as connection:
         connection.execute(
-            update(strategy_metadata.tables["strategy_versions"])
-            .where(
-                strategy_metadata.tables["strategy_versions"].c.strategy_version_id
-                == draft.strategy_version_id
-            )
+            update(versions)
+            .where(versions.c.strategy_version_id == draft.strategy_version_id)
             .values(name="forbidden")
+        )
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            update(versions)
+            .where(versions.c.strategy_version_id == draft.strategy_version_id)
+            .values(status="validated", record_version=3)
+        )
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            versions.delete().where(versions.c.strategy_version_id == draft.strategy_version_id)
         )
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE strategy_versions DISABLE TRIGGER ALL"))
         connection.execute(
-            update(strategy_metadata.tables["strategy_versions"])
+            update(versions)
             .where(
                 strategy_metadata.tables["strategy_versions"].c.strategy_version_id
                 == draft.strategy_version_id
