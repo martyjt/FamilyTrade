@@ -578,7 +578,8 @@ advance.
 
 ~~~text
 {
-  schema_version:"v1", engine_version:"paper-engine-v1", config_sha256,
+  schema_version:"v1", engine_version:"paper-engine-v1",
+  config_snapshot:EngineConfig, config_sha256,
   status:"ACTIVE"|"CLOSING"|"FINISHED"|"STOPPED"|"BLOCKED_UNCLOSED"|
     "BLOCKED_EXPIRY_UNRESOLVED",
   last_input_kind:null|"completed_bar_v1"|"data_quality_v1"|"finish_run_v1",
@@ -616,6 +617,24 @@ advance.
     "BLOCKED_UNCLOSED"|"BLOCKED_EXPIRY_UNRESOLVED"
 }
 ~~~
+
+`config_snapshot` is the exact validated `EngineConfig` supplied to
+`initialize_engine`, reconstructed as a deep strict frozen model rather than held as
+a caller-owned mutable mapping. Its frozen section 13.1 canonical bytes are limited
+to `16777216` UTF-8 bytes. `config_sha256` is exactly SHA-256 of those bytes. The
+snapshot is present even in the empty freshly initialized state, is never changed or
+evicted, and is serialized once inside `EngineState`; there is no config history,
+leaf map, second top-level checkpoint copy, or secret/provider payload. `EngineConfig`
+contains only the already accepted public strategy, contract, calendar, dataset,
+policy, identity, and time records. The byte ceiling makes the retained value
+strictly bounded without narrowing any trading rule.
+The `EngineState` local model validator enforces the snapshot's strict type and
+canonical byte ceiling but deliberately does not accept a caller-selected hash as
+proof of content; hash equality remains a callable-stage invariant. Initialization
+performs the same size check before constructing the derived state, so its resource
+failure has the promised `EngineFailure` rather than leaking an internal Pydantic
+exception. A raw oversized checkpoint/state mapping fails strict model construction
+before restore, consistently with the typed-ingress boundary in section 2.
 
 Feature runtime sorts by lexical feature ID. History is bounded to the validated
 feature/node need plus one prior value for temporal comparisons. No unordered set
@@ -723,6 +742,31 @@ stop_slippage_ticks,limit_slippage_ticks}` with the frozen numerical bounds.
 both_hit_policy,entry_bar_exit_policy}`. Sizing is exactly fixed contracts or stop
 risk fraction, and `RiskPolicy` has the five frozen fields including
 `max_positions:1`.
+
+During `initialize_engine` preflight, at `CONFIG_SNAPSHOT_LIMIT`'s position in the
+error-reason order, serialize the complete config with frozen section 13.1. More
+than `16777216` UTF-8 bytes raises `UNSUPPORTED_CONFIGURATION` with
+`{kind:"unsupported_configuration",path:"",reason:"CONFIG_SNAPSHOT_LIMIT"}` and no
+state. After all initialization preflight succeeds, deep-validate a canonical round trip into the
+strict frozen `config_snapshot` and stores its SHA-256 in `config_sha256`. Concretely,
+the copy input is `config.model_dump(mode="python", round_trip=True)`; the rebuilt
+model must reproduce the original canonical bytes exactly. The
+snapshot includes explicit nulls and empty tuples and every nested integrated-record
+field; no field covered by the config fingerprint is elided, redacted, normalized a
+second way, or represented only by a one-way hash.
+
+Config comparison is over the two canonical JSON trees. First compare
+`contract.contract_id` and `contract.record_version` as the special contract-change
+class. If they match but the full canonical bytes differ, recursively compare
+both trees and collect complete RFC 6901 pointers for every unequal scalar/null,
+missing object key, absent array index, or container-kind mismatch. Object keys are
+escaped per RFC 6901; each unequal array tail index is collected, not collapsed to
+its parent. Select the ordinal Unicode-code-point lexical minimum of the complete
+pointer strings; array indexes are therefore compared as pointer text, not numeric
+values. Typed models normally make object key sets and container kinds stable.
+Decimal strings, UTC timestamps, nulls, empty containers, and tuple order are
+compared exactly as serialized. This is the sole algorithm for
+`ConfigMismatchDetails.path`.
 
 `EngineConfig.fill_model.fill_interval_seconds` must equal the immutable
 `strategy_version.fill_interval_seconds` exactly. Run-level fill policy selects the
@@ -2207,18 +2251,20 @@ then other `POSITION_FLAT` cancellations in ascending order sequence.
 
 `EngineState` contains only deterministic engine state:
 
-- Config fingerprint, status, last consumed logical interval/record/payload/input
-  hash, exact source IDs and their parallel immutable dataset provenance needed by
-  open aggregates/evidence, and next deterministic decision/order/fill/event/zone/
-  setup/correlation sequences.
+- Exact bounded frozen config snapshot plus fingerprint, status, last consumed
+  logical interval/record/payload/input hash, exact source IDs and their parallel
+  immutable dataset provenance needed by open aggregates/evidence, and next
+  deterministic decision/order/fill/event/zone/setup/correlation sequences.
 - In-progress interval buckets; quantized feature recurrence/history sufficient for
   the validated maximum lookback; confirmed pivots/zones; setup state and frozen
   candidate snapshots.
 - Pending entry, position, protective bracket, close intent, scheduled force close,
   cash, equity, marks, fees, realized/unrealized P&L, exposure,
   high-water/drawdown, trading-day baseline, counters, and risk latches.
-- Finished/blocked status and last stable error/reason. It contains no credential,
-  database handle, path, provider payload, clock, lease, fence, outbox, or job state.
+- Finished/blocked status and last stable error/reason. Apart from immutable public
+  manifest/provenance references already inside the config snapshot, it contains no
+  credential, operational filesystem path, database handle, provider payload,
+  clock, lease, fence, outbox, or job state.
 
 Canonical state bytes use frozen section 13.1. `state_sha256` is SHA-256 of the
 state projection excluding any surrounding hash field. Every successful step
@@ -2234,6 +2280,75 @@ the identical state. Unknown schema/format/engine version is
 `CHECKPOINT_MISMATCH`; a changed strategy hash, contract ID/version, calendar
 ID/version, dataset binding, policy, owner, mode, or run ID is `CONFIG_MISMATCH`,
 except contract identity/version changes use `UNSUPPORTED_CONTRACT_CHANGE`.
+
+The snapshot closes config validation for all five callables. `step_engine` and
+`checkpoint_engine` first read expected contract ID/version from
+`state.config_snapshot`, compare those two fields with the supplied config, and
+raise `UNSUPPORTED_CONTRACT_CHANGE` before any other config mismatch. The error's
+expected fields come exactly from the snapshot and its actual fields exactly from
+the supplied config. If contract identity/version match, they apply section 3's
+tree comparison. `CONFIG_MISMATCH.expected_config_sha256` is
+`state.config_sha256`, `actual_config_sha256` is SHA-256 of the supplied config's
+canonical bytes, and `path` is the algorithm's lexically first differing complete
+pointer. This works before any input has been consumed because initialization always
+stores the snapshot. If supplied config bytes equal the snapshot but the stored
+fingerprint differs, the state is internally inconsistent and the exact
+`CONFIG_MISMATCH` uses root path `""`, stored hash as expected, and recomputed
+snapshot hash as actual. No event hash, replay classification, output, or state
+transition precedes these checks.
+
+`checkpoint_engine` writes its top-level `config_sha256` from the already-validated
+`state.config_sha256`; it does not reserialize a caller config into a new snapshot.
+`restore_engine` validation order is exact:
+
+1. Reject schema, format, or engine version in that order.
+2. Recompute and validate `state_sha256` over the complete state including
+   `config_snapshot` and `state.config_sha256`; the checkpoint's outer config hash
+   is not part of the state projection.
+3. Recompute snapshot canonical bytes and require its SHA-256 to equal both
+   `state.config_sha256` and checkpoint
+   `config_sha256`. An outer/state hash disagreement uses
+   `CHECKPOINT_CONFIG_HASH` at `/config_sha256`; a digest-mismatched snapshot uses
+   the same reason at `/state/config_snapshot`.
+4. Validate the remaining EngineState causal invariants below.
+5. Compare supplied versus snapshot contract ID/version and emit
+   `UNSUPPORTED_CONTRACT_CHANGE` first when either differs.
+6. Compare every remaining supplied config value using section 3 and emit the exact
+   `CONFIG_MISMATCH` hashes/pointer, or return the identical restored state.
+
+Thus accidental checkpoint tamper cannot replace the expected config identity by
+also changing only an outer hash. This is integrity and deterministic classification,
+not authenticity: FT-07 has no signing key or credential, and later persistence
+must protect stored checkpoint bytes.
+
+The adversarial matrix is exact. Changing a well-typed snapshot value without
+changing `state_sha256` fails first as `STATE_HASH` at `/state_sha256`. Recomputing
+`state_sha256` after that snapshot change while leaving both config hashes unchanged
+fails as `CHECKPOINT_CONFIG_HASH` at `/state/config_snapshot`. Changing only the checkpoint
+outer config hash fails with that reason at `/config_sha256`. A valid untouched
+checkpoint restored with a supplied config that changes both contract identity and
+other fields returns `UNSUPPORTED_CONTRACT_CHANGE`; with multiple non-contract
+changes it returns the lexical pointer algorithm's single first field. Each case
+returns no state and leaves the checkpoint/config model bytes unchanged.
+
+Checkpoint `format_version` remains `1` because this contract is still before the
+first FT-07 implementation/checkpoint release; the earlier reviewed candidate
+created no supported persisted bytes. There is no legacy draft-checkpoint migration
+or optional/missing snapshot form. Raw mappings missing `config_snapshot` fail
+strict Pydantic construction; a well-typed unknown format reaches restore and gets
+`CHECKPOINT_MISMATCH`. After the first implementation release, any removal,
+reinterpretation, or incompatible change to snapshot/state bytes must increment
+`format_version`; silent fallback is forbidden.
+
+`config_snapshot` participates in the initialized state hash and every later state
+and checkpoint hash. It allocates no sequence and adds no field to any domain UUID
+tuple. Consequently the normative UUID algorithms and fixed vectors in section 4
+are unchanged; runtime Decisions, orders, Fills, and RunEvents whose existing tuples
+already transitively commit a pre-state hash deterministically commit the new
+snapshot-containing hash and may therefore have different derived IDs than an
+unimplemented earlier draft. Rejection for contract/config/checkpoint mismatch
+allocates no UUID or counter. Restore returns byte-identical snapshot/state bytes, so
+checkpoint chunking cannot change later hashes or IDs.
 
 Restore additionally enforces the internal causal invariants before returning any
 state: every entry `OrderState` has a non-null lowercase UUIDv7
@@ -2293,8 +2408,8 @@ UnsupportedConfigurationDetails = {
     "CATALOGUE_MISMATCH"|"CONTRACT_CALENDAR_MISMATCH"|
     "CONTRACT_NUMERIC_POLICY"|"CURRENCY_MISMATCH"|"BACKTEST_BINDING"|
     "FORWARD_BINDING"|"DATASET_BINDING"|"DATASET_COVERAGE"|
-    "RUN_SPAN_EXCEEDED"|"BAR_LIMIT_RANGE"|"MODE_LANE_MISMATCH"|
-    "END_POLICY_MISMATCH"|"POLICY_UNSUPPORTED"
+    "RUN_SPAN_EXCEEDED"|"BAR_LIMIT_RANGE"|"CONFIG_SNAPSHOT_LIMIT"|
+    "MODE_LANE_MISMATCH"|"END_POLICY_MISMATCH"|"POLICY_UNSUPPORTED"
 }
 UnsupportedFillIntervalDetails = {
   kind:"unsupported_fill_interval", fill_interval_seconds:positive int,
@@ -2314,7 +2429,7 @@ ConfigMismatchDetails = {
 CheckpointMismatchDetails = {
   kind:"checkpoint_mismatch", path:JsonPointer,
   reason:"SCHEMA_VERSION"|"FORMAT_VERSION"|"ENGINE_VERSION"|
-    "CHECKPOINT_CONFIG_HASH"|"STATE_HASH"|"STATE_INVARIANT"
+    "STATE_HASH"|"CHECKPOINT_CONFIG_HASH"|"STATE_INVARIANT"
 }
 EventOutOfOrderDetails = {
   kind:"event_out_of_order",
@@ -2408,16 +2523,19 @@ For `UNSUPPORTED_CONFIGURATION`, reason precedence is the displayed enum order a
 mismatch, the first among `/contract/tick_size` and `/contract/multiplier` for
 numeric policy, the first currency field, the first backtest/forward/dataset binding or coverage
 field, `/start_at` or `/end_at` for span, `/max_canonical_bars` for cap range,
-`/lane_id` for mode/lane, `/force_close_at` for end-policy mismatch, and the first
-unsupported policy field. Alternatives separated by `|` here mean lexically first
-failing complete pointer, not a literal pointer containing `|`.
+root `""` for config snapshot limit, `/lane_id` for mode/lane,
+`/force_close_at` for end-policy mismatch, and the first unsupported policy field.
+Alternatives separated by `|` here mean lexically first failing complete pointer,
+not a literal pointer containing `|`.
 
 Checkpoint detail reasons map to `/schema_version`, `/format_version`,
-`/engine_version`, `/config_sha256`, `/state_sha256`, or the first failing `/state`
-pointer respectively. Contract-change fields copy the state/checkpoint expected
-contract and supplied-config actual contract. Config-mismatch hashes are the stored
-expected config hash and recomputed supplied-config actual hash, with the first
-non-contract differing config pointer. Out-of-order fields copy the stored cursor
+`/engine_version`, `/state_sha256`, `/config_sha256` or
+`/state/config_snapshot` as bound above, or the first failing `/state` pointer
+respectively.
+Contract-change fields copy `state.config_snapshot.contract` expected identity and
+supplied-config actual identity. Config-mismatch hashes are the stored expected
+config hash and recomputed supplied-config actual hash, with the recursive
+canonical-tree algorithm's first non-contract differing pointer. Out-of-order fields copy the stored cursor
 and supplied logical interval/recorded timestamps. Duplicate-conflict fields copy
 the conflicting logical interval and stored/current semantic input hashes.
 Run-finished fields copy the terminal state status and `finished_reason`.
@@ -2428,11 +2546,11 @@ reason order. `step_engine` uses section 4's exact dispatch order; within step 1
 contract change precedes other config mismatch, correction/outer validation follows,
 and within step 5 event-after-end precedes bar validity, ordering, then resource
 cap. `checkpoint_engine` checks contract change before other config mismatch.
-`restore_engine` checks checkpoint schema, format, engine, state hash, and state
-invariants first; a well-formed `config_sha256` inconsistent with the embedded
-state uses `CHECKPOINT_CONFIG_HASH`; only then do contract change and other supplied
-config mismatch run. These checks construct exactly the first error and never a
-list of errors.
+`restore_engine` checks checkpoint schema, format, engine, state hash, config
+snapshot/hash integrity, then other state invariants; only then do contract change
+and other supplied config mismatch run. A well-formed `config_sha256` inconsistent
+with the embedded state uses `CHECKPOINT_CONFIG_HASH`. These checks construct
+exactly the first error and never a list of errors.
 
 The code, sole public message, condition, and exact detail source are:
 
@@ -2442,7 +2560,7 @@ The code, sole public message, condition, and exact detail source are:
 | INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. | `InvalidBarEventDetails` from selected record ID and first reason. |
 | EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. | `event_end_at=event.selection.bar.end_at`; `config_end_at=config.end_at`. |
 | BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. | Stored pre-input `current_count`, computed positive non-replay `input_delta`, configured cap. |
-| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset identity/coverage, calendar, mode, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. | `UnsupportedConfigurationDetails` using the reason/path rules above. |
+| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset identity/coverage, calendar, mode, five-year span, bar/config-snapshot resource ceiling, fill-interval equality, or policy is unsupported/inconsistent. | `UnsupportedConfigurationDetails` using the reason/path rules above. |
 | UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. | Supplied fill and strategy execution seconds plus first fill reason. |
 | UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. | Stored expected and supplied actual contract ID/version. |
 | CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. | First differing pointer plus stored expected/recomputed actual hashes. |
@@ -2473,6 +2591,23 @@ bytes are exactly:
 
 ~~~json
 {"code":"CHECKPOINT_MISMATCH","details":{"kind":"checkpoint_mismatch","path":"/format_version","reason":"FORMAT_VERSION"},"message":"Engine checkpoint is invalid."}
+~~~
+
+For a state snapshot whose contract is
+`018f4c00-0000-7000-8000-000000000001` version `3` and a supplied config whose
+contract is `018f4c00-0000-7000-8000-000000000004` version `4`, even when other
+fields also differ, the complete error bytes are exactly:
+
+~~~json
+{"code":"UNSUPPORTED_CONTRACT_CHANGE","details":{"actual_contract_id":"018f4c00-0000-7000-8000-000000000004","actual_record_version":4,"expected_contract_id":"018f4c00-0000-7000-8000-000000000001","expected_record_version":3,"kind":"unsupported_contract_change"},"message":"Contract change is unsupported."}
+~~~
+
+For matching contract identity and multiple non-contract changes whose lexical
+first pointer is `/end_at`, expected hash all zero and actual hash all one, the
+complete error bytes are exactly:
+
+~~~json
+{"code":"CONFIG_MISMATCH","details":{"actual_config_sha256":"1111111111111111111111111111111111111111111111111111111111111111","expected_config_sha256":"0000000000000000000000000000000000000000000000000000000000000000","kind":"config_mismatch","path":"/end_at"},"message":"Engine configuration does not match state."}
 ~~~
 
 By contrast, an otherwise valid raw config mapping with `random_seed=1` raises raw
@@ -2666,6 +2801,12 @@ The named boundary and replay tests are:
 - `test_engine_step_result_pre_post_hashes_cover_normal_quality_finish_and_replay`
 - `test_run_engine_step_hash_chain_matches_incremental_and_empty_batch`
 - `test_failed_step_or_batch_returns_no_result_hashes_and_preserves_input_state`
+- `test_fresh_state_retains_exact_bounded_config_snapshot_and_hash`
+- `test_contract_change_precedes_multiple_config_diffs_and_reports_snapshot_expected`
+- `test_multiple_noncontract_config_diffs_report_lexically_first_deep_pointer`
+- `test_checkpoint_config_snapshot_round_trip_and_tamper_precedence`
+- `test_step_and_checkpoint_detect_snapshot_hash_inconsistency_without_state_change`
+- `test_config_snapshot_byte_limit_and_preimplementation_format_policy_are_exact`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
