@@ -641,7 +641,9 @@ def test_limit_market_ttl_gap_and_entry_bar_precedence_matrix_is_exhaustive() ->
 
 
 def test_indicator_warmup_equality_and_causal_catalogue() -> None:
-    expected = _frozen("indicator_warmup_equality_and_causal_catalogue")["expected"]
+    case = _frozen("indicator_warmup_equality_and_causal_catalogue")
+    expected = case["expected"]
+    crossing = case["given"]["crosses_above"]
     original = getcontext().prec
     getcontext().prec = 4
     try:
@@ -696,6 +698,71 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
             {"close": "12", "volume": "300"},
         ),
     )
+    crossing_definition = make_backtest_config().strategy_version.definition.model_copy(
+        update={
+            "features": (
+                feature("cross-left", "close", {}),
+                feature("cross-right", "close", {}),
+            ),
+            "nodes": (
+                FeatureNode(kind="feature", node_id="left-node", feature_id="cross-left", offset=0),
+                FeatureNode(
+                    kind="feature", node_id="right-node", feature_id="cross-right", offset=0
+                ),
+                TemporalCompareNode(
+                    kind="temporal_compare",
+                    node_id="fixture-cross",
+                    op="crosses_above",
+                    left_feature="left-node",
+                    right_feature="right-node",
+                ),
+            ),
+        }
+    )
+    previous_end = datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
+    current_end = datetime(2026, 1, 2, 3, 5, tzinfo=UTC)
+
+    def crossing_point(feature_id: str, end: datetime, value: str) -> FeatureValue:
+        return FeatureValue(
+            feature_id=feature_id,
+            interval_seconds=300,
+            evaluation_bar_end=end,
+            value_type="price",
+            unit="contract_price",
+            value=Decimal(value),
+            status="KNOWN",
+            reason_code=None,
+            source_bar_record_ids=(),
+            source_dataset_provenance=(),
+            known_at=end,
+        )
+
+    def crossing_decision(current_left: str):
+        return evaluate_rule(
+            crossing_definition,
+            "fixture-cross",
+            {
+                "cross-left": (
+                    crossing_point("cross-left", previous_end, crossing["previous_lhs"]),
+                    crossing_point("cross-left", current_end, current_left),
+                ),
+                "cross-right": (
+                    crossing_point("cross-right", previous_end, crossing["previous_rhs"]),
+                    crossing_point("cross-right", current_end, crossing["current_rhs"]),
+                ),
+            },
+            current_end,
+        )
+
+    crossed_status, crossed_evidence = crossing_decision(crossing["current_lhs"])
+    equality_status, equality_evidence = crossing_decision(crossing["current_rhs"])
+    crossed_root = next(item for item in crossed_evidence if item.node_id == "fixture-cross")
+    equality_root = next(item for item in equality_evidence if item.node_id == "fixture-cross")
+    assert crossed_status == "PASS" and crossed_root.value is True
+    assert equality_status == "FAIL" and equality_root.value is False
+    assert crossed_root.reason_code == "ENTRY_RULE_PASS"
+    assert equality_root.reason_code == "ENTRY_RULE_FAIL"
+    assert tuple(item.node_id for item in crossed_evidence) == ("fixture-cross",)
     projection = {
         "sma3_before_bar3": sma[1].status,
         "sma3_bar3": str(sma[2].value),
@@ -708,8 +775,8 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
         "relative_volume3_before_four_bars": relative[2].status,
         "relative_volume3_bar4": str(relative[3].value),
         "session_vwap_bar2": str(vwap[1].value),
-        "crosses_above": Decimal(10) <= Decimal(10) and Decimal(11) > Decimal(10),
-        "current_equality_would_cross": Decimal(10) < Decimal(10),
+        "crosses_above": crossed_status == "PASS" and crossed_root.value is True,
+        "current_equality_would_cross": (equality_status == "PASS" and equality_root.value is True),
         "gap_breaks_all_consecutive_warmups": all(
             item.continuity_status == "broken_until_reseed"
             for item in step_engine(

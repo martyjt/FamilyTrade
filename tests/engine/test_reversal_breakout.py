@@ -893,11 +893,43 @@ def test_decision_atr_reference_missing_and_atr_off() -> None:
     assert off_snapshot is not None and Decimal(off_snapshot.unit) == Decimal(1)
     future_end = datetime.fromisoformat(given["future_zone_atr"]["bar_end"])
     assert future_end > decision_end
+    future_atr = Decimal(given["future_zone_atr"]["value"])
+    # Wilder n=2: ATR 4.20 followed by a completed zone bar with TR 5.40
+    # produces the frozen future ATR 4.80.  The later completed bar is real
+    # engine input, not merely a timestamp named in the fixture.
+    future_range = 2 * future_atr - atr
+    future_events = tuple(
+        _fixture_bar(
+            on,
+            index,
+            start,
+            open_price="2005",
+            high=str(Decimal(2005) + future_range / 2),
+            low=str(Decimal(2005) - future_range / 2),
+            close="2005",
+        )
+        for index in range(15, 20)
+    )
+    advanced = run_engine(on, future_events, initial_state=on_result.state)
+    completed_future = tuple(
+        item for item in advanced.state.feature_values if item.feature_id == "__ft07_zone_300_atr"
+    )[-1]
+    assert completed_future.evaluation_bar_end == future_end
+    assert completed_future.value == future_atr
+    assert completed_future.known_at >= future_end
+    assert advanced.decisions == () and advanced.intents == ()
+    replayed = run_engine(on, (*events(on), *future_events), initial_state=_seed(on, zone))
+    assert replayed.decisions == on_result.decisions
+    assert replayed.intents == on_result.intents
+    assert replayed.decisions[-1].evidence == on_result.decisions[-1].evidence
+    assert replayed.decisions[-1].order_intent == on_result.decisions[-1].order_intent
+    assert replayed.decisions[-1].evidence.selected_setup == on_snapshot
     assert [
         (
-            f"future ATR {Decimal(given['future_zone_atr']['value']):.2f} is unavailable "
-            "to this decision"
-            if all(item.evaluation_bar_end <= decision_end for item in atr_values)
+            f"future ATR {future_atr:.2f} is unavailable to this decision"
+            if completed_future.evaluation_bar_end > decision_end
+            and replayed.decisions[-1].evidence.selected_setup == on_snapshot
+            and Decimal(on_snapshot.unit) == atr
             else "future ATR entered decision"
         ),
         (
