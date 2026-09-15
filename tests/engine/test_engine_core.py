@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from decimal import Decimal, getcontext
+from pathlib import Path
 
 import pytest
 
@@ -25,19 +27,142 @@ from familytrade.simulation.risk import (
     stop_fraction_quantity,
 )
 from familytrade.simulation.state import (
+    DataQualityEvent,
+    EmissionContext,
     EngineError,
     EngineFailure,
+    FeatureValue,
     UnsupportedConfigurationDetails,
     ZoneState,
 )
-from familytrade.strategies.definitions import ConstantNode, FeatureInstance, FeatureNode, GroupNode
+from familytrade.strategies.definitions import (
+    ConstantNode,
+    FeatureInstance,
+    FeatureNode,
+    FixedTicksStop,
+    FixedTicksTarget,
+    GroupNode,
+    TemporalCompareNode,
+)
 from familytrade.strategies.indicators import confirmed_pivot_index, quantize_feature, swing_regime
 from familytrade.strategies.rules import evaluate_rule
 from familytrade.strategies.setups import r_multiple_target, valid_bracket
 from familytrade.strategies.validation import canonical_definition_sha256
 from familytrade.strategies.zones import next_zone_target
 
-from .conftest import make_bar
+from .conftest import make_backtest_config, make_bar
+
+_FROZEN_PATH = Path(__file__).parents[2] / "docs" / "contracts-examples-v1.json"
+
+
+def _frozen(case_id: str) -> dict[str, object]:
+    payload = _FROZEN_PATH.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c2bd5d31acd8996d0d888ed75e99f320f395b74bc441db0f941201df705c1062"
+    )
+    return next(item for item in json.loads(payload)["cases"] if item["id"] == case_id)
+
+
+def _fixed_trade(
+    *,
+    side: str,
+    stop_ticks: int,
+    target_ticks: int,
+    entry_open: str,
+    entry_high: str,
+    entry_low: str,
+    entry_close: str,
+    exit_open: str,
+    exit_high: str,
+    exit_low: str,
+    exit_close: str,
+):
+    config = make_backtest_config()
+    if side == "short":
+        from .conftest import make_config
+
+        config = config.model_copy(
+            update={"strategy_version": make_config(side="short").strategy_version}
+        )
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+                update={
+                    "stop": FixedTicksStop(kind="fixed_ticks", ticks=stop_ticks),
+                    "target": FixedTicksTarget(kind="fixed_ticks", ticks=target_ticks),
+                }
+            )
+        }
+    )
+    strategy = config.strategy_version.model_copy(
+        update={
+            "definition": definition,
+            "canonical_definition_sha256": canonical_definition_sha256(definition),
+        }
+    )
+    config = config.model_copy(update={"strategy_version": strategy})
+    prefix = tuple(make_bar(config, index) for index in range(5))
+    entry = make_bar(
+        config,
+        5,
+        open_price=entry_open,
+        high=entry_high,
+        low=entry_low,
+        close=entry_close,
+    )
+    exit_bar = make_bar(
+        config,
+        6,
+        open_price=exit_open,
+        high=exit_high,
+        low=exit_low,
+        close=exit_close,
+    )
+    return run_engine(config, (*prefix, entry, exit_bar))
+
+
+def _feature_run(feature: FeatureInstance, bars: tuple[dict[str, str], ...]):
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(update={"features": (feature,)})
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    events = []
+    for index, values in enumerate(bars):
+        close = values["close"]
+        event = make_bar(
+            config,
+            index,
+            open_price=values.get("open", close),
+            high=values.get("high", close),
+            low=values.get("low", close),
+            close=close,
+        )
+        if "volume" in values:
+            event = event.model_copy(
+                update={
+                    "selection": event.selection.model_copy(
+                        update={
+                            "bar": event.selection.bar.model_copy(
+                                update={"volume": Decimal(values["volume"])}
+                            )
+                        }
+                    )
+                }
+            )
+        events.append(event)
+    result = run_engine(config, tuple(events))
+    runtime = next(
+        item for item in result.state.feature_runtime if item.feature_id == feature.feature_id
+    )
+    return config, result, runtime.history
 
 
 def test_deterministic_uuid7_ids_and_state_hashes_match_on_windows_and_linux_vectors() -> None:
@@ -270,6 +395,7 @@ def test_checkpoint_rejects_corruption_config_change_and_unknown_format(config) 
 
 
 def test_market_entry_gap_rejected_by_fill_time_risk() -> None:
+    expected = _frozen("market_entry_gap_rejected_by_fill_time_risk")["expected"]
     for entry, stop in (
         (Decimal("2010.10"), Decimal("1996.90")),
         (Decimal("1989.90"), Decimal("2003.10")),
@@ -281,9 +407,62 @@ def test_market_entry_gap_rejected_by_fill_time_risk() -> None:
             quantity=1,
             commission_rate=Decimal("1.25"),
         ) == Decimal("134.50")
+    from .test_reversal_breakout import _bars, _configured, _seed, _zone
+
+    for side, kind, zone_bounds, signal_prices, gap_prices in (
+        (
+            "long",
+            "support",
+            ("1996", "2000"),
+            {"low": "1999", "high": "2001", "close": "2000"},
+            {"open_price": "2010", "low": "2009", "high": "2011", "close": "2010"},
+        ),
+        (
+            "short",
+            "resistance",
+            ("2010", "2016"),
+            {"low": "2009", "high": "2011", "close": "2010"},
+            {"open_price": "2000", "low": "1999", "high": "2001", "close": "2000"},
+        ),
+    ):
+        config = _configured(sides=side, breakout=False, reversal=True)
+        initial = _seed(
+            config,
+            _zone(kind=kind, low=zone_bounds[0], high=zone_bounds[1]),
+        )
+        entered = run_engine(config, _bars(config, 0, 5, **signal_prices), initial_state=initial)
+        waiting = step_engine(config, entered.state, make_bar(config, 5))
+        rejected = step_engine(config, waiting.state, make_bar(config, 6, **gap_prices))
+        side_expected = expected[side]
+        assert len(rejected.fills) == side_expected["entry_fill_count"]
+        assert rejected.state.pending_entry is None
+        assert any(
+            event.payload.get("reason") == side_expected["reason"] for event in rejected.events
+        )
+        assert rejected.state.cash == Decimal(side_expected["cash"])
 
 
 def test_long_target_gap_price_improvement() -> None:
+    expected = _frozen("long_target_gap_price_improvement")["expected"]
+    engine = _fixed_trade(
+        side="long",
+        stop_ticks=77,
+        target_ticks=25,
+        entry_open="2002.4",
+        entry_high="2003",
+        entry_low="2002",
+        entry_close="2002.5",
+        exit_open="2005.5",
+        exit_high="2006",
+        exit_low="2005",
+        exit_close="2005.8",
+    )
+    assert [item.fill_price for item in engine.fills] == [
+        Decimal(item) for item in expected["fills"]
+    ]
+    assert engine.state.fees == Decimal(expected["fees"])
+    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
+    assert engine.state.cash == Decimal(expected["cash"])
     result = protective_fill(
         position_side="long",
         stop=Decimal("1994.8"),
@@ -301,6 +480,26 @@ def test_long_target_gap_price_improvement() -> None:
 
 
 def test_short_target_gap_price_improvement() -> None:
+    expected = _frozen("short_target_gap_price_improvement")["expected"]
+    engine = _fixed_trade(
+        side="short",
+        stop_ticks=57,
+        target_ticks=25,
+        entry_open="2008.1",
+        entry_high="2008.5",
+        entry_low="2007.5",
+        entry_close="2008",
+        exit_open="2005",
+        exit_high="2005.4",
+        exit_low="2004.8",
+        exit_close="2005.1",
+    )
+    assert [item.fill_price for item in engine.fills] == [
+        Decimal(item) for item in expected["fills"]
+    ]
+    assert engine.state.fees == Decimal(expected["fees"])
+    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
+    assert engine.state.cash == Decimal(expected["cash"])
     result = protective_fill(
         position_side="short",
         stop=Decimal("2013.7"),
@@ -316,6 +515,24 @@ def test_short_target_gap_price_improvement() -> None:
 
 
 def test_both_hit_after_open_fill_is_stop_first() -> None:
+    expected = _frozen("both_hit_after_open_fill_is_stop_first")["expected"]
+    engine = _fixed_trade(
+        side="long",
+        stop_ticks=21,
+        target_ticks=19,
+        entry_open="2000",
+        entry_high="2001",
+        entry_low="1999",
+        entry_close="2000",
+        exit_open="2000",
+        exit_high="2003",
+        exit_low="1997",
+        exit_close="2001",
+    )
+    assert engine.fills[-1].reason == "BOTH_HIT_STOP_FIRST"
+    assert engine.state.position is None and engine.state.fees == Decimal(expected["fees"])
+    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
+    assert engine.state.cash == Decimal(expected["cash"])
     result = protective_fill(
         position_side="long",
         stop=Decimal(1998),
@@ -373,6 +590,7 @@ def test_limit_market_ttl_gap_and_entry_bar_precedence_matrix_is_exhaustive() ->
 
 
 def test_indicator_warmup_equality_and_causal_catalogue() -> None:
+    expected = _frozen("indicator_warmup_equality_and_causal_catalogue")["expected"]
     original = getcontext().prec
     getcontext().prec = 4
     try:
@@ -380,6 +598,91 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
         assert quantize_feature(Decimal("2.333333333333333")) == Decimal("2.333333333333")
     finally:
         getcontext().prec = original
+
+    def feature(feature_id: str, name: str, parameters: dict[str, object]) -> FeatureInstance:
+        unit = (
+            "ratio_0_100"
+            if name == "rsi_wilder_v1"
+            else "ratio"
+            if name == "relative_volume_v1"
+            else "contract_price"
+        )
+        return FeatureInstance(
+            feature_id=feature_id,
+            kind="indicator",
+            name=name,
+            output_type="decimal",
+            unit=unit,  # type: ignore[arg-type]
+            interval_seconds=60,
+            parameters=parameters,
+        )
+
+    closes = tuple({"close": str(value)} for value in (1, 2, 3, 4))
+    sma_config, sma_result, sma = _feature_run(
+        feature("sma", "sma_v1", {"n": 3, "input": "close"}), closes
+    )
+    _, _, ema = _feature_run(feature("ema", "ema_v1", {"n": 3, "input": "close"}), closes)
+    _, _, rsi = _feature_run(
+        feature("rsi", "rsi_wilder_v1", {"n": 3}),
+        tuple({"close": value} for value in ("10", "11", "11", "10")),
+    )
+    _, _, atr = _feature_run(
+        feature("atr", "atr_wilder_v1", {"n": 3}),
+        (
+            {"high": "12", "low": "10", "close": "11"},
+            {"high": "13", "low": "10", "close": "12"},
+            {"high": "14", "low": "12", "close": "13"},
+        ),
+    )
+    _, _, relative = _feature_run(
+        feature("rv", "relative_volume_v1", {"n": 3}),
+        tuple({"close": "10", "volume": value} for value in ("100", "200", "300", "300")),
+    )
+    _, _, vwap = _feature_run(
+        feature("vwap", "session_vwap_v1", {}),
+        (
+            {"close": "10", "volume": "100"},
+            {"close": "12", "volume": "300"},
+        ),
+    )
+    projection = {
+        "sma3_before_bar3": sma[1].status,
+        "sma3_bar3": str(sma[2].value),
+        "ema3_before_bar3": ema[1].status,
+        "ema3_bar4": str(ema[3].value),
+        "rsi3_before_four_closes": rsi[2].status,
+        "rsi3_bar4": str(rsi[3].value),
+        "atr3_before_bar3": atr[1].status,
+        "atr3_bar3": str(atr[2].value),
+        "relative_volume3_before_four_bars": relative[2].status,
+        "relative_volume3_bar4": str(relative[3].value),
+        "session_vwap_bar2": str(vwap[1].value),
+        "crosses_above": Decimal(10) <= Decimal(10) and Decimal(11) > Decimal(10),
+        "current_equality_would_cross": Decimal(10) < Decimal(10),
+        "gap_breaks_all_consecutive_warmups": all(
+            item.continuity_status == "broken_until_reseed"
+            for item in step_engine(
+                sma_config,
+                sma_result.state,
+                DataQualityEvent(
+                    kind="data_quality_v1",
+                    start_at=make_bar(sma_config, 4).selection.bar.start_at,
+                    end_at=make_bar(sma_config, 4).selection.bar.end_at,
+                    status="missing",
+                    reason="NO_BAR",
+                    source_bar_record_ids=(),
+                    recorded_at=make_bar(sma_config, 4).selection.bar.end_at,
+                    emission_context=EmissionContext(
+                        attempt_id=None,
+                        fencing_token=1,
+                        order_submitted_at=make_bar(sma_config, 4).selection.bar.end_at,
+                        output_recorded_at=make_bar(sma_config, 4).selection.bar.end_at,
+                    ),
+                ),
+            ).state.feature_runtime
+        ),
+    }
+    assert projection == expected
 
 
 def test_rules_only_entry_fill_after_checkpoint_retains_originating_entry_decision(config) -> None:
@@ -551,6 +854,74 @@ def test_rule_result_known_pass_fail_reason_projection_by_context(config) -> Non
         assert all(
             item.known_at == anchor and item.source_bar_record_ids == () for item in evidence
         )
+    numeric_features = (
+        FeatureInstance(
+            feature_id="fast-feature",
+            kind="input",
+            name="close",
+            output_type="price",
+            unit="contract_price",
+            interval_seconds=300,
+            parameters={},
+        ),
+        FeatureInstance(
+            feature_id="slow-feature",
+            kind="input",
+            name="close",
+            output_type="price",
+            unit="contract_price",
+            interval_seconds=300,
+            parameters={},
+        ),
+    )
+    temporal = definition.model_copy(
+        update={
+            "features": numeric_features,
+            "nodes": (
+                FeatureNode(
+                    kind="feature", node_id="fast-node", feature_id="fast-feature", offset=0
+                ),
+                FeatureNode(
+                    kind="feature", node_id="slow-node", feature_id="slow-feature", offset=0
+                ),
+                TemporalCompareNode(
+                    kind="temporal_compare",
+                    node_id="cross",
+                    op="crosses_above",
+                    left_feature="fast-node",
+                    right_feature="slow-node",
+                ),
+            ),
+        }
+    )
+
+    def point(feature_id: str, minute: int, value: str) -> FeatureValue:
+        known = datetime(2026, 1, 2, 3, minute, tzinfo=UTC)
+        return FeatureValue(
+            feature_id=feature_id,
+            interval_seconds=300,
+            evaluation_bar_end=known,
+            value_type="price",
+            unit="contract_price",
+            value=Decimal(value),
+            status="KNOWN",
+            reason_code=None,
+            source_bar_record_ids=(),
+            source_dataset_provenance=(),
+            known_at=known,
+        )
+
+    crossing_status, crossing_evidence = evaluate_rule(
+        temporal,
+        "cross",
+        {
+            "fast-feature": (point("fast-feature", 0, "1"), point("fast-feature", 5, "3")),
+            "slow-feature": (point("slow-feature", 0, "2"), point("slow-feature", 5, "2")),
+        },
+        anchor,
+    )
+    assert crossing_status == "PASS"
+    assert crossing_evidence[0].node_id == "cross" and crossing_evidence[0].value is True
 
 
 def test_rule_result_unknown_dependency_and_group_precedence(config) -> None:
@@ -655,6 +1026,7 @@ def test_rule_result_all_any_none_truth_reason_matrix(config) -> None:
 
 
 def test_confirmed_pivot_plateau_and_regime_availability() -> None:
+    _frozen("confirmed_pivot_plateau_and_regime_availability")
     highs = tuple(Decimal(item) for item in ("10", "15", "15", "14", "13", "12"))
     assert confirmed_pivot_index(highs[:4], candidate_index=2, left=2, right=2, high=True) is None
     assert confirmed_pivot_index(highs[:5], candidate_index=2, left=2, right=2, high=True) == 2
@@ -679,6 +1051,9 @@ def test_confirmed_pivot_plateau_and_regime_availability() -> None:
 
 
 def test_pivot_confirmation_lag() -> None:
+    from .test_reversal_breakout import _bars, _case, _configured
+
+    _case("pivot_confirmation_lag")
     highs = tuple(Decimal(item) for item in ("10", "15", "15", "14", "13"))
     for observed in range(3, 5):
         result = confirmed_pivot_index(
@@ -686,9 +1061,49 @@ def test_pivot_confirmation_lag() -> None:
         )
         assert result is None
     assert confirmed_pivot_index(highs, candidate_index=2, left=2, right=2, high=True) == 2
+    config = _configured(breakout=False, reversal=False, sides="long")
+    first = run_engine(
+        config,
+        _bars(config, 0, 5, open_price="9", high="10", low="8", close="9"),
+    )
+    second = run_engine(
+        config,
+        _bars(config, 5, 10, open_price="10", high="15", low="9", close="10"),
+        initial_state=first.state,
+    )
+    assert second.state.zones == ()
+    third = run_engine(
+        config,
+        _bars(config, 10, 15, open_price="8", high="12", low="7", close="8"),
+        initial_state=second.state,
+    )
+    resistance = next(zone for zone in third.state.zones if zone.kind == "resistance")
+    assert resistance.high == Decimal(15)
+    assert resistance.pivot_bar_end == make_bar(config, 9).selection.bar.end_at
+    assert resistance.confirmation_bar_end == make_bar(config, 14).selection.bar.end_at
 
 
 def test_long_entry_then_stop_gap() -> None:
+    expected = _frozen("long_entry_then_stop_gap")["expected"]
+    engine = _fixed_trade(
+        side="long",
+        stop_ticks=77,
+        target_ticks=25,
+        entry_open="2002.4",
+        entry_high="2003",
+        entry_low="2002",
+        entry_close="2002.5",
+        exit_open="1994",
+        exit_high="1994.5",
+        exit_low="1993.5",
+        exit_close="1994.2",
+    )
+    assert [item.fill_price for item in engine.fills] == [
+        Decimal(item) for item in expected["fills"]
+    ]
+    assert engine.state.fees == Decimal(expected["fees"])
+    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
+    assert engine.state.cash == Decimal(expected["cash"])
     result = protective_fill(
         position_side="long",
         stop=Decimal("1994.8"),
@@ -709,6 +1124,26 @@ def test_long_entry_then_stop_gap() -> None:
 
 
 def test_short_entry_then_stop_gap() -> None:
+    expected = _frozen("short_entry_then_stop_gap")["expected"]
+    engine = _fixed_trade(
+        side="short",
+        stop_ticks=57,
+        target_ticks=25,
+        entry_open="2008.1",
+        entry_high="2008.5",
+        entry_low="2007.5",
+        entry_close="2008",
+        exit_open="2014.2",
+        exit_high="2014.5",
+        exit_low="2013.5",
+        exit_close="2014",
+    )
+    assert [item.fill_price for item in engine.fills] == [
+        Decimal(item) for item in expected["fills"]
+    ]
+    assert engine.state.fees == Decimal(expected["fees"])
+    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
+    assert engine.state.cash == Decimal(expected["cash"])
     result = protective_fill(
         position_side="short",
         stop=Decimal("2013.7"),
@@ -729,6 +1164,7 @@ def test_short_entry_then_stop_gap() -> None:
 
 
 def test_intrabar_entry_with_stop_and_target_is_conservative_stop() -> None:
+    expected = _frozen("intrabar_entry_with_stop_and_target_is_conservative_stop")["expected"]
     fill = limit_fill(
         side="buy",
         limit=Decimal(2000),
@@ -750,6 +1186,33 @@ def test_intrabar_entry_with_stop_and_target_is_conservative_stop() -> None:
     )
     assert result is not None
     assert (result.reason, result.fill_price) == ("BOTH_HIT_STOP_FIRST", Decimal("1997.9"))
+    from .test_reversal_breakout import _bars, _configured, _seed, _zone
+
+    config = _configured(sides="long")
+    initial = _seed(config, _zone(kind="support", low="1998.8", high="1999.5"))
+    armed = run_engine(
+        config,
+        _bars(config, 0, 5, open_price="2002", high="2003", low="2001", close="2002"),
+        initial_state=initial,
+    )
+    entered = run_engine(
+        config,
+        _bars(config, 5, 10, open_price="2001", high="2002", low="1999.9", close="2001"),
+        initial_state=armed.state,
+    )
+    waiting = step_engine(config, entered.state, make_bar(config, 10))
+    same_bar = step_engine(
+        config,
+        waiting.state,
+        make_bar(config, 11, open_price="2001", high="2003", low="1997", close="2002"),
+    )
+    assert [fill.reason for fill in same_bar.fills] == [
+        "LIMIT_ENTRY_TOUCH",
+        "ENTRY_BAR_CONSERVATIVE_STOP",
+    ]
+    assert same_bar.state.cash == Decimal(expected["default"]["cash"])
+    assert same_bar.state.fees == Decimal(expected["default"]["fees"])
+    assert same_bar.state.position is None
 
 
 def _zone(identifier: str, kind: str, low: str, high: str, sequence: int) -> ZoneState:
@@ -772,6 +1235,7 @@ def _zone(identifier: str, kind: str, low: str, high: str, sequence: int) -> Zon
 
 
 def test_next_zone_targets_long_short_and_missing() -> None:
+    expected = _frozen("next_zone_targets_long_short_and_missing")["expected"]
     zones = (
         _zone("018f4c00-0000-7000-8000-000000000101", "resistance", "2005", "2006", 10),
         _zone("018f4c00-0000-7000-8000-000000000102", "resistance", "2003", "2004", 8),
@@ -781,9 +1245,46 @@ def test_next_zone_targets_long_short_and_missing() -> None:
     assert next_zone_target(zones, side="long", entry=Decimal(2000)) == Decimal(2003)
     assert next_zone_target(zones, side="short", entry=Decimal(2010)) == Decimal(2008)
     assert next_zone_target(zones, side="long", entry=Decimal(2020)) is None
+    from .test_reversal_breakout import _bars, _configured, _seed
+    from .test_reversal_breakout import _zone as setup_zone
+
+    config = _configured(sides="long", target_mode="next_zone")
+    initial = _seed(
+        config,
+        setup_zone(kind="support", low="2000", high="2000.5", sequence=0),
+        setup_zone(kind="resistance", low="2003", high="2004", sequence=1),
+    )
+    armed = run_engine(
+        config,
+        _bars(config, 0, 5, open_price="2005", high="2006", low="2004", close="2005"),
+        initial_state=initial,
+    )
+    snapshot = armed.decisions[-1].evidence.selected_setup
+    assert snapshot is not None and snapshot.target == Decimal(expected["long_target"])
+    later_zone = setup_zone(kind="resistance", low="2002", high="2002.5", sequence=2)
+    changed = armed.state.model_copy(update={"zones": (*armed.state.zones, later_zone)})
+    entered = run_engine(
+        config,
+        _bars(config, 5, 10, open_price="2002", high="2003", low="2000.9", close="2002"),
+        initial_state=changed,
+    )
+    assert entered.decisions[-1].evidence.selected_setup.target == Decimal(expected["long_target"])
+    missing_initial = _seed(
+        config, setup_zone(kind="support", low="2000", high="2000.5", sequence=0)
+    )
+    missing = run_engine(
+        config,
+        _bars(config, 0, 5, open_price="2005", high="2006", low="2004", close="2005"),
+        initial_state=missing_initial,
+    )
+    assert (missing.decisions[-1].reason_code, len(missing.intents)) == (
+        expected["no_target_reason"],
+        expected["no_target_order_count"],
+    )
 
 
 def test_r_multiple_targets_long_short() -> None:
+    _frozen("r_multiple_targets_long_short")
     assert r_multiple_target(
         side="long",
         entry=Decimal(2000),
@@ -801,6 +1302,7 @@ def test_r_multiple_targets_long_short() -> None:
 
 
 def test_favorable_limit_gaps_revalidate_bracket_both_sides() -> None:
+    expected = _frozen("favorable_limit_gaps_revalidate_bracket_both_sides")["expected"]
     long_fill = limit_fill(
         side="buy",
         limit=Decimal(2000),
@@ -825,6 +1327,39 @@ def test_favorable_limit_gaps_revalidate_bracket_both_sides() -> None:
     assert short_fill is not None and not valid_bracket(
         side="short", entry=short_fill[1], stop=Decimal(2012), target=Decimal(2008)
     )
+    from .test_reversal_breakout import _bars, _configured, _seed, _zone
+
+    for side, kind, bounds, arm_prices, retest_prices, gap_prices in (
+        (
+            "long",
+            "support",
+            ("2000", "2000.5"),
+            {"low": "2004", "high": "2006", "close": "2005"},
+            {"low": "2000.9", "high": "2004", "close": "2003"},
+            {"open_price": "1997", "low": "1996", "high": "2001", "close": "1998"},
+        ),
+        (
+            "short",
+            "resistance",
+            ("2010", "2010.5"),
+            {"low": "2005", "high": "2007", "close": "2005.5"},
+            {"low": "2007", "high": "2009.6", "close": "2008"},
+            {"open_price": "2013", "low": "2009", "high": "2014", "close": "2012"},
+        ),
+    ):
+        config = _configured(sides=side)
+        initial = _seed(config, _zone(kind=kind, low=bounds[0], high=bounds[1]))
+        armed = run_engine(config, _bars(config, 0, 5, **arm_prices), initial_state=initial)
+        entered = run_engine(
+            config, _bars(config, 5, 10, **retest_prices), initial_state=armed.state
+        )
+        waiting = step_engine(config, entered.state, make_bar(config, 10))
+        rejected = step_engine(config, waiting.state, make_bar(config, 11, **gap_prices))
+        assert rejected.fills == () and rejected.state.pending_entry is None
+        assert any(
+            event.payload.get("reason") == expected[side]["reason"] for event in rejected.events
+        )
+        assert rejected.state.fees == Decimal(expected[side]["commission"])
 
 
 def _fill_interval_config(config, fill: int, execution: int):

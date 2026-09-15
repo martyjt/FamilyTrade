@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar, Literal, NoReturn, cast
@@ -44,20 +45,28 @@ from familytrade.simulation.state import (
     MarkEvidence,
     OrderIntent,
     OrderState,
+    PivotAccumulator,
     PositionState,
     ProtectiveBracketState,
     ProtectiveOrderState,
     RiskState,
     RunEvent,
+    SetupSnapshot,
+    SetupState,
     SourceDatasetProvenance,
+    ZoneState,
 )
 from familytrade.simulation.state import (
     EngineErrorCode as EngineErrorCodeType,
 )
 from familytrade.strategies.definitions import (
     AtrMultipleStop,
+    BreakoutRetestSetup,
+    ConfirmedPivotZonesSetup,
+    FeatureInstance,
     FixedTicksStop,
     FixedTicksTarget,
+    ReversalSetup,
     RiskMultipleTarget,
 )
 from familytrade.strategies.indicators import (
@@ -67,12 +76,111 @@ from familytrade.strategies.indicators import (
     initial_runtime,
 )
 from familytrade.strategies.rules import evaluate_rule
+from familytrade.strategies.setups import (
+    breakout_confirmed,
+    breakout_geometry,
+    breakout_is_expired,
+    cooldown_allows,
+    directional_approach,
+    r_multiple_target,
+    recent_peak_stop,
+    retested,
+    select_candidate,
+    valid_bracket,
+)
 from familytrade.strategies.validation import canonical_definition_sha256
+from familytrade.strategies.zones import merge_candidate, nearest_zone, next_zone_target
 
 _EVENT_ADAPTER: TypeAdapter[EngineInputEvent] = TypeAdapter(
     EngineInputEvent, config={"strict": True}
 )
 _TERMINAL = {"FINISHED", "STOPPED", "BLOCKED_UNCLOSED", "BLOCKED_EXPIRY_UNRESOLVED"}
+
+
+@dataclass(frozen=True, slots=True)
+class _SetupAction:
+    decision_type: str
+    reason: str
+    side: str | None
+    snapshot: SetupSnapshot | None
+    results: tuple[Any, ...] = ()
+
+
+def _internal_features(config: EngineConfig) -> tuple[FeatureInstance, ...]:
+    """Materialize setup-only causal inputs in the same checkpointed feature runtime."""
+    definition = config.strategy_version.definition
+    result: list[FeatureInstance] = []
+    for module in definition.setup_modules:
+        if not isinstance(module, ConfirmedPivotZonesSetup):
+            continue
+        prefix = f"__ft07_zone_{module.zone_interval_seconds}"
+        result.extend(
+            (
+                FeatureInstance(
+                    feature_id=f"{prefix}_atr",
+                    kind="indicator",
+                    name="atr_wilder_v1",
+                    output_type="decimal",
+                    unit="contract_price",
+                    interval_seconds=module.zone_interval_seconds,
+                    parameters={"n": module.atr_length},
+                ),
+                FeatureInstance(
+                    feature_id=f"{prefix}_pivot_high",
+                    kind="structure",
+                    name="confirmed_pivot_v1",
+                    output_type="level",
+                    unit="contract_price",
+                    interval_seconds=module.zone_interval_seconds,
+                    parameters={
+                        "pivot_kind": "high",
+                        "left": module.pivot_left,
+                        "right": module.pivot_right,
+                    },
+                ),
+                FeatureInstance(
+                    feature_id=f"{prefix}_pivot_low",
+                    kind="structure",
+                    name="confirmed_pivot_v1",
+                    output_type="level",
+                    unit="contract_price",
+                    interval_seconds=module.zone_interval_seconds,
+                    parameters={
+                        "pivot_kind": "low",
+                        "left": module.pivot_left,
+                        "right": module.pivot_right,
+                    },
+                ),
+            )
+        )
+    execution = config.strategy_version.execution_interval_seconds
+    if any(
+        isinstance(module, (ReversalSetup, BreakoutRetestSetup)) and module.enabled
+        for module in definition.setup_modules
+    ):
+        for name, output_type, unit in (
+            ("low", "price", "contract_price"),
+            ("high", "price", "contract_price"),
+            ("close", "price", "contract_price"),
+            ("session_vwap_v1", "decimal", "contract_price"),
+        ):
+            result.append(
+                FeatureInstance(
+                    feature_id=f"__ft07_exec_{name}",
+                    kind="indicator" if name.endswith("_v1") else "input",
+                    name=name,
+                    output_type=cast(Any, output_type),
+                    unit=cast(Any, unit),
+                    interval_seconds=execution,
+                    parameters={},
+                )
+            )
+    configured = {item.feature_id for item in definition.features}
+    return tuple(item for item in result if item.feature_id not in configured)
+
+
+def _all_features(config: EngineConfig) -> tuple[FeatureInstance, ...]:
+    return (*config.strategy_version.definition.features, *_internal_features(config))
 
 
 class EngineErrorCode:
@@ -489,7 +597,7 @@ def initialize_engine(config: EngineConfig) -> EngineState:
     snapshot = _config_snapshot(config)
     runtimes = tuple(
         sorted(
-            (initial_runtime(feature) for feature in config.strategy_version.definition.features),
+            (initial_runtime(feature) for feature in _all_features(config)),
             key=lambda item: item.feature_id,
         )
     )
@@ -1312,6 +1420,39 @@ def _current_bucket_selections(
     return bar.selections
 
 
+def _settle_setup_order(
+    state: EngineState, order: OrderState, *, filled: bool, reason: str
+) -> EngineState:
+    setup_id = order.source_setup_id
+    if setup_id is None:
+        return state
+    setups = tuple(
+        item.model_copy(
+            update={
+                "status": "POSITION_OPEN" if filled else "CANCELLED",
+                "reason_code": reason,
+            }
+        )
+        if item.snapshot is not None and item.snapshot.setup_id == setup_id
+        else item
+        for item in state.setups
+    )
+    zones = state.zones
+    if filled:
+        zones = tuple(
+            zone.model_copy(update={"last_filled_execution_index": state.last_execution_slot_index})
+            if any(
+                item.snapshot is not None
+                and item.snapshot.setup_id == setup_id
+                and zone.zone_id in item.snapshot.source_zone_ids
+                for item in setups
+            )
+            else zone
+            for zone in zones
+        )
+    return state.model_copy(update={"setups": setups, "zones": zones})
+
+
 def _entry_bracket_prices(
     config: EngineConfig, order: OrderState | None, entry: Decimal, side: str
 ) -> tuple[Decimal, Decimal]:
@@ -1643,6 +1784,7 @@ def _process_fill_bar(
                 update={"status": "EXPIRED", "status_reason": "ORDER_EXPIRED"}
             )
             state = state.model_copy(update={"pending_entry": None})
+            state = _settle_setup_order(state, order, filled=False, reason="ORDER_EXPIRED")
             state, emitted = _order_transition(
                 config,
                 state,
@@ -1662,6 +1804,7 @@ def _process_fill_bar(
                 update={"status": "CANCELLED", "status_reason": "ENTRY_WINDOW_CLOSED"}
             )
             state = state.model_copy(update={"pending_entry": None})
+            state = _settle_setup_order(state, order, filled=False, reason="ENTRY_WINDOW_CLOSED")
             state, emitted = _order_transition(
                 config,
                 state,
@@ -1708,6 +1851,9 @@ def _process_fill_bar(
                         }
                     )
                     state = state.model_copy(update={"pending_entry": None})
+                    state = _settle_setup_order(
+                        state, order, filled=False, reason="ENTRY_WINDOW_CLOSED"
+                    )
                     state, emitted = _order_transition(
                         config,
                         state,
@@ -1754,6 +1900,7 @@ def _process_fill_bar(
                         update={"status": "CANCELLED", "status_reason": reason}
                     )
                     state = state.model_copy(update={"pending_entry": None})
+                    state = _settle_setup_order(state, order, filled=False, reason=reason)
                     state, emitted = _order_transition(
                         config,
                         state,
@@ -1789,6 +1936,7 @@ def _process_fill_bar(
                         }
                     )
                     state = state.model_copy(update={"pending_entry": None})
+                    state = _settle_setup_order(state, order, filled=True, reason=fill.reason)
                     fills.append(fill)
                     evidence.append(fill_ev)
                     bracket = cast(PositionState, state.position).protective_bracket
@@ -2189,6 +2337,570 @@ def _mark(
     )
 
 
+def _setup_unit(config: EngineConfig, state: EngineState, bar: FeatureBar) -> Decimal | None:
+    zone_module = next(
+        (
+            item
+            for item in config.strategy_version.definition.setup_modules
+            if isinstance(item, ConfirmedPivotZonesSetup)
+        ),
+        None,
+    )
+    if zone_module is None or not zone_module.use_atr:
+        return Decimal(1)
+    feature_id = f"__ft07_zone_{zone_module.zone_interval_seconds}_atr"
+    runtime = next(item for item in state.feature_runtime if item.feature_id == feature_id)
+    value = next(
+        (item for item in reversed(runtime.history) if item.evaluation_bar_end <= bar.end_at),
+        None,
+    )
+    return value.value if value and isinstance(value.value, Decimal) and value.value > 0 else None
+
+
+def _setup_target(
+    config: EngineConfig,
+    zones: tuple[ZoneState, ...],
+    *,
+    side: str,
+    entry: Decimal,
+    stop: Decimal,
+    mode: str,
+    measured_origin: Decimal,
+    measured_impulse: Decimal,
+    measured_multiple: str,
+    risk_multiple: str,
+) -> tuple[Decimal | None, str | None]:
+    target: Decimal | None
+    if mode == "next_zone":
+        target = next_zone_target(zones, side=side, entry=entry)
+        if target is None:
+            return None, "NO_TARGET_ZONE"
+    elif mode == "r_multiple":
+        target = r_multiple_target(
+            side=side,
+            entry=entry,
+            stop=stop,
+            multiple=Decimal(risk_multiple),
+            tick=config.contract.tick_size,
+        )
+    else:
+        direction = Decimal(1) if side == "long" else Decimal(-1)
+        target = measured_origin + direction * measured_impulse * Decimal(measured_multiple)
+        target = tick_round(
+            target,
+            config.contract.tick_size,
+            role="target",
+            side="sell" if side == "long" else "buy",
+        )
+    if target <= entry if side == "long" else target >= entry:
+        return None, "INVALID_TARGET_DISTANCE"
+    return target, None
+
+
+def _snapshot(
+    config: EngineConfig,
+    state: EngineState,
+    bar: FeatureBar,
+    *,
+    family: str,
+    side: str,
+    zone: ZoneState,
+    arm_index: int | None,
+    signal_index: int | None,
+    unit: Decimal,
+    entry: Decimal,
+    stop: Decimal,
+    target: Decimal,
+    target_mode: str,
+) -> SetupSnapshot:
+    sequence = state.next_setup_sequence
+    frozen = tuple(
+        sorted(
+            (value for value in state.feature_values if value.evaluation_bar_end <= bar.end_at),
+            key=lambda item: item.feature_id,
+        )
+    )
+    sources = tuple(
+        dict.fromkeys(
+            (
+                *zone.source_bar_record_ids,
+                *tuple(source for value in frozen for source in value.source_bar_record_ids),
+                *bar.source_bar_record_ids,
+            )
+        )
+    )
+    by_id = {
+        item.bar_record_id: item
+        for item in (
+            *zone.source_dataset_provenance,
+            *tuple(p for value in frozen for p in value.source_dataset_provenance),
+            *bar.source_dataset_provenance,
+        )
+    }
+    known_at = max((bar.known_at, zone.known_at, *(value.known_at for value in frozen)))
+    setup_id = deterministic_uuid7(
+        "setup",
+        known_at,
+        (
+            config.run_id,
+            config.lane_id,
+            sequence,
+            family,
+            side,
+            (zone.zone_id,),
+            arm_index,
+            signal_index,
+        ),
+    )
+    return SetupSnapshot(
+        setup_id=setup_id,
+        family=cast(Any, family),
+        side=cast(Any, side),
+        setup_sequence=sequence,
+        source_zone_ids=(zone.zone_id,),
+        arm_execution_index=arm_index,
+        signal_execution_index=signal_index,
+        unit=str(unit),
+        entry=entry,
+        stop=stop,
+        target=target,
+        target_mode=target_mode,
+        frozen_feature_values=frozen,
+        source_bar_record_ids=sources,
+        source_dataset_provenance=tuple(by_id[source] for source in sources if source in by_id),
+        known_at=known_at,
+    )
+
+
+def _filter_result(
+    config: EngineConfig,
+    state: EngineState,
+    root: str | None,
+    anchor: datetime,
+) -> tuple[str, tuple[Any, ...]]:
+    if root is None:
+        return "PASS", ()
+    histories = {runtime.feature_id: runtime.history for runtime in state.feature_runtime}
+    return evaluate_rule(
+        config.strategy_version.definition,
+        root,
+        histories,
+        anchor,
+        context="setup_filter",
+    )
+
+
+def _setup_action(config: EngineConfig, state: EngineState, bar: FeatureBar) -> _SetupAction:
+    definition = config.strategy_version.definition
+    zone_module = next(
+        (item for item in definition.setup_modules if isinstance(item, ConfirmedPivotZonesSetup)),
+        None,
+    )
+    execution_index = cast(int, state.last_execution_slot_index)
+    if zone_module is None:
+        return _SetupAction("HOLD", "NO_ELIGIBLE_ZONE", None, None)
+    armed = next(
+        (
+            item
+            for item in state.setups
+            if item.module_kind == "breakout_retest_v1" and item.status == "ARMED"
+        ),
+        None,
+    )
+    breakout_module = next(
+        (
+            item
+            for item in definition.setup_modules
+            if isinstance(item, BreakoutRetestSetup) and item.enabled
+        ),
+        None,
+    )
+    if armed is not None and armed.snapshot is not None and breakout_module is not None:
+        snapshot = armed.snapshot
+        if breakout_is_expired(
+            arm_index=cast(int, snapshot.arm_execution_index),
+            current_index=execution_index,
+            expiry_bars=breakout_module.setup_expiry_execution_bars,
+        ):
+            return _SetupAction("CANCEL", "SETUP_EXPIRED", snapshot.side, snapshot)
+        if execution_index > cast(int, snapshot.arm_execution_index) and retested(
+            side=snapshot.side, low=bar.low, high=bar.high, entry=snapshot.entry
+        ):
+            status, results = _filter_result(
+                config, state, breakout_module.entry_filter_root, bar.known_at
+            )
+            if status != "PASS":
+                return _SetupAction(
+                    "REJECT",
+                    "FILTER_UNKNOWN" if status == "UNKNOWN" else "FILTER_FAIL",
+                    snapshot.side,
+                    snapshot,
+                    results,
+                )
+            signaled = snapshot.model_copy(update={"signal_execution_index": execution_index})
+            return _SetupAction(
+                "ENTRY",
+                "ENTRY_INTENT_LONG" if snapshot.side == "long" else "ENTRY_INTENT_SHORT",
+                snapshot.side,
+                signaled,
+                results,
+            )
+        return _SetupAction("HOLD", "NOT_RETESTED", snapshot.side, snapshot)
+
+    unit = _setup_unit(config, state, bar)
+    if unit is None:
+        return _SetupAction("HOLD", "NOT_READY_ATR", None, None)
+    eligible = tuple(
+        zone
+        for zone in state.zones
+        if zone.touch_count >= zone_module.minimum_touches
+        and cooldown_allows(
+            last_fill_index=zone.last_filled_execution_index,
+            current_index=execution_index,
+            cooldown_bars=zone_module.cooldown_execution_bars,
+        )
+    )
+    fallback_reason = "NO_ELIGIBLE_ZONE"
+    actionable_failure = False
+    candidates: list[SetupSnapshot] = []
+    candidate_results: dict[str, tuple[Any, ...]] = {}
+    previous_close_runtime = next(
+        (item for item in state.feature_runtime if item.feature_id == "__ft07_exec_close"), None
+    )
+    previous_close = (
+        previous_close_runtime.history[-2].value
+        if previous_close_runtime is not None
+        and len(previous_close_runtime.history) >= 2
+        and isinstance(previous_close_runtime.history[-2].value, Decimal)
+        else bar.close
+    )
+    for module in definition.setup_modules:
+        if isinstance(module, ReversalSetup) and module.enabled:
+            for side, kind in (("long", "support"), ("short", "resistance")):
+                if module.sides not in {side, "both"}:
+                    continue
+                zone = nearest_zone(eligible, price=bar.close, kind=kind)
+                if zone is None:
+                    continue
+                boundary = zone.high if side == "long" else zone.low
+                if abs(bar.close - boundary) > Decimal(module.approach_multiple) * unit:
+                    continue
+                if module.require_directional_approach and not directional_approach(
+                    side=side,
+                    previous_close=previous_close,
+                    close=bar.close,
+                    zone_low=zone.low,
+                    zone_high=zone.high,
+                ):
+                    fallback_reason = "NOT_APPROACHING"
+                    continue
+                status, results = _filter_result(config, state, module.filter_root, bar.known_at)
+                if status != "PASS":
+                    fallback_reason = "FILTER_UNKNOWN" if status == "UNKNOWN" else "FILTER_FAIL"
+                    continue
+                entry = tick_round(
+                    bar.close,
+                    config.contract.tick_size,
+                    role="entry",
+                    side="buy" if side == "long" else "sell",
+                )
+                buffer = Decimal(module.stop_buffer_multiple) * unit
+                stop = zone.low - buffer if side == "long" else zone.high + buffer
+                if module.recent_peak_stop:
+                    runtime_id = "__ft07_exec_low" if side == "long" else "__ft07_exec_high"
+                    runtime = next(
+                        item for item in state.feature_runtime if item.feature_id == runtime_id
+                    )
+                    prices = tuple(
+                        item.value
+                        for item in runtime.history[-module.peak_lookback :]
+                        if isinstance(item.value, Decimal)
+                    )
+                    if len(prices) < module.peak_lookback:
+                        fallback_reason = "NOT_READY_PEAK_WINDOW"
+                        continue
+                    stop = recent_peak_stop(
+                        side=side,
+                        prices=prices,
+                        zone_boundary=zone.low if side == "long" else zone.high,
+                        buffer=buffer,
+                    )
+                stop = tick_round(
+                    stop,
+                    config.contract.tick_size,
+                    role="stop",
+                    side="sell" if side == "long" else "buy",
+                )
+                target, target_reason = _setup_target(
+                    config,
+                    eligible,
+                    side=side,
+                    entry=entry,
+                    stop=stop,
+                    mode=module.target_mode,
+                    measured_origin=entry,
+                    measured_impulse=abs(entry - boundary),
+                    measured_multiple=module.measured_move_multiple,
+                    risk_multiple=module.r_multiple,
+                )
+                if target is None:
+                    fallback_reason = cast(str, target_reason)
+                    actionable_failure = True
+                    continue
+                if not valid_bracket(side=side, entry=entry, stop=stop, target=target):
+                    fallback_reason = "INVALID_BRACKET"
+                    actionable_failure = True
+                    continue
+                snapshot = _snapshot(
+                    config,
+                    state.model_copy(
+                        update={"next_setup_sequence": state.next_setup_sequence + len(candidates)}
+                    ),
+                    bar,
+                    family="reversal",
+                    side=side,
+                    zone=zone,
+                    arm_index=None,
+                    signal_index=execution_index,
+                    unit=unit,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    target_mode=module.target_mode,
+                )
+                candidates.append(snapshot)
+                candidate_results[snapshot.setup_id] = results
+        elif isinstance(module, BreakoutRetestSetup) and module.enabled:
+            vwap_value = next(
+                (
+                    value
+                    for value in state.feature_values
+                    if value.feature_id == "__ft07_exec_session_vwap_v1"
+                    and isinstance(value.value, Decimal)
+                ),
+                None,
+            )
+            for side, kind in (("long", "support"), ("short", "resistance")):
+                if module.sides not in {side, "both"}:
+                    continue
+                zone = nearest_zone(eligible, price=bar.close, kind=kind)
+                if zone is None:
+                    continue
+                geometry = breakout_geometry(
+                    side=side,
+                    zone_low=zone.low,
+                    zone_high=zone.high,
+                    close=bar.close,
+                    vwap=cast(Decimal, vwap_value.value)
+                    if module.use_vwap_stop and vwap_value
+                    else (zone.low if side == "long" else zone.high),
+                    unit=unit,
+                    break_multiple=Decimal(module.break_multiple),
+                    pullback_multiple=Decimal(module.pullback_multiple),
+                    stop_multiple=Decimal(module.stop_buffer_multiple),
+                    measured_move_multiple=Decimal(module.measured_move_multiple),
+                )
+                if not breakout_confirmed(
+                    side=side,
+                    previous_close=previous_close,
+                    close=bar.close,
+                    threshold=geometry.threshold,
+                    mode=module.confirmation_mode,
+                ):
+                    continue
+                status, results = _filter_result(
+                    config, state, module.arm_filter_root, bar.known_at
+                )
+                if status != "PASS":
+                    fallback_reason = "FILTER_UNKNOWN" if status == "UNKNOWN" else "FILTER_FAIL"
+                    continue
+                entry = tick_round(
+                    geometry.entry,
+                    config.contract.tick_size,
+                    role="entry",
+                    side="buy" if side == "long" else "sell",
+                )
+                stop = tick_round(
+                    geometry.stop,
+                    config.contract.tick_size,
+                    role="stop",
+                    side="sell" if side == "long" else "buy",
+                )
+                target, target_reason = _setup_target(
+                    config,
+                    eligible,
+                    side=side,
+                    entry=entry,
+                    stop=stop,
+                    mode=module.target_mode,
+                    measured_origin=zone.high if side == "long" else zone.low,
+                    measured_impulse=abs(bar.close - (zone.high if side == "long" else zone.low)),
+                    measured_multiple=module.measured_move_multiple,
+                    risk_multiple=module.r_multiple,
+                )
+                if target is None:
+                    fallback_reason = cast(str, target_reason)
+                    actionable_failure = True
+                    continue
+                if not valid_bracket(side=side, entry=entry, stop=stop, target=target):
+                    fallback_reason = "INVALID_BRACKET"
+                    actionable_failure = True
+                    continue
+                snapshot = _snapshot(
+                    config,
+                    state.model_copy(
+                        update={"next_setup_sequence": state.next_setup_sequence + len(candidates)}
+                    ),
+                    bar,
+                    family="breakout",
+                    side=side,
+                    zone=zone,
+                    arm_index=execution_index,
+                    signal_index=None,
+                    unit=unit,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    target_mode=module.target_mode,
+                )
+                candidates.append(snapshot)
+                candidate_results[snapshot.setup_id] = results
+    if not candidates:
+        return _SetupAction("REJECT" if actionable_failure else "HOLD", fallback_reason, None, None)
+    if len({item.side for item in candidates}) > 1:
+        reason = (
+            "CONFLICT_OPPOSING_SIDES"
+            if any(item.family == "reversal" for item in candidates)
+            else "CONFLICT_OPPOSING_ARMS"
+        )
+        return _SetupAction("REJECT", reason, None, None)
+    selected = select_candidate(tuple(candidates))
+    assert selected is not None
+    action = "ARM" if selected.family == "breakout" else "ENTRY"
+    reason = (
+        ("ARM_LONG" if selected.side == "long" else "ARM_SHORT")
+        if action == "ARM"
+        else ("ENTRY_INTENT_LONG" if selected.side == "long" else "ENTRY_INTENT_SHORT")
+    )
+    return _SetupAction(
+        action, reason, selected.side, selected, candidate_results[selected.setup_id]
+    )
+
+
+def _setup_entry_intent(
+    config: EngineConfig,
+    state: EngineState,
+    event_input: CompletedBarEvent,
+    decision_id: str,
+    snapshot: SetupSnapshot,
+    effective_at: datetime,
+    bar: FeatureBar,
+) -> tuple[OrderIntent | None, str]:
+    side = snapshot.side
+    order_side = "buy" if side == "long" else "sell"
+    order_type = "limit" if snapshot.family == "breakout" else "market"
+    reference = snapshot.entry
+    slipped_stop = (
+        snapshot.stop - config.contract.tick_size * config.cost_model.stop_slippage_ticks
+        if side == "long"
+        else snapshot.stop + config.contract.tick_size * config.cost_model.stop_slippage_ticks
+    )
+    quantity = (
+        config.sizing_policy.quantity
+        if config.sizing_policy.kind == "fixed_contracts"
+        else stop_fraction_quantity(
+            starting_cash=config.starting_cash,
+            current_equity=state.equity,
+            fraction=config.sizing_policy.fraction,
+            max_quantity=config.sizing_policy.max_quantity,
+            per_entry_cap=config.risk_policy.per_entry_loss_cap,
+            entry=reference,
+            slipped_stop=slipped_stop,
+            multiplier=config.contract.multiplier,
+            commission_rate=config.cost_model.commission_per_contract_per_side,
+        )
+    )
+    if (
+        quantity == 0
+        or modeled_total_loss(
+            entry=reference,
+            slipped_stop=slipped_stop,
+            multiplier=config.contract.multiplier,
+            quantity=quantity,
+            commission_rate=config.cost_model.commission_per_contract_per_side,
+        )
+        > config.risk_policy.per_entry_loss_cap
+    ):
+        return None, "RISK_SIZE_ZERO"
+    if state.risk.latches:
+        return None, state.risk.latches[0]
+    if state.risk.filled_entries_in_trading_day >= min(
+        definition_cap
+        := config.strategy_version.definition.constraints.max_entries_per_trading_day,
+        config.risk_policy.max_entries_per_trading_day,
+    ):
+        del definition_cap
+        return None, "DAILY_ENTRY_LIMIT"
+    submitted = event_input.emission_context.order_submitted_at
+    active = _next_fill_start(config, max(effective_at, submitted))
+    expires = entry_expiry(
+        bar.end_at,
+        submitted,
+        config.strategy_version.execution_interval_seconds,
+        config.strategy_version.definition.order_policy.entry_ttl_execution_bars,
+    )
+    if effective_at >= config.contract.entry_cutoff_at:
+        return None, "ENTRY_CUTOFF"
+    if not _entry_window_allows(config, active):
+        return None, "ENTRY_WINDOW_CLOSED"
+    if config.force_close_at is not None and expires > config.force_close_at:
+        return None, "FORCE_CLOSE"
+    sequence = state.next_order_sequence
+    order_id = deterministic_uuid7(
+        "entry-order",
+        effective_at,
+        (
+            config.run_id,
+            config.lane_id,
+            sequence,
+            decision_id,
+            snapshot.setup_id,
+            side,
+            order_type,
+            quantity,
+        ),
+    )
+    from familytrade.simulation.state import BracketTemplate
+
+    return OrderIntent(
+        order_id=order_id,
+        kind="entry",
+        order_type=cast(Any, order_type),
+        side=cast(Any, order_side),
+        effect="open",
+        quantity=quantity,
+        raw_price=snapshot.entry if order_type == "limit" else None,
+        executable_price=snapshot.entry if order_type == "limit" else None,
+        raw_stop=snapshot.stop,
+        stop_price=snapshot.stop,
+        raw_target=snapshot.target,
+        target_price=snapshot.target,
+        bracket_template=BracketTemplate(
+            stop=config.strategy_version.definition.exit_policy.stop,
+            target=config.strategy_version.definition.exit_policy.target,
+            frozen_feature_values={
+                item.feature_id: item for item in snapshot.frozen_feature_values
+            },
+        ),
+        effective_at=effective_at,
+        submitted_at=submitted,
+        active_from=active,
+        expires_at=expires,
+        entry_bar_exit_policy=config.fill_model.entry_bar_exit_policy,
+        both_hit_policy=config.fill_model.both_hit_policy,
+    ), ("ENTRY_INTENT_LONG" if side == "long" else "ENTRY_INTENT_SHORT")
+
+
 def _create_decision(
     config: EngineConfig,
     state: EngineState,
@@ -2198,6 +2910,8 @@ def _create_decision(
 ) -> tuple[EngineState, Decision, OrderIntent | None]:
     definition = config.strategy_version.definition
     histories = {runtime.feature_id: runtime.history for runtime in state.feature_runtime}
+    selected_setup: SetupSnapshot | None = None
+    side: str | None
     if state.position is not None:
         side = state.position.side
         root = (
@@ -2242,13 +2956,46 @@ def _create_decision(
             results = tuple(x for item in evaluations for x in item[2])
             unknown = next((r.reason_code for r in results if r.result == "UNKNOWN"), None)
             decision_type, reason = "HOLD", unknown or "ENTRY_RULE_FAIL"
+        if definition.entry_combination != "rules_only":
+            setup_action = _setup_action(config, state, bar)
+            use_setup = definition.entry_combination in {
+                "setups_only",
+                "setup_and_rules",
+            } or setup_action.decision_type in {
+                "ARM",
+                "ENTRY",
+                "CANCEL",
+                "REJECT",
+            }
+            if use_setup:
+                selected_setup = setup_action.snapshot
+                side = setup_action.side
+                decision_type = setup_action.decision_type
+                reason = setup_action.reason
+                results = setup_action.results
+                stage = "arm" if decision_type in {"ARM", "CANCEL"} else "entry_intent"
+                if definition.entry_combination == "setup_and_rules" and decision_type == "ENTRY":
+                    matching = next((item for item in evaluations if item[0] == side), None)
+                    if matching is None or matching[1] != "PASS":
+                        decision_type = "HOLD"
+                        reason = next(
+                            (
+                                item.reason_code
+                                for item in (matching[2] if matching else ())
+                                if item.result == "UNKNOWN"
+                            ),
+                            "ENTRY_RULE_FAIL",
+                        )
+                        results = matching[2] if matching else ()
         if state.pending_entry is not None and decision_type == "ENTRY":
             decision_type, reason = "HOLD", "ENTRY_PENDING"
-        stage = "entry_rule"
+        if selected_setup is None:
+            stage = "entry_rule"
     sources = tuple(
         dict.fromkeys(
             (
                 *tuple(source for result in results for source in result.source_bar_record_ids),
+                *(selected_setup.source_bar_record_ids if selected_setup else ()),
                 *bar.source_bar_record_ids,
             )
         )
@@ -2260,6 +3007,35 @@ def _create_decision(
         if config.mode == "backtest"
         else max((bar.known_at, *(item.known_at for item in results)))
     )
+    intent: OrderIntent | None = None
+    update: dict[str, Any] = {"next_decision_sequence": sequence + 1}
+    if decision_type == "ENTRY" and side is not None:
+        # Resolve geometry/risk/window rejection before deriving Decision identity.
+        # The provisional UUID can affect only the subsequently discarded order ID.
+        probe, reason = (
+            _setup_entry_intent(
+                config,
+                state,
+                event_input,
+                "00000000-0000-7000-8000-000000000000",
+                selected_setup,
+                effective_at,
+                bar,
+            )
+            if selected_setup is not None
+            else _entry_intent(
+                config,
+                state,
+                event_input,
+                "00000000-0000-7000-8000-000000000000",
+                side,
+                effective_at,
+                bar,
+            )
+        )
+        decision_type = "ENTRY" if probe is not None else "REJECT"
+    elif decision_type == "CLOSE" and state.close_intent is not None:
+        decision_type, reason = "HOLD", "CLOSE_PENDING"
     decision_id = deterministic_uuid7(
         "decision",
         effective_at,
@@ -2271,18 +3047,26 @@ def _create_decision(
             bar.end_at,
             decision_type,
             side,
-            None,
+            selected_setup.setup_id if selected_setup else None,
             pre_hash,
             correlation,
         ),
     )
-    intent: OrderIntent | None = None
-    update: dict[str, Any] = {"next_decision_sequence": sequence + 1}
     if decision_type == "ENTRY" and side is not None:
-        intent, reason = _entry_intent(
-            config, state, event_input, decision_id, side, effective_at, bar
+        intent, reason = (
+            _setup_entry_intent(
+                config,
+                state,
+                event_input,
+                decision_id,
+                selected_setup,
+                effective_at,
+                bar,
+            )
+            if selected_setup is not None
+            else _entry_intent(config, state, event_input, decision_id, side, effective_at, bar)
         )
-        decision_type = "ENTRY" if intent is not None else "REJECT"
+        assert intent is not None
         if intent is not None:
             order_state = OrderState(
                 intent=intent,
@@ -2295,13 +3079,30 @@ def _create_decision(
                 if intent.active_from <= event_input.emission_context.order_submitted_at
                 else None,
                 fill_sequence=None,
-                source_setup_id=None,
+                source_setup_id=selected_setup.setup_id if selected_setup else None,
                 originating_decision_id=decision_id,
                 creation_cause="ENTRY",
             )
             update.update(
                 pending_entry=order_state, next_order_sequence=state.next_order_sequence + 1
             )
+            if selected_setup is not None:
+                update.update(
+                    setups=(
+                        SetupState(
+                            module_kind="breakout_retest_v1"
+                            if selected_setup.family == "breakout"
+                            else "reversal_setup_v1",
+                            status="ENTRY_PENDING",
+                            snapshot=selected_setup,
+                            expires_after_execution_index=None,
+                            reason_code=reason,
+                        ),
+                    ),
+                    next_setup_sequence=max(
+                        state.next_setup_sequence, selected_setup.setup_sequence + 1
+                    ),
+                )
     elif decision_type == "CLOSE" and state.position is not None and state.close_intent is None:
         intent = _close_intent(config, state, event_input, decision_id, effective_at, "EXIT_RULE")
         order_state = OrderState(
@@ -2320,8 +3121,39 @@ def _create_decision(
             status="CLOSING",
             next_order_sequence=state.next_order_sequence + 1,
         )
-    elif decision_type == "CLOSE":
-        decision_type, reason = "HOLD", "CLOSE_PENDING"
+    elif decision_type == "ARM" and selected_setup is not None:
+        breakout = next(
+            item
+            for item in definition.setup_modules
+            if isinstance(item, BreakoutRetestSetup) and item.enabled
+        )
+        update.update(
+            setups=(
+                SetupState(
+                    module_kind="breakout_retest_v1",
+                    status="ARMED",
+                    snapshot=selected_setup,
+                    expires_after_execution_index=cast(int, selected_setup.arm_execution_index)
+                    + breakout.setup_expiry_execution_bars,
+                    reason_code=reason,
+                ),
+            ),
+            next_setup_sequence=max(state.next_setup_sequence, selected_setup.setup_sequence + 1),
+        )
+    elif decision_type in {"CANCEL", "REJECT"} and selected_setup is not None:
+        update.update(
+            setups=(
+                SetupState(
+                    module_kind="breakout_retest_v1"
+                    if selected_setup.family == "breakout"
+                    else "reversal_setup_v1",
+                    status="EXPIRED" if reason == "SETUP_EXPIRED" else "CANCELLED",
+                    snapshot=selected_setup,
+                    expires_after_execution_index=None,
+                    reason_code=reason,
+                ),
+            )
+        )
     state = state.model_copy(update=update)
     post_hash = _state_hash(state)
     idempotency = deterministic_uuid7(
@@ -2335,7 +3167,7 @@ def _create_decision(
             bar.end_at,
             decision_type,
             side,
-            None,
+            selected_setup.setup_id if selected_setup else None,
             pre_hash,
             correlation,
             decision_id,
@@ -2356,13 +3188,13 @@ def _create_decision(
         decision_sequence=sequence,
         decision_type=cast(Any, decision_type),
         side=cast(Any, side),
-        setup_id=None,
+        setup_id=selected_setup.setup_id if selected_setup else None,
         reason_code=reason,
         evidence=DecisionEvidence(
             evaluation_stage=cast(Any, stage),
             evidence_mode="historical" if config.mode == "backtest" else "contemporaneous",
             results=tuple(sorted(results, key=lambda item: item.node_id)),
-            selected_setup=None,
+            selected_setup=selected_setup,
         ),
         order_intent=intent,
         pre_state_sha256=pre_hash,
@@ -2652,6 +3484,7 @@ def _lifecycle_boundary(
     event_input: CompletedBarEvent | DataQualityEvent | FinishRunEvent,
     correlation: str,
     boundary: datetime,
+    processed_start: datetime,
 ) -> tuple[EngineState, tuple[OrderIntent, ...], tuple[RunEvent, ...]]:
     """Apply policy transitions exposed by the next accepted chronology boundary."""
     intents: list[OrderIntent] = []
@@ -2664,6 +3497,7 @@ def _lifecycle_boundary(
             return
         cancelled = order.model_copy(update={"status": "CANCELLED", "status_reason": reason})
         state = state.model_copy(update={"pending_entry": None})
+        state = _settle_setup_order(state, order, filled=False, reason=reason)
         state, emitted = _order_transition(
             config,
             state,
@@ -2724,6 +3558,8 @@ def _lifecycle_boundary(
                         "next_order_sequence": state.next_order_sequence + 1,
                     }
                 )
+            if scheduled.intent.active_from > processed_start:
+                return state, tuple(intents), tuple(events)
             activated = scheduled.model_copy(
                 update={
                     "status": "ACTIVE",
@@ -2784,7 +3620,7 @@ def _lifecycle_boundary(
                 config.contract.liquidation_start_at,
                 "CONTRACT_LIQUIDATION",
             )
-            direct = intent.active_from <= boundary
+            direct = intent.active_from <= processed_start
             order = OrderState(
                 intent=intent,
                 order_sequence=state.next_order_sequence,
@@ -2849,9 +3685,7 @@ def _advance_features(config: EngineConfig, state: EngineState, bar: FeatureBar)
     runtime_by_id = {item.feature_id: item for item in state.feature_runtime}
     current: dict[str, Any] = {}
     trading_day = _trading_day(config.calendar.windows, bar.start_at)
-    for feature in sorted(
-        config.strategy_version.definition.features, key=lambda item: item.feature_id
-    ):
+    for feature in sorted(_all_features(config), key=lambda item: item.feature_id):
         if feature.interval_seconds != int((bar.end_at - bar.start_at).total_seconds()):
             continue
         runtime, value = advance_feature(
@@ -2881,6 +3715,109 @@ def _advance_features(config: EngineConfig, state: EngineState, bar: FeatureBar)
                     ),
                 )
             ),
+        }
+    )
+
+
+def _advance_zones(config: EngineConfig, state: EngineState, bar: FeatureBar) -> EngineState:
+    """Consume one completed zone aggregate and persist newly confirmed pivots."""
+    modules = tuple(
+        item
+        for item in config.strategy_version.definition.setup_modules
+        if isinstance(item, ConfirmedPivotZonesSetup)
+        and item.zone_interval_seconds == int((bar.end_at - bar.start_at).total_seconds())
+    )
+    if not modules:
+        return state
+    by_id = {item.feature_id: item for item in state.feature_runtime}
+    indexes = {item.interval_seconds: item for item in state.zone_slot_indexes}
+    zones = state.zones
+    next_sequence = state.next_zone_sequence
+    for module in modules:
+        index_state = indexes[module.zone_interval_seconds]
+        zone_index = (
+            index_state.last_slot_index if index_state.last_slot_index is not None else -1
+        ) + 1
+        prefix = f"__ft07_zone_{module.zone_interval_seconds}"
+        atr_runtime = by_id[f"{prefix}_atr"]
+        atr_value = atr_runtime.history[-1] if atr_runtime.history else None
+        unit = (
+            atr_value.value
+            if module.use_atr
+            and atr_value is not None
+            and isinstance(atr_value.value, Decimal)
+            and atr_value.value > 0
+            else Decimal(1)
+            if not module.use_atr
+            else None
+        )
+        # Zone age is evaluated before this boundary's confirmed pivots are merged.
+        zones = tuple(
+            zone
+            for zone in zones
+            if zone_index - zone.last_touch_zone_index <= module.zone_max_age_bars
+        )
+        if unit is not None:
+            for kind, suffix in (("resistance", "pivot_high"), ("support", "pivot_low")):
+                runtime = by_id[f"{prefix}_{suffix}"]
+                accumulator = runtime.accumulator
+                assert isinstance(accumulator, PivotAccumulator)
+                points = (
+                    accumulator.confirmed_highs
+                    if kind == "resistance"
+                    else accumulator.confirmed_lows
+                )
+                if not points or points[-1].known_at != bar.known_at:
+                    continue
+                point = points[-1]
+                zone_id = deterministic_uuid7(
+                    "zone",
+                    bar.known_at,
+                    (
+                        config.run_id,
+                        config.lane_id,
+                        next_sequence,
+                        config.contract.contract_id,
+                        module.zone_interval_seconds,
+                        kind,
+                        point.evaluation_bar_end,
+                        bar.end_at,
+                    ),
+                )
+                candidate = ZoneState(
+                    zone_id=zone_id,
+                    kind=cast(Any, kind),
+                    low=point.value,
+                    high=point.value,
+                    creation_sequence=next_sequence,
+                    touch_count=1,
+                    created_zone_index=zone_index,
+                    last_touch_zone_index=zone_index,
+                    last_filled_execution_index=None,
+                    pivot_bar_end=point.evaluation_bar_end,
+                    confirmation_bar_end=bar.end_at,
+                    known_at=bar.known_at,
+                    source_bar_record_ids=point.source_bar_record_ids,
+                    source_dataset_provenance=point.source_dataset_provenance,
+                )
+                prior_ids = {zone.zone_id for zone in zones}
+                zones = merge_candidate(
+                    zones,
+                    candidate,
+                    merge_distance=Decimal(module.merge_multiple) * unit,
+                    max_width=Decimal(module.max_width_multiple) * unit,
+                    max_zones=module.max_zones,
+                )
+                if candidate.zone_id in {zone.zone_id for zone in zones} - prior_ids:
+                    next_sequence += 1
+        indexes[module.zone_interval_seconds] = index_state.model_copy(
+            update={"last_slot_index": zone_index}
+        )
+    return state.model_copy(
+        update={
+            "zones": tuple(sorted(zones, key=lambda item: (item.creation_sequence, item.zone_id))),
+            "zone_slot_indexes": tuple(indexes[key] for key in sorted(indexes)),
+            "next_zone_sequence": next_sequence,
         }
     )
 
@@ -2978,6 +3915,7 @@ def _consume_completed(
         )
     for interval, feature_bar in sorted(aggregate_by_interval.items()):
         state = _advance_features(config, state, feature_bar)
+        state = _advance_zones(config, state, feature_bar)
     execution_bar = aggregate_by_interval.get(config.strategy_version.execution_interval_seconds)
     if execution_bar is not None:
         state = state.model_copy(
@@ -3153,7 +4091,7 @@ def step_engine(
     lifecycle_events: tuple[RunEvent, ...] = ()
     if not isinstance(parsed, FinishRunEvent):
         cursor_state, lifecycle_intents, lifecycle_events = _lifecycle_boundary(
-            config, cursor_state, parsed, correlation, start
+            config, cursor_state, parsed, correlation, end, start
         )
         if cursor_state.status in _TERMINAL:
             cursor_state = cursor_state.model_copy(
@@ -3351,6 +4289,17 @@ def run_engine(
                     "logical_end_at": end,
                     "previous_input_sha256": cast(str, previous_hash),
                     "input_sha256": sha,
+                },
+            )
+        # Match step_engine's closed dispatch order: replay and retained-identity
+        # conflict precede the terminal guard, and normal chronology checks follow it.
+        if state.status in _TERMINAL:
+            _raise(
+                EngineErrorCode.RUN_FINISHED,
+                {
+                    "kind": "run_finished",
+                    "status": state.status,
+                    "finished_reason": state.finished_reason,
                 },
             )
         if previous_recorded is not None and event.recorded_at < previous_recorded:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 from familytrade.market_data.models import canonical_json_bytes
 from familytrade.simulation.engine import (
     checkpoint_engine,
+    deterministic_uuid7,
     initialize_engine,
     restore_engine,
     run_engine,
@@ -24,13 +26,28 @@ from familytrade.simulation.state import (
     EngineFailure,
     FinishRunEvent,
 )
+from familytrade.strategies.definitions import (
+    CompareNode,
+    ConstantNode,
+    FeatureInstance,
+    FeatureNode,
+    FeaturePriceSource,
+    FixedTicksStop,
+    OrderPolicy,
+    RiskMultipleTarget,
+)
+from familytrade.strategies.validation import canonical_definition_sha256
 
 from .conftest import BASE, make_backtest_config, make_bar, make_config
 
 
 def _frozen(case_id: str) -> dict[str, object]:
     path = Path(__file__).parents[2] / "docs" / "contracts-examples-v1.json"
-    cases = json.loads(path.read_text(encoding="utf-8"))["cases"]
+    payload = path.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c2bd5d31acd8996d0d888ed75e99f320f395b74bc441db0f941201df705c1062"
+    )
+    cases = json.loads(payload)["cases"]
     return next(item for item in cases if item["id"] == case_id)
 
 
@@ -86,33 +103,149 @@ def _quality(config, start: datetime, status: str = "missing") -> DataQualityEve
 
 def test_fees_and_open_end_position_marked_not_liquidated() -> None:
     expected = _frozen("fees_and_open_end_position_marked_not_liquidated")["expected"]
-    _, result = _trade_result()
-    assert len(result.fills) == expected["fill_count"] == 1
-    assert result.state.position is not None and result.state.realized_pnl == Decimal("0.00")
+    config = make_backtest_config()
+    events = (
+        *tuple(make_bar(config, i) for i in range(5)),
+        make_bar(config, 5, close="1999.8"),
+        make_bar(config, 6, close="2001"),
+    )
+    result = run_engine(config, events)
+    position = result.state.position
+    assert position is not None
+    assert {
+        "fill_count": len(result.fills),
+        "fees": str(result.state.fees),
+        "realized_pnl": str(result.state.realized_pnl),
+        "unrealized_pnl": str(result.state.unrealized_pnl),
+        "cash": str(result.state.cash),
+        "equity": str(result.state.equity),
+        "open_quantity": position.quantity,
+        "maximum_drawdown": str(result.state.risk.maximum_drawdown),
+        "synthetic_exit": any(fill.effect == "close" for fill in result.fills),
+    } == expected
 
 
 def test_daily_loss_with_overnight_carried_position() -> None:
     expected = _frozen("daily_loss_with_overnight_carried_position")["expected"]
-    assert expected["risk_latched"] is True
-    assert expected["position_flattened_by_day_boundary"] is False
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+                update={"stop": FixedTicksStop(kind="fixed_ticks", ticks=1000)}
+            )
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            ),
+            "risk_policy": config.risk_policy.model_copy(
+                update={"per_entry_loss_cap": Decimal(2000)}
+            ),
+        }
+    )
+    result = run_engine(
+        config,
+        (
+            *tuple(make_bar(config, i) for i in range(6)),
+            make_bar(config, 6, low="1975", close="1975.1"),
+        ),
+    )
+    assert ("DAILY_LOSS_LIMIT" in result.state.risk.latches) is expected["risk_latched"]
+    assert (result.state.position is None) is expected["position_flattened_by_day_boundary"]
+    assert result.state.position is not None
+    assert all(
+        leg.status == "ACTIVE"
+        for leg in (
+            result.state.position.protective_bracket.stop,
+            result.state.position.protective_bracket.target,
+        )
+    )
 
 
 def test_entry_order_multi_bar_ttl_expiry() -> None:
     expected = _frozen("entry_order_multi_bar_ttl_expiry")["expected"]
-    assert expected == {
-        "fill_count": 0,
-        "expires_at": "2026-09-14T10:30:00Z",
-        "expiry_occurs_before_late_bar": True,
-        "missing_bar_extends_ttl": False,
-        "final_order_status": "EXPIRED",
-        "commission": "0.00",
-    }
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "features": (
+                FeatureInstance(
+                    feature_id="entry-limit",
+                    kind="input",
+                    name="close",
+                    output_type="price",
+                    unit="contract_price",
+                    interval_seconds=300,
+                    parameters={},
+                ),
+            ),
+            "order_policy": OrderPolicy(
+                entry_type="limit",
+                limit_price_source=FeaturePriceSource(
+                    kind="feature", feature_id="entry-limit", offset_ticks=-1000
+                ),
+                entry_ttl_execution_bars=2,
+                both_hit_policy="stop_first",
+                entry_bar_exit_policy="conservative_stop_first",
+            ),
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    result = run_engine(config, tuple(make_bar(config, index) for index in range(16)))
+    expired = next(
+        event
+        for event in result.events
+        if event.event_type == "ORDER_STATE" and event.payload["to"] == "EXPIRED"
+    )
+    assert len(result.fills) == expected["fill_count"]
+    assert expired.payload["reason"] == expected["final_order_status"].replace(
+        "EXPIRED", "ORDER_EXPIRED"
+    )
+    assert result.state.pending_entry is None and result.state.fees == Decimal(
+        expected["commission"]
+    )
+    assert expired.effective_at == BASE + timedelta(minutes=15)
 
 
 def test_contract_expiry_close_and_no_roll() -> None:
     expected = _frozen("contract_expiry_close_and_no_roll")["expected"]
-    assert expected["final_status"] == "STOPPED"
-    assert expected["automatic_roll"] is False and expected["new_contract_position"] == 0
+    config = make_backtest_config(end_minutes=15)
+    config = config.model_copy(
+        update={
+            "contract": config.contract.model_copy(
+                update={
+                    "entry_cutoff_at": BASE + timedelta(minutes=6, seconds=15),
+                    "liquidation_start_at": BASE + timedelta(minutes=6, seconds=30),
+                    "last_trade_at": BASE + timedelta(minutes=12),
+                }
+            )
+        }
+    )
+    opened = run_engine(config, tuple(make_bar(config, i) for i in range(6)))
+    scheduled = step_engine(config, opened.state, make_bar(config, 6))
+    assert scheduled.state.status == "CLOSING" and scheduled.fills == ()
+    closed = step_engine(
+        config,
+        scheduled.state,
+        make_bar(config, 7, open_price="1998", high="1999", low="1997", close="1998"),
+    )
+    assert closed.fills[0].fill_price == Decimal(expected["later_fill"]["price"])
+    assert closed.state.status == expected["final_status"]
+    assert closed.state.position is None and expected["new_contract_position"] == 0
+    assert expected["automatic_roll"] is False
 
 
 def test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state() -> None:
@@ -123,16 +256,108 @@ def test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state(
 
 
 def test_forward_delayed_bar_availability_and_exit_rule() -> None:
+    expected = _frozen("forward_delayed_bar_availability_and_exit_rule")["expected"]
     config = make_config()
-    event = make_bar(config, 0)
-    assert event.recorded_at > event.selection.bar.end_at
-    assert event.emission_context.order_submitted_at > event.recorded_at
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "exit_rules": config.strategy_version.definition.exit_rules.model_copy(
+                update={"long_root": "entry"}
+            )
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    opened = run_engine(config, tuple(make_bar(config, i) for i in range(10)))
+    close_decision = opened.decisions[-1]
+    close_intent = opened.intents[-1]
+    assert close_decision.decision_type == "CLOSE" and opened.state.position is not None
+    assert close_decision.effective_at > close_decision.execution_bar_end
+    assert close_intent.active_from > close_decision.execution_bar_end
+    assert all(fill.effect != "close" for fill in opened.fills)
+    waiting = step_engine(config, opened.state, make_bar(config, 10))
+    assert waiting.fills == ()
+    closed = step_engine(config, waiting.state, make_bar(config, 11))
+    assert closed.fills[0].effect == "close"
+    assert close_intent.active_from == closed.fills[0].model_time
+    assert expected["bar_1015_fill_count"] == 0
 
 
 def test_exit_rule_unknown_does_not_close() -> None:
-    _, result = _trade_result()
+    expected = _frozen("exit_rule_unknown_does_not_close")["expected"]
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "features": (
+                FeatureInstance(
+                    feature_id="rsi",
+                    kind="indicator",
+                    name="rsi_wilder_v1",
+                    output_type="decimal",
+                    unit="ratio_0_100",
+                    interval_seconds=300,
+                    parameters={"n": 20},
+                ),
+            ),
+            "nodes": (
+                ConstantNode(
+                    kind="constant",
+                    node_id="entry",
+                    value_type="boolean",
+                    unit="boolean",
+                    value=True,
+                ),
+                FeatureNode(kind="feature", node_id="rsi-now", feature_id="rsi", offset=0),
+                ConstantNode(
+                    kind="constant",
+                    node_id="threshold",
+                    value_type="decimal",
+                    unit="ratio_0_100",
+                    value=Decimal(70),
+                ),
+                CompareNode(
+                    kind="compare",
+                    node_id="rsi-exit",
+                    op="gt",
+                    left="rsi-now",
+                    right="threshold",
+                    tolerance=None,
+                ),
+            ),
+            "exit_rules": config.strategy_version.definition.exit_rules.model_copy(
+                update={"long_root": "rsi-exit"}
+            ),
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    result = run_engine(config, tuple(make_bar(config, index) for index in range(10)))
+    decision = result.decisions[-1]
     assert result.state.position is not None
-    assert all(item.kind != "close" for item in result.intents)
+    assert (decision.decision_type, decision.reason_code) == (
+        "HOLD",
+        expected["decision_reason"],
+    )
+    assert decision.evidence.results[0].reason_code == expected["decision_reason"]
+    assert (
+        sum(intent.kind == "close" for intent in result.intents) == expected["close_intent_count"]
+    )
+    assert sum(fill.effect == "close" for fill in result.fills) == expected["fill_count"]
 
 
 def test_derived_buckets_match_ft05_aggregation_and_reject_scheduled_partials() -> None:
@@ -387,9 +612,11 @@ def test_flat_at_liquidation_stops_without_close_or_closing_and_finish_raises_ru
             "end_at": BASE + timedelta(minutes=3),
         }
     )
-    state = run_engine(config, tuple(make_bar(config, i) for i in range(2))).state
-    stopped = step_engine(config, state, make_bar(config, 2)).state
+    stopped = run_engine(config, tuple(make_bar(config, i) for i in range(2))).state
     assert stopped.status == "STOPPED" and stopped.close_intent is None
+    with pytest.raises(EngineFailure) as failure:
+        step_engine(config, stopped, make_bar(config, 2))
+    assert failure.value.error.code == "RUN_FINISHED"
 
 
 def test_flat_at_force_close_waits_for_finish_without_close_or_closing() -> None:
@@ -423,6 +650,33 @@ def test_decision_type_emission_order_uuid_and_pre_post_hash_chain_are_exact() -
     assert decision.decision_type == "ENTRY"
     assert result.events[-2].event_type == "DECISION_RECORDED"
     assert decision.pre_state_sha256 != decision.post_state_sha256
+    rejected_config = make_backtest_config().model_copy(
+        update={
+            "risk_policy": make_backtest_config().risk_policy.model_copy(
+                update={"per_entry_loss_cap": Decimal(1)}
+            )
+        }
+    )
+    rejected = run_engine(
+        rejected_config, tuple(make_bar(rejected_config, index) for index in range(5))
+    ).decisions[0]
+    assert (rejected.decision_type, rejected.reason_code) == ("REJECT", "RISK_SIZE_ZERO")
+    assert rejected.decision_id == deterministic_uuid7(
+        "decision",
+        rejected.effective_at,
+        (
+            rejected.run_id,
+            rejected.lane_id,
+            rejected.decision_sequence,
+            rejected.strategy_version_id,
+            rejected.execution_bar_end,
+            "REJECT",
+            rejected.side,
+            None,
+            rejected.pre_state_sha256,
+            rejected.causation_event_id,
+        ),
+    )
 
 
 def test_signed_zero_and_negative_protective_triggers_require_finite_tick_geometry() -> None:
@@ -430,8 +684,30 @@ def test_signed_zero_and_negative_protective_triggers_require_finite_tick_geomet
 
 
 def test_setup_expiry_cancel_decision_has_exact_completed_bar_projection() -> None:
-    state = initialize_engine(make_config())
-    assert state.setups == () and state.next_setup_sequence == 0
+    from .test_reversal_breakout import _bars, _configured, _seed, _zone
+
+    config = _configured(sides="long", expiry=1)
+    state = _seed(config, _zone(kind="support", low="2000", high="2000.5"))
+    armed = run_engine(
+        config,
+        _bars(config, 0, 5, low="2004", high="2006", close="2005"),
+        initial_state=state,
+    )
+    eligible = run_engine(
+        config,
+        _bars(config, 5, 10, low="2002", high="2004", close="2003"),
+        initial_state=armed.state,
+    )
+    expired = run_engine(
+        config,
+        _bars(config, 10, 15, low="2002", high="2004", close="2003"),
+        initial_state=eligible.state,
+    )
+    decision = expired.decisions[-1]
+    assert (decision.decision_type, decision.reason_code) == ("CANCEL", "SETUP_EXPIRED")
+    assert decision.setup_id == armed.decisions[-1].setup_id
+    assert decision.evidence.selected_setup == armed.decisions[-1].evidence.selected_setup
+    assert decision.order_intent is None and expired.state.setups[0].status == "EXPIRED"
 
 
 def test_policy_window_cutoff_ttl_and_risk_transitions_emit_no_cancel_decision() -> None:
@@ -489,6 +765,26 @@ def test_backtest_record_decide_submit_output_and_created_times_equal_modeled_bo
 def test_entry_exit_liquidation_and_force_close_opening_gaps_never_precede_submission() -> None:
     _, result = _trade_result()
     assert result.fills[0].model_time >= result.intents[0].submitted_at
+    config = make_backtest_config(end_minutes=15)
+    config = config.model_copy(
+        update={
+            "contract": config.contract.model_copy(
+                update={
+                    "entry_cutoff_at": BASE + timedelta(minutes=6, seconds=15),
+                    "liquidation_start_at": BASE + timedelta(minutes=6, seconds=30),
+                    "last_trade_at": BASE + timedelta(minutes=12),
+                }
+            )
+        }
+    )
+    opened = run_engine(config, tuple(make_bar(config, i) for i in range(6)))
+    assert opened.state.position is not None
+    exposed = step_engine(config, opened.state, make_bar(config, 6))
+    close = exposed.state.close_intent
+    assert close is not None and close.creation_cause == "CONTRACT_LIQUIDATION"
+    assert close.intent.effective_at == BASE + timedelta(minutes=6, seconds=30)
+    assert close.intent.submitted_at == close.intent.active_from == BASE + timedelta(minutes=7)
+    assert exposed.fills == ()
 
 
 def test_decision_dataset_revision_is_shared_base_or_null_from_all_cited_sources() -> None:
@@ -582,14 +878,46 @@ def test_signal_time_market_sizing_absolute_and_relative_stops_long_short() -> N
 
 
 def test_generic_market_entry_resolves_relative_bracket() -> None:
-    _, result = _trade_result()
+    expected = _frozen("generic_market_entry_resolves_relative_bracket")["expected"]
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+                update={"target": RiskMultipleTarget(kind="risk_multiple", multiple="2")}
+            )
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    result = run_engine(
+        config,
+        (
+            *tuple(make_bar(config, index) for index in range(6)),
+            make_bar(config, 6, close="2000.5"),
+        ),
+    )
     intent = result.intents[0]
     position = result.state.position
     assert intent.order_type == "market"
     assert intent.stop_price is None and intent.target_price is None
     assert position is not None
-    assert position.protective_bracket.stop.trigger_price < position.entry_price
-    assert position.protective_bracket.target.trigger_price > position.entry_price
+    assert position.entry_price == Decimal(expected["entry_fill"])
+    assert position.protective_bracket.stop.trigger_price == Decimal(expected["resolved_stop"])
+    assert position.protective_bracket.target.trigger_price == Decimal(expected["resolved_target"])
+    assert len(result.fills) == expected["entry_fill_count"]
+    assert result.state.cash == Decimal(expected["cash"])
+    assert result.state.equity == Decimal(expected["equity"])
+    assert (
+        position.protective_bracket.stop is None or position.protective_bracket.target is None
+    ) is expected["unprotected_committed_position_possible"]
 
 
 def test_market_fill_time_gap_revalidates_without_resizing_either_sizing_policy() -> None:
@@ -627,6 +955,9 @@ def test_terminal_dispatch_precedes_normal_finish_validation_for_every_terminal_
     with pytest.raises(EngineFailure) as caught:
         step_engine(config, terminal, later)
     assert caught.value.error.code == "RUN_FINISHED"
+    with pytest.raises(EngineFailure) as batch_caught:
+        run_engine(config, (make_bar(config, 0),), initial_state=terminal)
+    assert batch_caught.value.error.code == "RUN_FINISHED"
 
 
 def test_completed_bar_rejects_nested_corrections_before_hash_cursor_and_state() -> None:
@@ -645,12 +976,40 @@ def test_retry_differing_only_by_nested_corrections_is_invalid_not_replay() -> N
 
 
 def test_setup_entry_fill_after_checkpoint_retains_originating_entry_decision() -> None:
-    config, result = _trade_result()
-    restored = restore_engine(config, result.checkpoint)
-    assert (
-        restored.position.protective_bracket.stop.originating_decision_id
-        == result.fills[0].causation_decision_id
+    from .test_reversal_breakout import _bars, _configured, _seed, _zone
+
+    config = _configured(sides="long")
+    initial = _seed(config, _zone(kind="support", low="2000", high="2000.5"))
+    armed = run_engine(
+        config,
+        _bars(config, 0, 5, high="2006", low="2004", close="2005"),
+        initial_state=initial,
     )
+    entered = run_engine(
+        config,
+        _bars(config, 5, 10, high="2004", low="2000.9", close="2003"),
+        initial_state=armed.state,
+    )
+    decision = entered.decisions[-1]
+    assert decision.setup_id is not None and entered.state.pending_entry is not None
+    assert entered.state.pending_entry.source_setup_id == decision.setup_id
+    restored = restore_engine(config, entered.checkpoint)
+    waiting = step_engine(
+        config,
+        restored,
+        make_bar(config, 10, open_price="2001", high="2002", low="2000", close="2001"),
+    )
+    filled = step_engine(
+        config,
+        waiting.state,
+        make_bar(config, 11, open_price="2001", high="2002", low="2000", close="2001"),
+    )
+    assert filled.state.position is not None
+    assert (
+        filled.state.position.protective_bracket.stop.originating_decision_id
+        == decision.decision_id
+    )
+    assert filled.state.setups[0].status == "POSITION_OPEN"
 
 
 def test_protective_fill_after_checkpoint_inherits_originating_entry_decision() -> None:

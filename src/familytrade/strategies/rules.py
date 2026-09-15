@@ -188,8 +188,15 @@ def evaluate_rule(
                     "ENTRY_RULE_PASS" if passed else "ENTRY_RULE_FAIL",
                 )
         elif isinstance(node, TemporalCompareNode):
-            left_history = feature_history.get(node.left_feature, ())
-            right_history = feature_history.get(node.right_feature, ())
+            # Temporal operands are graph node references, while runtime history is
+            # keyed by FeatureInstance.feature_id.  Validation guarantees these
+            # references name feature nodes; resolve that indirection explicitly.
+            left_node = nodes[node.left_feature]
+            right_node = nodes[node.right_feature]
+            assert isinstance(left_node, FeatureNode)
+            assert isinstance(right_node, FeatureNode)
+            left_history = feature_history.get(left_node.feature_id, ())
+            right_history = feature_history.get(right_node.feature_id, ())
             temporal_values = (*left_history[-2:], *right_history[-2:])
             sources = _unique(
                 tuple(source for item in temporal_values for source in item.source_bar_record_ids)

@@ -102,11 +102,25 @@ def select_candidate(candidates: tuple[SetupSnapshot, ...]) -> SetupSnapshot | N
     sides = {candidate.side for candidate in candidates}
     if len(sides) != 1:
         return None
+
+    def normalized_distance(item: SetupSnapshot) -> Decimal:
+        close = next(
+            (
+                value.value
+                for value in item.frozen_feature_values
+                if value.feature_id == "__ft07_exec_close" and isinstance(value.value, Decimal)
+            ),
+            item.entry,
+        )
+        unit = Decimal(item.unit)
+        return abs(close - item.entry) / unit if unit > 0 else Decimal("Infinity")
+
     return min(
         candidates,
         key=lambda item: (
             0 if item.family == "breakout" else 1,
-            item.setup_sequence,
+            normalized_distance(item),
+            -item.setup_sequence,
             item.setup_id,
         ),
     )
