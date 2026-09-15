@@ -104,6 +104,7 @@ class _SetupAction:
     side: str | None
     snapshot: SetupSnapshot | None
     results: tuple[Any, ...] = ()
+    candidate_snapshots: tuple[SetupSnapshot, ...] = ()
 
 
 def _internal_features(config: EngineConfig) -> tuple[FeatureInstance, ...]:
@@ -1092,6 +1093,18 @@ def _validate_completed(config: EngineConfig, state: EngineState, event: Complet
         _raise(
             EngineErrorCode.INVALID_BAR_EVENT,
             {"kind": "invalid_bar_event", "bar_record_id": bar.bar_record_id, "reason": reason},
+        )
+    previous_provenance = _source_provenance(state).get(bar.bar_record_id)
+    if previous_provenance is not None:
+        _raise(
+            EngineErrorCode.DUPLICATE_CONFLICT,
+            {
+                "kind": "duplicate_conflict",
+                "logical_start_at": bar.start_at,
+                "logical_end_at": bar.end_at,
+                "previous_input_sha256": cast(str, state.last_input_sha256),
+                "input_sha256": _hash(_event_projection(event)),
+            },
         )
     if state.last_input_end_at is not None and bar.start_at > state.last_input_end_at:
         # Closed spans still require explicit quality events, making causal coverage auditable.
@@ -2397,6 +2410,129 @@ def _setup_target(
     return target, None
 
 
+def _provenance_failure(path: str, reason: str) -> NoReturn:
+    del reason
+    _raise(
+        EngineErrorCode.CHECKPOINT_MISMATCH,
+        {
+            "kind": "checkpoint_mismatch",
+            "path": path if path.startswith("/state") else "/state/source_dataset_provenance",
+            "reason": "STATE_INVARIANT",
+        },
+    )
+
+
+def _source_provenance(
+    state: EngineState, bar: FeatureBar | None = None
+) -> dict[str, SourceDatasetProvenance]:
+    """Resolve only evidence still owned by canonical state, never a mutable base pointer."""
+    mapping: dict[str, SourceDatasetProvenance] = {}
+
+    def add(
+        path: str,
+        sources: tuple[str, ...],
+        companions: tuple[SourceDatasetProvenance, ...],
+    ) -> None:
+        if len(sources) != len(companions) or len(set(sources)) != len(sources):
+            _provenance_failure(path, "PROVENANCE_LENGTH_OR_DUPLICATE")
+        for source, companion in zip(sources, companions, strict=True):
+            if companion.bar_record_id != source:
+                _provenance_failure(path, "PROVENANCE_SOURCE_MISMATCH")
+            previous = mapping.setdefault(source, companion)
+            if previous != companion:
+                _provenance_failure(path, "PROVENANCE_CONFLICT")
+
+    def feature(path: str, value: Any) -> None:
+        add(path, value.source_bar_record_ids, value.source_dataset_provenance)
+
+    for index, value in enumerate(state.feature_values):
+        feature(f"/state/feature_values/{index}", value)
+    for index, runtime in enumerate(state.feature_runtime):
+        prefix = f"/state/feature_runtime/{index}"
+        for value_index, value in enumerate(runtime.history):
+            feature(f"{prefix}/history/{value_index}", value)
+        acc = runtime.accumulator
+        for field in (
+            "points",
+            "seed_points",
+            "prior_volumes",
+            "confirmed_highs",
+            "confirmed_lows",
+        ):
+            for point_index, point in enumerate(getattr(acc, field, ())):
+                feature(f"{prefix}/accumulator/{field}/{point_index}", point)
+        previous_close = getattr(acc, "previous_close", None)
+        if previous_close is not None:
+            feature(f"{prefix}/accumulator/previous_close", previous_close)
+        for value_index, value in enumerate(getattr(acc, "previous_values", ())):
+            feature(f"{prefix}/accumulator/previous_values/{value_index}", value)
+        if isinstance(acc, PivotAccumulator):
+            add(
+                f"{prefix}/accumulator/candidate_source_dataset_provenance",
+                tuple(item.bar.bar_record_id for item in acc.candidate_bars),
+                acc.candidate_source_dataset_provenance,
+            )
+        for field in ("source", "current_source", "previous_source"):
+            ids = f"{field}_bar_record_ids"
+            provenance = f"{field}_dataset_provenance"
+            if hasattr(acc, ids):
+                add(
+                    f"{prefix}/accumulator/{provenance}",
+                    getattr(acc, ids),
+                    getattr(acc, provenance),
+                )
+    for index, zone in enumerate(state.zones):
+        feature(f"/state/zones/{index}", zone)
+    for index, setup in enumerate(state.setups):
+        if setup.snapshot is None:
+            continue
+        snapshot = setup.snapshot
+        feature(f"/state/setups/{index}/snapshot", snapshot)
+        for value_index, value in enumerate(snapshot.frozen_feature_values):
+            feature(f"/state/setups/{index}/snapshot/frozen_feature_values/{value_index}", value)
+    for index, bucket in enumerate(state.interval_buckets):
+        add(
+            f"/state/interval_buckets/{index}/published_base_revision_ids",
+            tuple(selection.bar.bar_record_id for selection in bucket.selections),
+            tuple(
+                SourceDatasetProvenance(
+                    bar_record_id=selection.bar.bar_record_id,
+                    published_base_revision_id=revision,
+                )
+                for selection, revision in zip(
+                    bucket.selections, bucket.published_base_revision_ids, strict=True
+                )
+            )
+            if len(bucket.selections) == len(bucket.published_base_revision_ids)
+            else (),
+        )
+    add(
+        "/state/last_mark_source_dataset_provenance",
+        state.last_mark_source_bar_record_ids,
+        state.last_mark_source_dataset_provenance,
+    )
+    if bar is not None:
+        add(
+            "/current_bar/source_dataset_provenance",
+            bar.source_bar_record_ids,
+            bar.source_dataset_provenance,
+        )
+    return mapping
+
+
+def _resolve_sources(
+    sources: tuple[str, ...], mapping: dict[str, SourceDatasetProvenance]
+) -> tuple[SourceDatasetProvenance, ...]:
+    if not sources or len(set(sources)) != len(sources):
+        _provenance_failure("/decision/source_bar_record_ids", "PROVENANCE_EMPTY_OR_DUPLICATE")
+    result: list[SourceDatasetProvenance] = []
+    for source in sources:
+        if source not in mapping:
+            _provenance_failure("/decision/source_bar_record_ids", "PROVENANCE_MISSING")
+        result.append(mapping[source])
+    return tuple(result)
+
+
 def _snapshot(
     config: EngineConfig,
     state: EngineState,
@@ -2429,14 +2565,7 @@ def _snapshot(
             )
         )
     )
-    by_id = {
-        item.bar_record_id: item
-        for item in (
-            *zone.source_dataset_provenance,
-            *tuple(p for value in frozen for p in value.source_dataset_provenance),
-            *bar.source_dataset_provenance,
-        )
-    }
+    by_id = _source_provenance(state, bar)
     known_at = max((bar.known_at, zone.known_at, *(value.known_at for value in frozen)))
     setup_id = deterministic_uuid7(
         "setup",
@@ -2467,7 +2596,7 @@ def _snapshot(
         target_mode=target_mode,
         frozen_feature_values=frozen,
         source_bar_record_ids=sources,
-        source_dataset_provenance=tuple(by_id[source] for source in sources if source in by_id),
+        source_dataset_provenance=_resolve_sources(sources, by_id),
         known_at=known_at,
     )
 
@@ -2611,14 +2740,24 @@ def _setup_action(config: EngineConfig, state: EngineState, bar: FeatureBar) -> 
                     runtime = next(
                         item for item in state.feature_runtime if item.feature_id == runtime_id
                     )
-                    prices = tuple(
-                        item.value
-                        for item in runtime.history[-module.peak_lookback :]
-                        if isinstance(item.value, Decimal)
+                    window = runtime.history[-module.peak_lookback :]
+                    expected_ends = tuple(
+                        bar.end_at
+                        - timedelta(
+                            seconds=config.strategy_version.execution_interval_seconds
+                            * (module.peak_lookback - offset - 1)
+                        )
+                        for offset in range(module.peak_lookback)
                     )
-                    if len(prices) < module.peak_lookback:
+                    if len(window) != module.peak_lookback or any(
+                        item.status != "KNOWN"
+                        or not isinstance(item.value, Decimal)
+                        or item.evaluation_bar_end != expected_end
+                        for item, expected_end in zip(window, expected_ends, strict=True)
+                    ):
                         fallback_reason = "NOT_READY_PEAK_WINDOW"
                         continue
+                    prices = tuple(cast(Decimal, item.value) for item in window)
                     stop = recent_peak_stop(
                         side=side,
                         prices=prices,
@@ -2773,7 +2912,7 @@ def _setup_action(config: EngineConfig, state: EngineState, bar: FeatureBar) -> 
             if any(item.family == "reversal" for item in candidates)
             else "CONFLICT_OPPOSING_ARMS"
         )
-        return _SetupAction("REJECT", reason, None, None)
+        return _SetupAction("REJECT", reason, None, None, candidate_snapshots=tuple(candidates))
     selected = select_candidate(tuple(candidates))
     assert selected is not None
     action = "ARM" if selected.family == "breakout" else "ENTRY"
@@ -2911,6 +3050,7 @@ def _create_decision(
     definition = config.strategy_version.definition
     histories = {runtime.feature_id: runtime.history for runtime in state.feature_runtime}
     selected_setup: SetupSnapshot | None = None
+    conflict_candidates: tuple[SetupSnapshot, ...] = ()
     side: str | None
     if state.position is not None:
         side = state.position.side
@@ -2958,6 +3098,7 @@ def _create_decision(
             decision_type, reason = "HOLD", unknown or "ENTRY_RULE_FAIL"
         if definition.entry_combination != "rules_only":
             setup_action = _setup_action(config, state, bar)
+            conflict_candidates = setup_action.candidate_snapshots
             use_setup = definition.entry_combination in {
                 "setups_only",
                 "setup_and_rules",
@@ -3154,6 +3295,25 @@ def _create_decision(
                 ),
             )
         )
+    elif decision_type == "REJECT" and conflict_candidates:
+        update.update(
+            setups=tuple(
+                SetupState(
+                    module_kind="breakout_retest_v1"
+                    if candidate.family == "breakout"
+                    else "reversal_setup_v1",
+                    status="CANCELLED",
+                    snapshot=candidate,
+                    expires_after_execution_index=None,
+                    reason_code=reason,
+                )
+                for candidate in conflict_candidates
+            ),
+            next_setup_sequence=max(
+                state.next_setup_sequence,
+                max(item.setup_sequence for item in conflict_candidates) + 1,
+            ),
+        )
     state = state.model_copy(update=update)
     post_hash = _state_hash(state)
     idempotency = deterministic_uuid7(
@@ -3212,22 +3372,15 @@ def _create_decision(
 def _decision_dataset(
     config: EngineConfig, sources: tuple[str, ...], state: EngineState, bar: FeatureBar
 ) -> str | None:
+    resolved = _resolve_sources(sources, _source_provenance(state, bar))
     if config.mode == "backtest":
         assert config.dataset_revision is not None
-        return config.dataset_revision.dataset_revision_id
-    mapping = {
-        item.bar_record_id: item.published_base_revision_id
-        for item in bar.source_dataset_provenance
-    }
-    for runtime in state.feature_runtime:
-        for value in runtime.history:
-            mapping.update(
-                (item.bar_record_id, item.published_base_revision_id)
-                for item in value.source_dataset_provenance
-            )
-    values = {mapping.get(source) for source in sources}
-    selected = next(iter(values)) if len(values) == 1 and None not in values else None
-    return selected
+        pinned = config.dataset_revision.dataset_revision_id
+        if any(item.published_base_revision_id != pinned for item in resolved):
+            _provenance_failure("/state/source_dataset_provenance", "BACKTEST_PIN_MISMATCH")
+        return pinned
+    revisions = {item.published_base_revision_id for item in resolved}
+    return next(iter(revisions)) if len(revisions) == 1 and None not in revisions else None
 
 
 def _next_fill_start(config: EngineConfig, earliest: datetime) -> datetime:
@@ -4379,6 +4532,7 @@ def run_engine(
 
 def checkpoint_engine(config: EngineConfig, state: EngineState) -> EngineCheckpoint:
     _validate_state_config(config, state)
+    _validate_checkpoint_state(state)
     return EngineCheckpoint(
         schema_version="v1",
         format_version=1,
@@ -4391,6 +4545,7 @@ def checkpoint_engine(config: EngineConfig, state: EngineState) -> EngineCheckpo
 
 def _validate_checkpoint_state(state: EngineState) -> None:
     failures: list[str] = []
+    _source_provenance(state)
     terminal_pairs: dict[str, set[str | None]] = {
         "ACTIVE": {None},
         "CLOSING": {None},

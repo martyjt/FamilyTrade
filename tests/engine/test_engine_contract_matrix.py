@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from familytrade.market_data.models import canonical_json_bytes
+from familytrade.market_data.models import CalendarWindow, canonical_json_bytes
 from familytrade.simulation.engine import (
+    _decision_dataset,
     checkpoint_engine,
     deterministic_uuid7,
     initialize_engine,
@@ -25,6 +26,8 @@ from familytrade.simulation.state import (
     EmissionContext,
     EngineFailure,
     FinishRunEvent,
+    SourceDatasetProvenance,
+    ZoneState,
 )
 from familytrade.strategies.definitions import (
     CompareNode,
@@ -33,9 +36,12 @@ from familytrade.strategies.definitions import (
     FeatureNode,
     FeaturePriceSource,
     FixedTicksStop,
+    FixedTicksTarget,
     OrderPolicy,
     RiskMultipleTarget,
 )
+from familytrade.strategies.indicators import FeatureBar
+from familytrade.strategies.setups import valid_bracket
 from familytrade.strategies.validation import canonical_definition_sha256
 
 from .conftest import BASE, make_backtest_config, make_bar, make_config
@@ -101,6 +107,81 @@ def _quality(config, start: datetime, status: str = "missing") -> DataQualityEve
     )
 
 
+def _fixture_epoch(config, start: datetime, *, end_minutes: int):
+    """Place synthetic stored metadata around an immutable recipe's UTC clock."""
+    start = start.astimezone(UTC)
+    window = CalendarWindow(
+        kind="open",
+        start_at=start - timedelta(hours=1),
+        end_at=start + timedelta(hours=2),
+        trading_day=start.date(),
+        reason=None,
+        ordinal=0,
+    )
+    calendar = config.calendar.model_copy(
+        update={
+            "coverage_start": window.start_at,
+            "coverage_end": window.end_at,
+            "windows": (window,),
+        }
+    )
+    contract = config.contract.model_copy(
+        update={
+            "first_trade_at": start - timedelta(days=30),
+            "entry_cutoff_at": start + timedelta(hours=1),
+            "liquidation_start_at": start + timedelta(hours=1, minutes=30),
+            "last_trade_at": start + timedelta(hours=2),
+        }
+    )
+    revision = config.dataset_revision
+    if revision is not None:
+        revision = revision.model_copy(
+            update={
+                "coverage_start": window.start_at,
+                "coverage_end": window.end_at,
+            }
+        )
+    return config.model_copy(
+        update={
+            "calendar": calendar,
+            "contract": contract,
+            "dataset_revision": revision,
+            "start_at": start,
+            "end_at": start + timedelta(minutes=end_minutes) if config.mode == "backtest" else None,
+        }
+    )
+
+
+def _fixture_bar(config, index: int, start: datetime, **prices):
+    event = make_bar(config, index, **prices)
+    bar = event.selection.bar
+    modeled_start = start + timedelta(minutes=index)
+    modeled_end = modeled_start + timedelta(minutes=1)
+    shifted = bar.model_copy(
+        update={
+            "contract_id": config.contract.contract_id,
+            "start_at": modeled_start,
+            "end_at": modeled_end,
+            "received_at": modeled_end,
+            "completed_at": modeled_end,
+            "created_at": modeled_end,
+        }
+    )
+    selection = event.selection.model_copy(update={"bar": shifted, "availability_at": modeled_end})
+    return event.model_copy(
+        update={
+            "selection": selection,
+            "recorded_at": modeled_end,
+            "emission_context": event.emission_context.model_copy(
+                update={
+                    "order_submitted_at": modeled_end,
+                    "output_recorded_at": modeled_end,
+                }
+            ),
+        }
+    )
+
+
 def test_fees_and_open_end_position_marked_not_liquidated() -> None:
     expected = _frozen("fees_and_open_end_position_marked_not_liquidated")["expected"]
     config = make_backtest_config()
@@ -126,7 +207,9 @@ def test_fees_and_open_end_position_marked_not_liquidated() -> None:
 
 
 def test_daily_loss_with_overnight_carried_position() -> None:
-    expected = _frozen("daily_loss_with_overnight_carried_position")["expected"]
+    case = _frozen("daily_loss_with_overnight_carried_position")
+    given, expected = case["given"], case["expected"]
+    epoch = datetime(2026, 9, 14, 23, 50, tzinfo=UTC)
     config = make_backtest_config()
     definition = config.strategy_version.definition.model_copy(
         update={
@@ -146,29 +229,79 @@ def test_daily_loss_with_overnight_carried_position() -> None:
             "risk_policy": config.risk_policy.model_copy(
                 update={"per_entry_loss_cap": Decimal(2000)}
             ),
+            "cost_model": config.cost_model.model_copy(update={"market_slippage_ticks": 0}),
+            "starting_cash": Decimal(given["cash_after_prior_costs"]) + Decimal("1.25"),
         }
     )
-    result = run_engine(
+    config = _fixture_epoch(config, epoch, end_minutes=20)
+    midnight = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
+    config = config.model_copy(
+        update={
+            "calendar": config.calendar.model_copy(
+                update={
+                    "windows": (
+                        CalendarWindow(
+                            kind="open",
+                            start_at=epoch - timedelta(hours=1),
+                            end_at=midnight,
+                            trading_day=epoch.date(),
+                            reason=None,
+                            ordinal=0,
+                        ),
+                        CalendarWindow(
+                            kind="open",
+                            start_at=midnight,
+                            end_at=epoch + timedelta(hours=2),
+                            trading_day=midnight.date(),
+                            reason=None,
+                            ordinal=1,
+                        ),
+                    )
+                }
+            )
+        }
+    )
+    prior = run_engine(
         config,
-        (
-            *tuple(make_bar(config, i) for i in range(6)),
-            make_bar(config, 6, low="1975", close="1975.1"),
+        tuple(_fixture_bar(config, i, epoch) for i in range(10)),
+    )
+    assert prior.state.position is not None
+    assert prior.state.equity == Decimal(given["prior_day_last_equity"])
+    assert prior.state.cash == Decimal(given["cash_after_prior_costs"])
+    carried = step_engine(
+        config,
+        prior.state,
+        _fixture_bar(
+            config,
+            10,
+            epoch,
+            open_price=given["new_day_position"]["entry"],
+            high=given["new_day_position"]["entry"],
+            low=given["new_day_mark"],
+            close=given["new_day_mark"],
         ),
     )
-    assert ("DAILY_LOSS_LIMIT" in result.state.risk.latches) is expected["risk_latched"]
-    assert (result.state.position is None) is expected["position_flattened_by_day_boundary"]
-    assert result.state.position is not None
-    assert all(
-        leg.status == "ACTIVE"
-        for leg in (
-            result.state.position.protective_bracket.stop,
-            result.state.position.protective_bracket.target,
-        )
-    )
+    position = carried.state.position
+    assert position is not None
+    assert position.opened_trading_day == epoch.date()
+    assert position.quantity == given["new_day_position"]["quantity"]
+    assert {
+        "daily_loss": f"{carried.state.risk.daily_start_equity - carried.state.equity:.2f}",
+        "risk_latched": "DAILY_LOSS_LIMIT" in carried.state.risk.latches,
+        "new_entries_allowed": "DAILY_LOSS_LIMIT" not in carried.state.risk.latches,
+        "protective_exits_active": all(
+            leg.status == "ACTIVE"
+            for leg in (position.protective_bracket.stop, position.protective_bracket.target)
+        ),
+        "position_flattened_by_day_boundary": position is None,
+    } == expected
 
 
 def test_entry_order_multi_bar_ttl_expiry() -> None:
-    expected = _frozen("entry_order_multi_bar_ttl_expiry")["expected"]
+    case = _frozen("entry_order_multi_bar_ttl_expiry")
+    given, expected = case["given"], case["expected"]
+    submitted = datetime.fromisoformat(given["submitted_at"])
+    epoch = submitted - timedelta(minutes=15)
     config = make_backtest_config()
     definition = config.strategy_version.definition.model_copy(
         update={
@@ -179,16 +312,36 @@ def test_entry_order_multi_bar_ttl_expiry() -> None:
                     name="close",
                     output_type="price",
                     unit="contract_price",
-                    interval_seconds=300,
+                    interval_seconds=given["decision_interval_seconds"],
                     parameters={},
+                ),
+            ),
+            "nodes": (
+                FeatureNode(
+                    kind="feature", node_id="limit-close", feature_id="entry-limit", offset=0
+                ),
+                ConstantNode(
+                    kind="constant",
+                    node_id="threshold",
+                    value_type="price",
+                    unit="contract_price",
+                    value=Decimal("2000.25"),
+                ),
+                CompareNode(
+                    kind="compare",
+                    node_id="entry",
+                    op="lt",
+                    left="limit-close",
+                    right="threshold",
+                    tolerance=None,
                 ),
             ),
             "order_policy": OrderPolicy(
                 entry_type="limit",
                 limit_price_source=FeaturePriceSource(
-                    kind="feature", feature_id="entry-limit", offset_ticks=-1000
+                    kind="feature", feature_id="entry-limit", offset_ticks=0
                 ),
-                entry_ttl_execution_bars=2,
+                entry_ttl_execution_bars=given["entry_ttl_execution_bars"],
                 both_hit_policy="stop_first",
                 entry_bar_exit_policy="conservative_stop_first",
             ),
@@ -200,69 +353,321 @@ def test_entry_order_multi_bar_ttl_expiry() -> None:
                 update={
                     "definition": definition,
                     "canonical_definition_sha256": canonical_definition_sha256(definition),
+                    "execution_interval_seconds": given["decision_interval_seconds"],
                 }
             )
         }
     )
-    result = run_engine(config, tuple(make_bar(config, index) for index in range(16)))
+    config = _fixture_epoch(config, epoch, end_minutes=46)
+    events = []
+    for index in range(46):
+        start = epoch + timedelta(minutes=index)
+        if start.isoformat().replace("+00:00", "Z") in given["missing_minutes"]:
+            events.append(_quality(config, start))
+        elif start == submitted + timedelta(minutes=30):
+            events.append(
+                _fixture_bar(
+                    config,
+                    index,
+                    epoch,
+                    open_price="2000.5",
+                    high="2001",
+                    low=given["first_late_touch"]["low"],
+                    close="2000.5",
+                )
+            )
+        elif start < submitted:
+            events.append(_fixture_bar(config, index, epoch))
+        else:
+            events.append(
+                _fixture_bar(
+                    config,
+                    index,
+                    epoch,
+                    open_price="2000.5",
+                    high="2001",
+                    low=given["lowest_valid_bar_low"],
+                    close="2000.5",
+                )
+            )
+    result = run_engine(config, tuple(events))
     expired = next(
         event
         for event in result.events
         if event.event_type == "ORDER_STATE" and event.payload["to"] == "EXPIRED"
     )
-    assert len(result.fills) == expected["fill_count"]
-    assert expired.payload["reason"] == expected["final_order_status"].replace(
-        "EXPIRED", "ORDER_EXPIRED"
-    )
-    assert result.state.pending_entry is None and result.state.fees == Decimal(
-        expected["commission"]
-    )
-    assert expired.effective_at == BASE + timedelta(minutes=15)
+    order = result.intents[0]
+    assert order.submitted_at == submitted
+    assert order.executable_price == Decimal(given["buy_limit"])
+    assert {
+        "fill_count": len(result.fills),
+        "expires_at": order.expires_at.isoformat().replace("+00:00", "Z"),
+        "expiry_occurs_before_late_bar": expired.effective_at <= submitted + timedelta(minutes=30)
+        and len(result.fills) == 0,
+        "missing_bar_extends_ttl": order.expires_at > submitted + timedelta(minutes=30),
+        "final_order_status": expired.payload["to"],
+        "commission": str(result.state.fees),
+    } == expected
+    assert expired.effective_at == submitted + timedelta(minutes=30)
 
 
 def test_contract_expiry_close_and_no_roll() -> None:
-    expected = _frozen("contract_expiry_close_and_no_roll")["expected"]
-    config = make_backtest_config(end_minutes=15)
-    config = config.model_copy(
+    case = _frozen("contract_expiry_close_and_no_roll")
+    given, expected = case["given"], case["expected"]
+    epoch = datetime(2026, 12, 23, 22, 45, tzinfo=UTC)
+    cutoff = datetime.fromisoformat(given["entry_cutoff_at"])
+    liquidation = datetime.fromisoformat(given["liquidation_start_at"])
+    last_trade = datetime.fromisoformat(given["last_trade_at"])
+    later_start = datetime.fromisoformat(given["first_later_eligible_bar"]["start_at"])
+    config = make_backtest_config()
+    definition = config.strategy_version.definition.model_copy(
         update={
-            "contract": config.contract.model_copy(
+            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
                 update={
-                    "entry_cutoff_at": BASE + timedelta(minutes=6, seconds=15),
-                    "liquidation_start_at": BASE + timedelta(minutes=6, seconds=30),
-                    "last_trade_at": BASE + timedelta(minutes=12),
+                    "stop": FixedTicksStop(kind="fixed_ticks", ticks=100),
                 }
             )
         }
     )
-    opened = run_engine(config, tuple(make_bar(config, i) for i in range(6)))
-    scheduled = step_engine(config, opened.state, make_bar(config, 6))
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            ),
+            "contract": config.contract.model_copy(
+                update={
+                    "expiry_label": "2026-12",
+                    "first_trade_at": epoch - timedelta(days=30),
+                    "entry_cutoff_at": cutoff,
+                    "liquidation_start_at": liquidation,
+                    "last_trade_at": last_trade,
+                }
+            ),
+        }
+    )
+    window = CalendarWindow(
+        kind="open",
+        start_at=epoch - timedelta(hours=1),
+        end_at=last_trade + timedelta(hours=1),
+        trading_day=epoch.date(),
+        reason=None,
+        ordinal=0,
+    )
+    config = config.model_copy(
+        update={
+            "calendar": config.calendar.model_copy(
+                update={
+                    "coverage_start": window.start_at,
+                    "coverage_end": window.end_at,
+                    "windows": (window,),
+                }
+            ),
+            "dataset_revision": config.dataset_revision.model_copy(
+                update={
+                    "coverage_start": window.start_at,
+                    "coverage_end": window.end_at,
+                }
+            ),
+            "start_at": epoch,
+            "end_at": last_trade + timedelta(minutes=1),
+        }
+    )
+    opened = run_engine(
+        config,
+        (
+            *tuple(_fixture_bar(config, i, epoch) for i in range(5)),
+            _fixture_bar(
+                config,
+                5,
+                epoch,
+                open_price="1999.90",
+                high="2000.00",
+                low="1999.00",
+                close="2000.00",
+            ),
+        ),
+    )
+    assert opened.state.position is not None
+    assert opened.state.position.entry_price == Decimal(given["position"]["entry"])
+    assert opened.state.position.quantity == given["position"]["quantity"]
+
+    def missing(start: datetime, end: datetime) -> DataQualityEvent:
+        return DataQualityEvent(
+            kind="data_quality_v1",
+            start_at=start,
+            end_at=end,
+            status="missing",
+            reason="NO_BAR",
+            source_bar_record_ids=(),
+            recorded_at=end,
+            emission_context=EmissionContext(
+                attempt_id=None,
+                fencing_token=1,
+                order_submitted_at=end,
+                output_recorded_at=end,
+            ),
+        )
+
+    at_cutoff = step_engine(config, opened.state, missing(epoch + timedelta(minutes=6), cutoff))
+    assert at_cutoff.state.position is not None
+    scheduled = step_engine(config, at_cutoff.state, missing(cutoff, liquidation))
     assert scheduled.state.status == "CLOSING" and scheduled.fills == ()
+    assert scheduled.state.close_intent is not None
+    assert scheduled.state.close_intent.creation_cause == "CONTRACT_LIQUIDATION"
+    waiting = step_engine(config, scheduled.state, missing(liquidation, later_start))
     closed = step_engine(
         config,
-        scheduled.state,
-        make_bar(config, 7, open_price="1998", high="1999", low="1997", close="1998"),
+        waiting.state,
+        _fixture_bar(
+            config,
+            10,
+            later_start - timedelta(minutes=10),
+            open_price=given["first_later_eligible_bar"]["open"],
+            high="1999.00",
+            low="1997.00",
+            close="1998.00",
+        ),
     )
-    assert closed.fills[0].fill_price == Decimal(expected["later_fill"]["price"])
-    assert closed.state.status == expected["final_status"]
-    assert closed.state.position is None and expected["new_contract_position"] == 0
-    assert expected["automatic_roll"] is False
+    assert len(closed.fills) == 1 and closed.fills[0].effect == "close"
+
+    limit_definition = definition.model_copy(
+        update={
+            "features": (
+                FeatureInstance(
+                    feature_id="cutoff-limit",
+                    kind="input",
+                    name="close",
+                    output_type="price",
+                    unit="contract_price",
+                    interval_seconds=300,
+                    parameters={},
+                ),
+            ),
+            "order_policy": OrderPolicy(
+                entry_type="limit",
+                limit_price_source=FeaturePriceSource(
+                    kind="feature",
+                    feature_id="cutoff-limit",
+                    offset_ticks=-1000,
+                ),
+                entry_ttl_execution_bars=100,
+                both_hit_policy="stop_first",
+                entry_bar_exit_policy="conservative_stop_first",
+            ),
+        }
+    )
+    limit_config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": limit_definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(limit_definition),
+                }
+            )
+        }
+    )
+    pending = run_engine(
+        limit_config, tuple(_fixture_bar(limit_config, i, epoch) for i in range(5))
+    )
+    assert pending.state.pending_entry is not None
+    cancelled = step_engine(
+        limit_config, pending.state, missing(epoch + timedelta(minutes=5), cutoff)
+    )
+    cutoff_event = next(
+        item
+        for item in cancelled.events
+        if item.event_type == "ORDER_STATE"
+        and item.payload.get("to") == "CANCELLED"
+        and item.payload.get("reason") == "ENTRY_CUTOFF"
+    )
+    assert cancelled.state.pending_entry is None
+    post_cutoff = run_engine(
+        limit_config,
+        tuple(_fixture_bar(limit_config, i, cutoff - timedelta(minutes=5)) for i in range(5, 10)),
+        initial_state=cancelled.state,
+    )
+    assert all(decision.decision_type != "ENTRY" for decision in post_cutoff.decisions)
+
+    # FT-11 operator/control intent is outside this pure engine. Its prefix is a
+    # fixture-sourced external projection; only the suffix is engine-observed.
+    assert "expiry" in case["covers"] and "no automatic roll" in case["covers"]
+    assert "operator_intent" not in type(scheduled.state).model_fields
+    external_intent = "operator intent CLOSE_AND_STOP"
+    liquidation_projection = (
+        f"{external_intent}; status CLOSING; no stale fill"
+        if scheduled.state.status == "CLOSING" and scheduled.fills == ()
+        else f"{external_intent}; liquidation state not observed"
+    )
+    assert {
+        "at_entry_cutoff": (
+            "pending entries cancelled and new entries blocked"
+            if cutoff_event.payload["to"] == "CANCELLED"
+            and all(decision.decision_type != "ENTRY" for decision in post_cutoff.decisions)
+            else "cutoff transition not observed"
+        ),
+        "at_liquidation_start": liquidation_projection,
+        "later_fill": {
+            "price": f"{closed.fills[0].fill_price:.2f}",
+            "realized_pnl": str(closed.fills[0].realized_pnl),
+            "exit_commission": str(closed.fills[0].commission),
+        },
+        "final_status": closed.state.status,
+        "new_contract_position": 0
+        if closed.state.position is None
+        else closed.state.position.quantity,
+        "automatic_roll": (
+            closed.state.position is not None
+            and closed.state.position.contract_id != config.contract.contract_id
+        ),
+    } == expected
 
 
 def test_contract_expiry_fixture_projects_all_fields_without_ft11_control_state() -> None:
     case = _frozen("contract_expiry_close_and_no_roll")
-    assert "operator intent CLOSE_AND_STOP" in case["expected"]["at_liquidation_start"]
+    assert "expiry" in case["covers"] and "no automatic roll" in case["covers"]
     state_fields = type(initialize_engine(make_config())).model_fields
     assert "operator_intent" not in state_fields and "control" not in state_fields
 
 
 def test_forward_delayed_bar_availability_and_exit_rule() -> None:
-    expected = _frozen("forward_delayed_bar_availability_and_exit_rule")["expected"]
+    case = _frozen("forward_delayed_bar_availability_and_exit_rule")
+    given, expected = case["given"], case["expected"]
+    execution_end = datetime.fromisoformat(given["execution_bar_end"])
+    epoch = execution_end - timedelta(minutes=10)
+    source_received = datetime.fromisoformat(given["source_bar_received_at"])
+    decision_recorded = datetime.fromisoformat(given["decision_recorded_at"])
+    submitted = datetime.fromisoformat(given["close_submitted_at"])
     config = make_config()
     definition = config.strategy_version.definition.model_copy(
         update={
             "exit_rules": config.strategy_version.definition.exit_rules.model_copy(
-                update={"long_root": "entry"}
-            )
+                update={"long_root": given["exit_root"]["node_id"]}
+            ),
+            "nodes": (
+                ConstantNode(
+                    kind="constant",
+                    node_id="entry",
+                    value_type="boolean",
+                    unit="boolean",
+                    value=True,
+                ),
+                ConstantNode(
+                    kind="constant",
+                    node_id=given["exit_root"]["node_id"],
+                    value_type="boolean",
+                    unit="boolean",
+                    value=True,
+                ),
+            ),
+            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+                update={
+                    "stop": FixedTicksStop(kind="fixed_ticks", ticks=50),
+                    "target": FixedTicksTarget(kind="fixed_ticks", ticks=50),
+                }
+            ),
         }
     )
     config = config.model_copy(
@@ -275,19 +680,128 @@ def test_forward_delayed_bar_availability_and_exit_rule() -> None:
             )
         }
     )
-    opened = run_engine(config, tuple(make_bar(config, i) for i in range(10)))
+    config = _fixture_epoch(config, epoch, end_minutes=20)
+    prefix = tuple(_fixture_bar(config, i, epoch) for i in range(5))
+    entry = _fixture_bar(
+        config,
+        5,
+        epoch,
+        open_price="1999.90",
+        high="2000.10",
+        low="1999.50",
+        close="2000.00",
+    )
+    between = tuple(_fixture_bar(config, i, epoch) for i in range(6, 9))
+    delayed = _fixture_bar(config, 9, epoch)
+    delayed = delayed.model_copy(
+        update={
+            "selection": delayed.selection.model_copy(
+                update={
+                    "availability_at": source_received,
+                    "bar": delayed.selection.bar.model_copy(
+                        update={"received_at": source_received}
+                    ),
+                }
+            ),
+            "recorded_at": decision_recorded,
+            "emission_context": delayed.emission_context.model_copy(
+                update={
+                    "order_submitted_at": submitted,
+                    "output_recorded_at": submitted,
+                }
+            ),
+        }
+    )
+    opened = run_engine(config, (*prefix, entry, *between, delayed))
     close_decision = opened.decisions[-1]
     close_intent = opened.intents[-1]
     assert close_decision.decision_type == "CLOSE" and opened.state.position is not None
-    assert close_decision.effective_at > close_decision.execution_bar_end
-    assert close_intent.active_from > close_decision.execution_bar_end
-    assert all(fill.effect != "close" for fill in opened.fills)
-    waiting = step_engine(config, opened.state, make_bar(config, 10))
-    assert waiting.fills == ()
-    closed = step_engine(config, waiting.state, make_bar(config, 11))
+    assert opened.fills[0].fill_price == Decimal(given["open_long"]["entry_fill"])
+    assert opened.state.position.protective_bracket.stop.trigger_price == Decimal(
+        given["open_long"]["protective_stop"]
+    )
+    assert opened.state.position.protective_bracket.target.trigger_price == Decimal(
+        given["open_long"]["profit_target"]
+    )
+    first = given["bars"][0]
+    second = given["bars"][1]
+    waiting = step_engine(
+        config,
+        opened.state,
+        _fixture_bar(
+            config,
+            10,
+            epoch,
+            open_price=first["open"],
+            high=first["high"],
+            low=first["low"],
+            close=first["close"],
+        ),
+    )
+    closed = step_engine(
+        config,
+        waiting.state,
+        _fixture_bar(
+            config,
+            11,
+            epoch,
+            open_price=second["open"],
+            high=second["high"],
+            low=second["low"],
+            close=second["close"],
+        ),
+    )
     assert closed.fills[0].effect == "close"
-    assert close_intent.active_from == closed.fills[0].model_time
-    assert expected["bar_1015_fill_count"] == 0
+    bracket_ids = {
+        opened.state.position.protective_bracket.stop.order_id,
+        opened.state.position.protective_bracket.target.order_id,
+    }
+    cancelled_ids = {
+        item.payload["order_id"]
+        for item in closed.events
+        if item.event_type == "ORDER_STATE"
+        and item.payload.get("to") == "CANCELLED"
+        and item.payload.get("order_id") in bracket_ids
+    }
+    gap_bar = _fixture_bar(
+        config,
+        11,
+        epoch,
+        open_price=given["ordering_subcase_opening_stop_gap"]["bar_open"],
+        high="1994.50",
+        low="1993.50",
+        close="1994.20",
+    )
+    stop_gap = step_engine(config, waiting.state, gap_bar)
+    assert stop_gap.fills[0].reason == "STOP_GAP"
+    assert stop_gap.fills[0].effect == "close"
+    assert stop_gap.state.position is None
+    assert {
+        "execution_bar_end": close_decision.execution_bar_end.isoformat().replace("+00:00", "Z"),
+        "effective_at": close_decision.effective_at.isoformat().replace("+00:00", "Z"),
+        "active_from": close_intent.active_from.isoformat().replace("+00:00", "Z"),
+        "bar_1015_fill_count": len(waiting.fills),
+        "exit_fill": f"{closed.fills[0].fill_price:.2f}",
+        "cash": str(closed.state.cash),
+        "fees_total_including_entry": str(closed.state.fees),
+        "later_intrabar_target_fill_count": sum(
+            fill.reason.startswith("TARGET") for fill in closed.fills
+        ),
+        "bracket_cancelled_by_close": cancelled_ids == bracket_ids,
+        "opening_stop_gap_subcase": {
+            "stop_fill": f"{stop_gap.fills[0].fill_price:.2f}",
+            "market_close_fill_count": sum(
+                fill.order_id == close_intent.order_id for fill in stop_gap.fills
+            ),
+            "target_fill_count": sum(fill.reason.startswith("TARGET") for fill in stop_gap.fills),
+            "reason": (
+                "opening bracket gap resolves before active market close"
+                if stop_gap.fills[0].reason == "STOP_GAP"
+                and all(fill.order_id != close_intent.order_id for fill in stop_gap.fills)
+                else "opening bracket priority not observed"
+            ),
+        },
+    } == expected
 
 
 def test_exit_rule_unknown_does_not_close() -> None:
@@ -348,16 +862,22 @@ def test_exit_rule_unknown_does_not_close() -> None:
     )
     result = run_engine(config, tuple(make_bar(config, index) for index in range(10)))
     decision = result.decisions[-1]
-    assert result.state.position is not None
-    assert (decision.decision_type, decision.reason_code) == (
-        "HOLD",
-        expected["decision_reason"],
-    )
-    assert decision.evidence.results[0].reason_code == expected["decision_reason"]
-    assert (
-        sum(intent.kind == "close" for intent in result.intents) == expected["close_intent_count"]
-    )
-    assert sum(fill.effect == "close" for fill in result.fills) == expected["fill_count"]
+    position = result.state.position
+    assert position is not None and decision.decision_type == "HOLD"
+    assert decision.evidence.results[0].reason_code == decision.reason_code
+    assert {
+        "close_intent_count": sum(intent.kind == "close" for intent in result.intents),
+        "fill_count": sum(fill.effect == "close" for fill in result.fills),
+        "protective_bracket": (
+            "active"
+            if all(
+                leg.status == "ACTIVE"
+                for leg in (position.protective_bracket.stop, position.protective_bracket.target)
+            )
+            else "inactive"
+        ),
+        "decision_reason": decision.reason_code,
+    } == expected
 
 
 def test_derived_buckets_match_ft05_aggregation_and_reject_scheduled_partials() -> None:
@@ -788,17 +1308,226 @@ def test_entry_exit_liquidation_and_force_close_opening_gaps_never_precede_submi
 
 
 def test_decision_dataset_revision_is_shared_base_or_null_from_all_cited_sources() -> None:
-    config, result = _trade_result(bars=5)
-    assert result.decisions[0].dataset_revision_id == config.dataset_revision.dataset_revision_id
+    config = make_config()
+    r1 = "018f4c00-0000-7000-8000-000000000071"
+    r2 = "018f4c00-0000-7000-8000-000000000072"
+    first = tuple(
+        make_bar(config, i).model_copy(update={"published_base_revision_id": r1}) for i in range(5)
+    )
+    run1 = run_engine(config, first)
+    assert run1.decisions[0].dataset_revision_id == r1
+    restored = restore_engine(config, run1.checkpoint)
+    a = first[0].selection.bar.bar_record_id
+    old_zone = ZoneState(
+        zone_id="018f4c00-0000-7000-8000-000000000079",
+        kind="support",
+        low=Decimal(1999),
+        high=Decimal(2000),
+        creation_sequence=0,
+        touch_count=1,
+        created_zone_index=0,
+        last_touch_zone_index=0,
+        last_filled_execution_index=None,
+        pivot_bar_end=first[0].selection.bar.end_at,
+        confirmation_bar_end=first[0].selection.bar.end_at,
+        known_at=first[0].selection.bar.end_at,
+        source_bar_record_ids=(a,),
+        source_dataset_provenance=(
+            SourceDatasetProvenance(bar_record_id=a, published_base_revision_id=r1),
+        ),
+    )
+    restored = restore_engine(
+        config, checkpoint_engine(config, restored.model_copy(update={"zones": (old_zone,)}))
+    )
+    second = tuple(
+        make_bar(config, i).model_copy(update={"published_base_revision_id": r2})
+        for i in range(5, 10)
+    )
+    run2 = run_engine(config, second, initial_state=restored)
+    assert run2.decisions[-1].dataset_revision_id == r2
+    b = second[-1].selection.bar.bar_record_id
+    current = FeatureBar(
+        start_at=second[-1].selection.bar.start_at,
+        end_at=second[-1].selection.bar.end_at,
+        open=second[-1].selection.bar.open,
+        high=second[-1].selection.bar.high,
+        low=second[-1].selection.bar.low,
+        close=second[-1].selection.bar.close,
+        volume=second[-1].selection.bar.volume,
+        source_bar_record_ids=(second[-1].selection.bar.bar_record_id,),
+        source_dataset_provenance=(
+            SourceDatasetProvenance(
+                bar_record_id=second[-1].selection.bar.bar_record_id,
+                published_base_revision_id=r2,
+            ),
+        ),
+        known_at=second[-1].selection.availability_at,
+    )
+    assert _decision_dataset(config, (a,), run2.state, current) == r1
+    assert _decision_dataset(config, (b,), run2.state, current) == r2
+    assert _decision_dataset(config, (a, b), run2.state, current) is None
+    c = "018f4c00-0000-7000-8000-000000000073"
+    active = FeatureBar(
+        start_at=current.start_at,
+        end_at=current.end_at,
+        open=current.open,
+        high=current.high,
+        low=current.low,
+        close=current.close,
+        volume=current.volume,
+        source_bar_record_ids=(c,),
+        source_dataset_provenance=(
+            SourceDatasetProvenance(bar_record_id=c, published_base_revision_id=None),
+        ),
+        known_at=current.known_at,
+    )
+    assert _decision_dataset(config, (a, c), run2.state, active) is None
+    assert _decision_dataset(config, (b, c), run2.state, active) is None
+
+    # The public setup path must preserve a cited old-zone base across a
+    # checkpoint, not just reduce an artificially supplied source tuple.
+    from .test_reversal_breakout import _configured, _zone
+
+    setup_config = _configured(sides="long", pivot_radius=50)
+    warm_inputs = tuple(
+        make_bar(setup_config, i, low="1999", high="2001", close="2000").model_copy(
+            update={"published_base_revision_id": r1}
+        )
+        for i in range(5)
+    )
+    warmed = run_engine(setup_config, warm_inputs)
+    zone_source = warm_inputs[0].selection.bar.bar_record_id
+    cited_zone = _zone(kind="support", low="2000", high="2000.5").model_copy(
+        update={
+            "source_bar_record_ids": (zone_source,),
+            "source_dataset_provenance": (
+                SourceDatasetProvenance(bar_record_id=zone_source, published_base_revision_id=r1),
+            ),
+        }
+    )
+    checkpointed_zone = restore_engine(
+        setup_config,
+        checkpoint_engine(
+            setup_config,
+            warmed.state.model_copy(update={"zones": (cited_zone,), "next_zone_sequence": 1}),
+        ),
+    )
+    arm_inputs = tuple(
+        make_bar(
+            setup_config, i, open_price="2005", low="2004", high="2006", close="2005"
+        ).model_copy(update={"published_base_revision_id": r1})
+        for i in range(5, 10)
+    )
+    armed = run_engine(setup_config, arm_inputs, initial_state=checkpointed_zone)
+    assert armed.decisions[-1].reason_code == "ARM_LONG"
+    assert armed.decisions[-1].evidence.selected_setup is not None
+    assert cited_zone.zone_id in armed.decisions[-1].evidence.selected_setup.source_zone_ids
+    assert zone_source in armed.decisions[-1].source_bar_record_ids
+    assert armed.decisions[-1].dataset_revision_id == r1
+    assert all(
+        source.published_base_revision_id == r1
+        for source in armed.decisions[-1].evidence.selected_setup.source_dataset_provenance
+    )
+
+    backtest = make_backtest_config()
+    pinned = backtest.dataset_revision.dataset_revision_id
+    event = make_bar(backtest, 0)
+    state = step_engine(backtest, initialize_engine(backtest), event).state
+    zone = ZoneState(
+        zone_id="018f4c00-0000-7000-8000-000000000079",
+        kind="support",
+        low=Decimal(1999),
+        high=Decimal(2000),
+        creation_sequence=0,
+        touch_count=0,
+        created_zone_index=0,
+        last_touch_zone_index=0,
+        last_filled_execution_index=None,
+        pivot_bar_end=event.selection.bar.end_at,
+        confirmation_bar_end=event.selection.bar.end_at,
+        known_at=event.selection.bar.end_at,
+        source_bar_record_ids=("018f4c00-0000-7000-8000-000000000078",),
+        source_dataset_provenance=(
+            SourceDatasetProvenance(
+                bar_record_id="018f4c00-0000-7000-8000-000000000078",
+                published_base_revision_id=r2,
+            ),
+        ),
+    )
+    conflicting = state.model_copy(update={"zones": (zone,)})
+    with pytest.raises(EngineFailure) as caught:
+        _decision_dataset(
+            backtest,
+            (zone.source_bar_record_ids[0],),
+            conflicting,
+            FeatureBar(
+                start_at=event.selection.bar.start_at,
+                end_at=event.selection.bar.end_at,
+                open=event.selection.bar.open,
+                high=event.selection.bar.high,
+                low=event.selection.bar.low,
+                close=event.selection.bar.close,
+                volume=event.selection.bar.volume,
+                source_bar_record_ids=(event.selection.bar.bar_record_id,),
+                source_dataset_provenance=(
+                    SourceDatasetProvenance(
+                        bar_record_id=event.selection.bar.bar_record_id,
+                        published_base_revision_id=pinned,
+                    ),
+                ),
+                known_at=event.selection.bar.end_at,
+            ),
+        )
+    assert caught.value.error.code == "CHECKPOINT_MISMATCH"
 
 
 def test_checkpoint_preserves_bounded_source_provenance_across_base_transition() -> None:
-    config, result = _trade_result()
-    restored = restore_engine(config, result.checkpoint)
+    config = make_config()
+    r1 = "018f4c00-0000-7000-8000-000000000071"
+    r2 = "018f4c00-0000-7000-8000-000000000072"
+    first = make_bar(config, 0).model_copy(update={"published_base_revision_id": r1})
+    before = step_engine(config, initialize_engine(config), first)
+    restored = restore_engine(config, checkpoint_engine(config, before.state))
     assert (
         restored.last_mark_source_dataset_provenance
-        == result.state.last_mark_source_dataset_provenance
+        == before.state.last_mark_source_dataset_provenance
     )
+    assert restored.last_mark_source_dataset_provenance[0].published_base_revision_id == r1
+    later = make_bar(config, 1).model_copy(update={"published_base_revision_id": r2})
+    after = step_engine(config, restored, later)
+    assert after.state.last_published_base_revision_id == r2
+    assert after.state.feature_runtime == before.state.feature_runtime
+    assert after.state.interval_buckets[0].published_base_revision_ids[:2] == (r1, r2)
+    source = first.selection.bar.bar_record_id
+    zone = ZoneState(
+        zone_id="018f4c00-0000-7000-8000-000000000079",
+        kind="support",
+        low=Decimal(1999),
+        high=Decimal(2000),
+        creation_sequence=0,
+        touch_count=0,
+        created_zone_index=0,
+        last_touch_zone_index=0,
+        last_filled_execution_index=None,
+        pivot_bar_end=first.selection.bar.end_at,
+        confirmation_bar_end=first.selection.bar.end_at,
+        known_at=first.selection.bar.end_at,
+        source_bar_record_ids=(source,),
+        source_dataset_provenance=(
+            SourceDatasetProvenance(bar_record_id=source, published_base_revision_id=r1),
+        ),
+    )
+    with_zone = after.state.model_copy(update={"zones": (zone,)})
+    assert (
+        restore_engine(config, checkpoint_engine(config, with_zone))
+        .zones[0]
+        .source_dataset_provenance
+        == zone.source_dataset_provenance
+    )
+    missing = zone.model_copy(update={"source_dataset_provenance": ()})
+    with pytest.raises(EngineFailure) as caught:
+        checkpoint_engine(config, with_zone.model_copy(update={"zones": (missing,)}))
+    assert caught.value.error.code == "CHECKPOINT_MISMATCH"
 
 
 def test_post_terminal_replay_duplicate_conflict_and_run_finished_precedence() -> None:
@@ -878,12 +1607,23 @@ def test_signal_time_market_sizing_absolute_and_relative_stops_long_short() -> N
 
 
 def test_generic_market_entry_resolves_relative_bracket() -> None:
-    expected = _frozen("generic_market_entry_resolves_relative_bracket")["expected"]
+    case = _frozen("generic_market_entry_resolves_relative_bracket")
+    given, expected = case["given"], case["expected"]
+    signal = datetime.fromisoformat(given["signal_time"])
+    epoch = signal - timedelta(minutes=5)
     config = make_backtest_config()
     definition = config.strategy_version.definition.model_copy(
         update={
             "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
-                update={"target": RiskMultipleTarget(kind="risk_multiple", multiple="2")}
+                update={
+                    "stop": FixedTicksStop(
+                        kind="fixed_ticks", ticks=given["frozen_exit_policy"]["stop"]["ticks"]
+                    ),
+                    "target": RiskMultipleTarget(
+                        kind="risk_multiple",
+                        multiple=given["frozen_exit_policy"]["target"]["multiple"],
+                    ),
+                }
             )
         }
     )
@@ -897,11 +1637,20 @@ def test_generic_market_entry_resolves_relative_bracket() -> None:
             )
         }
     )
+    config = _fixture_epoch(config, epoch, end_minutes=8)
     result = run_engine(
         config,
         (
-            *tuple(make_bar(config, index) for index in range(6)),
-            make_bar(config, 6, close="2000.5"),
+            *tuple(_fixture_bar(config, index, epoch) for index in range(5)),
+            _fixture_bar(
+                config,
+                5,
+                epoch,
+                open_price=given["eligible_bar"]["open"],
+                high=given["eligible_bar"]["high"],
+                low=given["eligible_bar"]["low"],
+                close=given["eligible_bar"]["close"],
+            ),
         ),
     )
     intent = result.intents[0]
@@ -909,15 +1658,97 @@ def test_generic_market_entry_resolves_relative_bracket() -> None:
     assert intent.order_type == "market"
     assert intent.stop_price is None and intent.target_price is None
     assert position is not None
-    assert position.entry_price == Decimal(expected["entry_fill"])
-    assert position.protective_bracket.stop.trigger_price == Decimal(expected["resolved_stop"])
-    assert position.protective_bracket.target.trigger_price == Decimal(expected["resolved_target"])
-    assert len(result.fills) == expected["entry_fill_count"]
-    assert result.state.cash == Decimal(expected["cash"])
-    assert result.state.equity == Decimal(expected["equity"])
-    assert (
-        position.protective_bracket.stop is None or position.protective_bracket.target is None
-    ) is expected["unprotected_committed_position_possible"]
+    assert intent.submitted_at == signal
+
+    limit_definition = definition.model_copy(
+        update={
+            "features": (
+                FeatureInstance(
+                    feature_id="limit-source",
+                    kind="input",
+                    name="close",
+                    output_type="price",
+                    unit="contract_price",
+                    interval_seconds=300,
+                    parameters={},
+                ),
+            ),
+            "order_policy": OrderPolicy(
+                entry_type="limit",
+                limit_price_source=FeaturePriceSource(
+                    kind="feature",
+                    feature_id="limit-source",
+                    offset_ticks=0,
+                ),
+                entry_ttl_execution_bars=2,
+                both_hit_policy="stop_first",
+                entry_bar_exit_policy="conservative_stop_first",
+            ),
+        }
+    )
+    limit_config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": limit_definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(limit_definition),
+                }
+            )
+        }
+    )
+    limit_result = run_engine(
+        limit_config,
+        (
+            *tuple(_fixture_bar(limit_config, index, epoch) for index in range(5)),
+            _fixture_bar(
+                limit_config,
+                5,
+                epoch,
+                open_price=given["limit_companion"]["favorable_gap_open"],
+                high=given["limit_companion"]["buy_limit"],
+                low=given["limit_companion"]["favorable_gap_open"],
+                close=given["limit_companion"]["favorable_gap_open"],
+            ),
+        ),
+    )
+    limit_position = limit_result.state.position
+    assert limit_position is not None
+    limit_intent = limit_result.intents[0]
+    assert limit_intent.executable_price == Decimal(given["limit_companion"]["buy_limit"])
+    assert {
+        "entry_fill": f"{position.entry_price:.2f}",
+        "resolved_stop": f"{position.protective_bracket.stop.trigger_price:.2f}",
+        "resolved_target": f"{position.protective_bracket.target.trigger_price:.2f}",
+        "geometry_valid": valid_bracket(
+            side="long",
+            entry=position.entry_price,
+            stop=position.protective_bracket.stop.trigger_price,
+            target=position.protective_bracket.target.trigger_price,
+        ),
+        "entry_fill_count": len(result.fills),
+        "unprotected_committed_position_possible": not all(
+            leg.status == "ACTIVE"
+            for leg in (position.protective_bracket.stop, position.protective_bracket.target)
+        ),
+        "cash": str(result.state.cash),
+        "equity": str(result.state.equity),
+        "limit_companion": {
+            "entry_fill": f"{limit_position.entry_price:.2f}",
+            "frozen_stop": f"{limit_position.protective_bracket.stop.trigger_price:.2f}",
+            "frozen_target": f"{limit_position.protective_bracket.target.trigger_price:.2f}",
+            "bracket_moved_at_fill": (
+                limit_position.protective_bracket.stop.trigger_price != limit_intent.stop_price
+                or limit_position.protective_bracket.target.trigger_price
+                != limit_intent.target_price
+            ),
+            "geometry_valid": valid_bracket(
+                side="long",
+                entry=limit_position.entry_price,
+                stop=limit_position.protective_bracket.stop.trigger_price,
+                target=limit_position.protective_bracket.target.trigger_price,
+            ),
+        },
+    } == expected
 
 
 def test_market_fill_time_gap_revalidates_without_resizing_either_sizing_policy() -> None:

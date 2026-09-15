@@ -39,18 +39,21 @@ from familytrade.strategies.definitions import (
     ConstantNode,
     FeatureInstance,
     FeatureNode,
+    FeaturePriceSource,
     FixedTicksStop,
     FixedTicksTarget,
     GroupNode,
+    OrderPolicy,
+    RiskMultipleTarget,
     TemporalCompareNode,
 )
-from familytrade.strategies.indicators import confirmed_pivot_index, quantize_feature, swing_regime
+from familytrade.strategies.indicators import quantize_feature
 from familytrade.strategies.rules import evaluate_rule
 from familytrade.strategies.setups import r_multiple_target, valid_bracket
 from familytrade.strategies.validation import canonical_definition_sha256
 from familytrade.strategies.zones import next_zone_target
 
-from .conftest import make_backtest_config, make_bar
+from .conftest import BASE, make_backtest_config, make_bar
 
 _FROZEN_PATH = Path(__file__).parents[2] / "docs" / "contracts-examples-v1.json"
 
@@ -76,6 +79,7 @@ def _fixed_trade(
     exit_high: str,
     exit_low: str,
     exit_close: str,
+    entry_limit: str | None = None,
 ):
     config = make_backtest_config()
     if side == "short":
@@ -84,16 +88,38 @@ def _fixed_trade(
         config = config.model_copy(
             update={"strategy_version": make_config(side="short").strategy_version}
         )
-    definition = config.strategy_version.definition.model_copy(
-        update={
-            "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
-                update={
-                    "stop": FixedTicksStop(kind="fixed_ticks", ticks=stop_ticks),
-                    "target": FixedTicksTarget(kind="fixed_ticks", ticks=target_ticks),
-                }
-            )
-        }
-    )
+    updates = {
+        "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+            update={
+                "stop": FixedTicksStop(kind="fixed_ticks", ticks=stop_ticks),
+                "target": FixedTicksTarget(kind="fixed_ticks", ticks=target_ticks),
+            }
+        )
+    }
+    if entry_limit is not None:
+        updates["features"] = (
+            FeatureInstance(
+                feature_id="fixture-limit",
+                kind="input",
+                name="close",
+                output_type="price",
+                unit="contract_price",
+                interval_seconds=300,
+                parameters={},
+            ),
+        )
+        updates["order_policy"] = OrderPolicy(
+            entry_type="limit",
+            limit_price_source=FeaturePriceSource(
+                kind="feature",
+                feature_id="fixture-limit",
+                offset_ticks=int((Decimal(entry_limit) - Decimal(2000)) / Decimal("0.1")),
+            ),
+            entry_ttl_execution_bars=2,
+            both_hit_policy="stop_first",
+            entry_bar_exit_policy="conservative_stop_first",
+        )
+    definition = config.strategy_version.definition.model_copy(update=updates)
     strategy = config.strategy_version.model_copy(
         update={
             "definition": definition,
@@ -396,6 +422,7 @@ def test_checkpoint_rejects_corruption_config_change_and_unknown_format(config) 
 
 def test_market_entry_gap_rejected_by_fill_time_risk() -> None:
     expected = _frozen("market_entry_gap_rejected_by_fill_time_risk")["expected"]
+    projection = {}
     for entry, stop in (
         (Decimal("2010.10"), Decimal("1996.90")),
         (Decimal("1989.90"), Decimal("2003.10")),
@@ -433,13 +460,22 @@ def test_market_entry_gap_rejected_by_fill_time_risk() -> None:
         entered = run_engine(config, _bars(config, 0, 5, **signal_prices), initial_state=initial)
         waiting = step_engine(config, entered.state, make_bar(config, 5))
         rejected = step_engine(config, waiting.state, make_bar(config, 6, **gap_prices))
-        side_expected = expected[side]
-        assert len(rejected.fills) == side_expected["entry_fill_count"]
-        assert rejected.state.pending_entry is None
-        assert any(
-            event.payload.get("reason") == side_expected["reason"] for event in rejected.events
+        cancellation = next(
+            event
+            for event in rejected.events
+            if event.event_type == "ORDER_STATE"
+            and event.payload.get("to") == "CANCELLED"
+            and event.payload.get("reason") == "RISK_GAP"
         )
-        assert rejected.state.cash == Decimal(side_expected["cash"])
+        projection[side] = {
+            "entry_fill_count": sum(fill.effect == "open" for fill in rejected.fills),
+            "order_status": cancellation.payload["to"],
+            "reason": cancellation.payload["reason"],
+            "commission": str(rejected.state.fees),
+            "cash": str(rejected.state.cash),
+        }
+        assert rejected.state.pending_entry is None
+    assert projection == expected
 
 
 def test_long_target_gap_price_improvement() -> None:
@@ -448,21 +484,22 @@ def test_long_target_gap_price_improvement() -> None:
         side="long",
         stop_ticks=77,
         target_ticks=25,
-        entry_open="2002.4",
-        entry_high="2003",
-        entry_low="2002",
-        entry_close="2002.5",
+        entry_open="2003.00",
+        entry_high="2003.20",
+        entry_low="2002.40",
+        entry_close="2002.80",
         exit_open="2005.5",
         exit_high="2006",
         exit_low="2005",
         exit_close="2005.8",
+        entry_limit="2002.50",
     )
-    assert [item.fill_price for item in engine.fills] == [
-        Decimal(item) for item in expected["fills"]
-    ]
-    assert engine.state.fees == Decimal(expected["fees"])
-    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
-    assert engine.state.cash == Decimal(expected["cash"])
+    assert {
+        "fills": [f"{item.fill_price:.2f}" for item in engine.fills],
+        "fees": str(engine.state.fees),
+        "realized_pnl": str(engine.state.realized_pnl),
+        "cash": str(engine.state.cash),
+    } == expected
     result = protective_fill(
         position_side="long",
         stop=Decimal("1994.8"),
@@ -485,21 +522,22 @@ def test_short_target_gap_price_improvement() -> None:
         side="short",
         stop_ticks=57,
         target_ticks=25,
-        entry_open="2008.1",
-        entry_high="2008.5",
-        entry_low="2007.5",
-        entry_close="2008",
+        entry_open="2007.00",
+        entry_high="2008.10",
+        entry_low="2006.80",
+        entry_close="2007.50",
         exit_open="2005",
         exit_high="2005.4",
         exit_low="2004.8",
         exit_close="2005.1",
+        entry_limit="2008.00",
     )
-    assert [item.fill_price for item in engine.fills] == [
-        Decimal(item) for item in expected["fills"]
-    ]
-    assert engine.state.fees == Decimal(expected["fees"])
-    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
-    assert engine.state.cash == Decimal(expected["cash"])
+    assert {
+        "fills": [f"{item.fill_price:.2f}" for item in engine.fills],
+        "fees": str(engine.state.fees),
+        "realized_pnl": str(engine.state.realized_pnl),
+        "cash": str(engine.state.cash),
+    } == expected
     result = protective_fill(
         position_side="short",
         stop=Decimal("2013.7"),
@@ -529,10 +567,23 @@ def test_both_hit_after_open_fill_is_stop_first() -> None:
         exit_low="1997",
         exit_close="2001",
     )
-    assert engine.fills[-1].reason == "BOTH_HIT_STOP_FIRST"
-    assert engine.state.position is None and engine.state.fees == Decimal(expected["fees"])
-    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
-    assert engine.state.cash == Decimal(expected["cash"])
+    target_id = next(
+        order.order_id for order in engine.protective_orders if order.role == "profit_target"
+    )
+    assert {
+        "filled_exit": "stop" if engine.fills[-1].reason == "BOTH_HIT_STOP_FIRST" else "target",
+        "target_cancelled": any(
+            event.event_type == "ORDER_STATE"
+            and event.payload.get("order_id") == target_id
+            and event.payload.get("to") == "CANCELLED"
+            and event.payload.get("reason") == "POSITION_FLAT"
+            for event in engine.events
+        ),
+        "fees": str(engine.state.fees),
+        "realized_pnl": str(engine.state.realized_pnl),
+        "cash": str(engine.state.cash),
+        "maximum_drawdown": str(engine.state.risk.maximum_drawdown),
+    } == expected
     result = protective_fill(
         position_side="long",
         stop=Decimal(1998),
@@ -1026,61 +1077,178 @@ def test_rule_result_all_any_none_truth_reason_matrix(config) -> None:
 
 
 def test_confirmed_pivot_plateau_and_regime_availability() -> None:
-    _frozen("confirmed_pivot_plateau_and_regime_availability")
-    highs = tuple(Decimal(item) for item in ("10", "15", "15", "14", "13", "12"))
-    assert confirmed_pivot_index(highs[:4], candidate_index=2, left=2, right=2, high=True) is None
-    assert confirmed_pivot_index(highs[:5], candidate_index=2, left=2, right=2, high=True) == 2
-    assert (
-        swing_regime(
-            prior_high=Decimal(15),
-            latest_high=Decimal(16),
-            prior_low=Decimal(9),
-            latest_low=Decimal(10),
-        )
-        == "bullish"
+    case = _frozen("confirmed_pivot_plateau_and_regime_availability")
+    given, expected = case["given"], case["expected"]
+    config = make_backtest_config()
+    pivot = FeatureInstance(
+        feature_id="fixture-pivot-high",
+        kind="indicator",
+        name="confirmed_pivot_v1",
+        output_type="level",
+        unit="contract_price",
+        interval_seconds=60,
+        parameters={"pivot_kind": "high", "left": given["left"], "right": given["right"]},
     )
-    assert (
-        swing_regime(
-            prior_high=Decimal(15),
-            latest_high=Decimal(15),
-            prior_low=Decimal(9),
-            latest_low=Decimal(10),
-        )
-        == "unknown"
+    regime = FeatureInstance(
+        feature_id="fixture-regime",
+        kind="indicator",
+        name="swing_regime_v1",
+        output_type="regime",
+        unit="regime",
+        interval_seconds=60,
+        parameters={"left": given["left"], "right": given["right"]},
     )
+    definition = config.strategy_version.definition.model_copy(
+        update={
+            "features": (pivot, regime),
+            "nodes": (
+                ConstantNode(
+                    kind="constant",
+                    node_id="entry",
+                    value_type="boolean",
+                    unit="boolean",
+                    value=False,
+                ),
+            ),
+        }
+    )
+    config = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(definition),
+                }
+            )
+        }
+    )
+    highs = tuple(
+        Decimal(item)
+        for item in (
+            *given["highs_indices_0_to_5"],
+            "12",
+            "12",
+            "12",
+            "12",
+            "12",
+            "14",
+            given["four_regime_pivots"]["latest_high"],
+            "15",
+            "14",
+            "13",
+            "12",
+            "12",
+            "12",
+            "12",
+            "12",
+        )
+    )
+    lows = tuple(
+        Decimal(item)
+        for item in (
+            "8",
+            "9",
+            "10",
+            "11",
+            "11",
+            "10",
+            "11",
+            given["four_regime_pivots"]["prior_low"],
+            "11",
+            "11",
+            "11",
+            "11",
+            "11",
+            "11",
+            "12",
+            "11",
+            given["four_regime_pivots"]["latest_low"],
+            "11",
+            "12",
+            "12",
+            "12",
+        )
+    )
+    state = initialize_engine(config)
+    pivot_values, regime_values = [], []
+    for index, (high, low) in enumerate(zip(highs, lows, strict=True)):
+        midpoint = (high + low) / Decimal(2)
+        event = make_bar(
+            config,
+            index,
+            open_price=str(midpoint),
+            high=str(high),
+            low=str(low),
+            close=str(midpoint),
+        )
+        state = step_engine(config, state, event).state
+        values = {value.feature_id: value for value in state.feature_values}
+        pivot_values.append(values[pivot.feature_id])
+        regime_values.append(values[regime.feature_id])
+    runtime = next(item for item in state.feature_runtime if item.feature_id == pivot.feature_id)
+    point = next(
+        item
+        for item in runtime.accumulator.confirmed_highs
+        if item.value == Decimal(given["highs_indices_0_to_5"][given["candidate_index"]])
+    )
+    confirmed_index = int((point.evaluation_bar_end - BASE).total_seconds() // 60) - 1
+    assert {
+        "pivot_high_index": confirmed_index,
+        "available_before_index4": any(value.status == "KNOWN" for value in pivot_values[:4]),
+        "available_after_index4_completion": pivot_values[4].status == "KNOWN",
+        "regime_before_all_four_confirmations": (
+            "unknown" if regime_values[17].status == "UNKNOWN" else regime_values[17].value
+        ),
+        "regime_at_index20": regime_values[20].value,
+    } == expected
 
 
 def test_pivot_confirmation_lag() -> None:
     from .test_reversal_breakout import _bars, _case, _configured
 
-    _case("pivot_confirmation_lag")
-    highs = tuple(Decimal(item) for item in ("10", "15", "15", "14", "13"))
-    for observed in range(3, 5):
-        result = confirmed_pivot_index(
-            highs[:observed], candidate_index=2, left=2, right=2, high=True
+    case = _case("pivot_confirmation_lag")
+    given = case["given"]
+    highs = tuple(Decimal(item) for item in given["zone_bar_highs_indices_0_to_6"])
+    config = _configured(
+        breakout=False,
+        reversal=False,
+        sides="long",
+        pivot_radius=given["pivot_left"],
+    )
+    state = initialize_engine(config)
+    observed = []
+    for zone_index, high in enumerate(highs):
+        result = run_engine(
+            config,
+            _bars(
+                config,
+                zone_index * 5,
+                (zone_index + 1) * 5,
+                open_price=str(high - 1),
+                high=str(high),
+                low=str(high - 2),
+                close=str(high - 1),
+            ),
+            initial_state=state,
         )
-        assert result is None
-    assert confirmed_pivot_index(highs, candidate_index=2, left=2, right=2, high=True) == 2
-    config = _configured(breakout=False, reversal=False, sides="long")
-    first = run_engine(
-        config,
-        _bars(config, 0, 5, open_price="9", high="10", low="8", close="9"),
-    )
-    second = run_engine(
-        config,
-        _bars(config, 5, 10, open_price="10", high="15", low="9", close="10"),
-        initial_state=first.state,
-    )
-    assert second.state.zones == ()
-    third = run_engine(
-        config,
-        _bars(config, 10, 15, open_price="8", high="12", low="7", close="8"),
-        initial_state=second.state,
-    )
-    resistance = next(zone for zone in third.state.zones if zone.kind == "resistance")
-    assert resistance.high == Decimal(15)
-    assert resistance.pivot_bar_end == make_bar(config, 9).selection.bar.end_at
-    assert resistance.confirmation_bar_end == make_bar(config, 14).selection.bar.end_at
+        state = result.state
+        observed.append(tuple(item for item in state.zones if item.kind == "resistance"))
+    pivot = next(item for item in observed[6] if item.high == highs[3])
+    assert all(not observed[index] for index in (3, 4, 5))
+    assert pivot.pivot_bar_end == make_bar(config, 19).selection.bar.end_at
+    assert pivot.confirmation_bar_end == make_bar(config, 34).selection.bar.end_at
+    assert [
+        (
+            "no pivot event is available at indices 3, 4 or 5"
+            if all(not observed[index] for index in (3, 4, 5))
+            else "premature pivot"
+        ),
+        (
+            f"PIVOT_HIGH price {pivot.high:.2f} is emitted only after zone bar 6 completes"
+            if pivot.confirmation_bar_end == make_bar(config, 34).selection.bar.end_at
+            else "late/early pivot"
+        ),
+    ] == case["expected"]
 
 
 def test_long_entry_then_stop_gap() -> None:
@@ -1089,21 +1257,24 @@ def test_long_entry_then_stop_gap() -> None:
         side="long",
         stop_ticks=77,
         target_ticks=25,
-        entry_open="2002.4",
-        entry_high="2003",
-        entry_low="2002",
-        entry_close="2002.5",
+        entry_open="2003.00",
+        entry_high="2003.20",
+        entry_low="2002.40",
+        entry_close="2002.80",
         exit_open="1994",
         exit_high="1994.5",
         exit_low="1993.5",
         exit_close="1994.2",
+        entry_limit="2002.50",
     )
-    assert [item.fill_price for item in engine.fills] == [
-        Decimal(item) for item in expected["fills"]
-    ]
-    assert engine.state.fees == Decimal(expected["fees"])
-    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
-    assert engine.state.cash == Decimal(expected["cash"])
+    assert {
+        "fills": [f"{item.fill_price:.2f}" for item in engine.fills],
+        "fees": str(engine.state.fees),
+        "realized_pnl": str(engine.state.realized_pnl),
+        "cash": str(engine.state.cash),
+        "equity": str(engine.state.equity),
+        "maximum_drawdown": str(engine.state.risk.maximum_drawdown),
+    } == expected
     result = protective_fill(
         position_side="long",
         stop=Decimal("1994.8"),
@@ -1129,21 +1300,24 @@ def test_short_entry_then_stop_gap() -> None:
         side="short",
         stop_ticks=57,
         target_ticks=25,
-        entry_open="2008.1",
-        entry_high="2008.5",
-        entry_low="2007.5",
-        entry_close="2008",
+        entry_open="2007.00",
+        entry_high="2008.10",
+        entry_low="2006.80",
+        entry_close="2007.50",
         exit_open="2014.2",
         exit_high="2014.5",
         exit_low="2013.5",
         exit_close="2014",
+        entry_limit="2008.00",
     )
-    assert [item.fill_price for item in engine.fills] == [
-        Decimal(item) for item in expected["fills"]
-    ]
-    assert engine.state.fees == Decimal(expected["fees"])
-    assert engine.state.realized_pnl == Decimal(expected["realized_pnl"])
-    assert engine.state.cash == Decimal(expected["cash"])
+    assert {
+        "fills": [f"{item.fill_price:.2f}" for item in engine.fills],
+        "fees": str(engine.state.fees),
+        "realized_pnl": str(engine.state.realized_pnl),
+        "cash": str(engine.state.cash),
+        "equity": str(engine.state.equity),
+        "maximum_drawdown": str(engine.state.risk.maximum_drawdown),
+    } == expected
     result = protective_fill(
         position_side="short",
         stop=Decimal("2013.7"),
@@ -1188,31 +1362,75 @@ def test_intrabar_entry_with_stop_and_target_is_conservative_stop() -> None:
     assert (result.reason, result.fill_price) == ("BOTH_HIT_STOP_FIRST", Decimal("1997.9"))
     from .test_reversal_breakout import _bars, _configured, _seed, _zone
 
+    def drive(candidate_config):
+        initial = _seed(candidate_config, _zone(kind="support", low="1998.8", high="1999.5"))
+        armed = run_engine(
+            candidate_config,
+            _bars(candidate_config, 0, 5, open_price="2002", high="2003", low="2001", close="2002"),
+            initial_state=initial,
+        )
+        entered = run_engine(
+            candidate_config,
+            _bars(
+                candidate_config, 5, 10, open_price="2001", high="2002", low="1999.9", close="2001"
+            ),
+            initial_state=armed.state,
+        )
+        waiting = step_engine(candidate_config, entered.state, make_bar(candidate_config, 10))
+        return step_engine(
+            candidate_config,
+            waiting.state,
+            make_bar(
+                candidate_config,
+                11,
+                open_price="2001",
+                high="2003",
+                low="1997",
+                close="2002",
+            ),
+        )
+
     config = _configured(sides="long")
-    initial = _seed(config, _zone(kind="support", low="1998.8", high="1999.5"))
-    armed = run_engine(
-        config,
-        _bars(config, 0, 5, open_price="2002", high="2003", low="2001", close="2002"),
-        initial_state=initial,
-    )
-    entered = run_engine(
-        config,
-        _bars(config, 5, 10, open_price="2001", high="2002", low="1999.9", close="2001"),
-        initial_state=armed.state,
-    )
-    waiting = step_engine(config, entered.state, make_bar(config, 10))
-    same_bar = step_engine(
-        config,
-        waiting.state,
-        make_bar(config, 11, open_price="2001", high="2003", low="1997", close="2002"),
-    )
+    same_bar = drive(config)
     assert [fill.reason for fill in same_bar.fills] == [
         "LIMIT_ENTRY_TOUCH",
         "ENTRY_BAR_CONSERVATIVE_STOP",
     ]
-    assert same_bar.state.cash == Decimal(expected["default"]["cash"])
-    assert same_bar.state.fees == Decimal(expected["default"]["fees"])
-    assert same_bar.state.position is None
+    variant_definition = config.strategy_version.definition.model_copy(
+        update={
+            "order_policy": config.strategy_version.definition.order_policy.model_copy(
+                update={"entry_bar_exit_policy": "next_bar_only"}
+            )
+        }
+    )
+    variant = config.model_copy(
+        update={
+            "strategy_version": config.strategy_version.model_copy(
+                update={
+                    "definition": variant_definition,
+                    "canonical_definition_sha256": canonical_definition_sha256(variant_definition),
+                }
+            ),
+            "fill_model": config.fill_model.model_copy(
+                update={"entry_bar_exit_policy": "next_bar_only"}
+            ),
+        }
+    )
+    next_bar = drive(variant)
+    assert {
+        "default": {
+            "filled_exit": "stop" if same_bar.fills[-1].effect == "close" else "none",
+            "cash": str(same_bar.state.cash),
+            "fees": str(same_bar.state.fees),
+        },
+        "next_bar_only_variant": (
+            "position remains open; same-bar target is not granted; RunSpec must name the limitation"
+            if next_bar.state.position is not None
+            and all(fill.effect != "close" for fill in next_bar.fills)
+            and variant.fill_model.entry_bar_exit_policy == "next_bar_only"
+            else "next-bar-only limitation not exercised"
+        ),
+    } == expected
 
 
 def _zone(identifier: str, kind: str, low: str, high: str, sequence: int) -> ZoneState:
@@ -1269,6 +1487,19 @@ def test_next_zone_targets_long_short_and_missing() -> None:
         initial_state=changed,
     )
     assert entered.decisions[-1].evidence.selected_setup.target == Decimal(expected["long_target"])
+    short_config = _configured(sides="short", target_mode="next_zone")
+    short_initial = _seed(
+        short_config,
+        setup_zone(kind="resistance", low="2010", high="2010.5", sequence=0),
+        setup_zone(kind="support", low="2007.5", high="2008", sequence=1),
+    )
+    short_armed = run_engine(
+        short_config,
+        _bars(short_config, 0, 5, open_price="2005.5", high="2007", low="2005", close="2005.5"),
+        initial_state=short_initial,
+    )
+    short_snapshot = short_armed.decisions[-1].evidence.selected_setup
+    assert short_snapshot is not None
     missing_initial = _seed(
         config, setup_zone(kind="support", low="2000", high="2000.5", sequence=0)
     )
@@ -1277,32 +1508,102 @@ def test_next_zone_targets_long_short_and_missing() -> None:
         _bars(config, 0, 5, open_price="2005", high="2006", low="2004", close="2005"),
         initial_state=missing_initial,
     )
-    assert (missing.decisions[-1].reason_code, len(missing.intents)) == (
-        expected["no_target_reason"],
-        expected["no_target_order_count"],
-    )
+    assert {
+        "long_target": f"{snapshot.target:.2f}",
+        "short_target": f"{short_snapshot.target:.2f}",
+        "later_zone_changes_target": entered.decisions[-1].evidence.selected_setup.target
+        != snapshot.target,
+        "no_target_reason": missing.decisions[-1].reason_code,
+        "no_target_order_count": len(missing.intents),
+    } == expected
 
 
 def test_r_multiple_targets_long_short() -> None:
-    _frozen("r_multiple_targets_long_short")
-    assert r_multiple_target(
-        side="long",
-        entry=Decimal(2000),
-        stop=Decimal("1997.3"),
-        multiple=Decimal("2.5"),
-        tick=Decimal("0.1"),
-    ) == Decimal("2006.7")
-    assert r_multiple_target(
-        side="short",
-        entry=Decimal(2010),
-        stop=Decimal("2012.4"),
-        multiple=Decimal(3),
-        tick=Decimal("0.1"),
-    ) == Decimal("2002.8")
+    case = _frozen("r_multiple_targets_long_short")
+    given, expected = case["given"], case["expected"]
+    projection = {}
+    fee_independent, gap_independent = [], []
+    for side in ("long", "short"):
+        from .conftest import make_config
+
+        config = make_backtest_config()
+        if side == "short":
+            config = config.model_copy(
+                update={"strategy_version": make_config(side="short").strategy_version}
+            )
+        recipe = given[side]
+        stop_ticks = int(
+            abs(Decimal(recipe["entry"]) - Decimal(recipe["stop"])) / config.contract.tick_size
+        )
+        definition = config.strategy_version.definition.model_copy(
+            update={
+                "exit_policy": config.strategy_version.definition.exit_policy.model_copy(
+                    update={
+                        "stop": FixedTicksStop(kind="fixed_ticks", ticks=stop_ticks),
+                        "target": RiskMultipleTarget(
+                            kind="risk_multiple", multiple=recipe["r_multiple"]
+                        ),
+                    }
+                )
+            }
+        )
+        config = config.model_copy(
+            update={
+                "strategy_version": config.strategy_version.model_copy(
+                    update={
+                        "definition": definition,
+                        "canonical_definition_sha256": canonical_definition_sha256(definition),
+                    }
+                ),
+                "cost_model": config.cost_model.model_copy(update={"market_slippage_ticks": 0}),
+            }
+        )
+        price = recipe["entry"]
+        events = tuple(
+            make_bar(config, i, open_price=price, high=price, low=price, close=price)
+            for i in range(6)
+        )
+        opened = run_engine(config, events)
+        position = opened.state.position
+        assert position is not None and opened.state.fees > 0
+        assert position.entry_price == Decimal(recipe["entry"])
+        assert position.protective_bracket.stop.trigger_price == Decimal(recipe["stop"])
+        projection[f"{side}_target"] = f"{position.protective_bracket.target.trigger_price:.2f}"
+        fee_independent.append(
+            position.protective_bracket.target.trigger_price
+            == r_multiple_target(
+                side=side,
+                entry=position.entry_price,
+                stop=position.protective_bracket.stop.trigger_price,
+                multiple=Decimal(recipe["r_multiple"]),
+                tick=config.contract.tick_size,
+            )
+        )
+        later = step_engine(
+            config,
+            opened.state,
+            make_bar(
+                config,
+                6,
+                open_price=str(Decimal(price) + (Decimal(1) if side == "long" else Decimal(-1))),
+                high=str(Decimal(price) + (Decimal(1) if side == "long" else Decimal(-1))),
+                low=str(Decimal(price) + (Decimal(1) if side == "long" else Decimal(-1))),
+                close=str(Decimal(price) + (Decimal(1) if side == "long" else Decimal(-1))),
+            ),
+        )
+        assert later.state.position is not None
+        gap_independent.append(
+            later.state.position.protective_bracket.target.trigger_price
+            == position.protective_bracket.target.trigger_price
+        )
+    projection["fees_in_R"] = not all(fee_independent)
+    projection["gap_slippage_in_R"] = not all(gap_independent)
+    assert projection == expected
 
 
 def test_favorable_limit_gaps_revalidate_bracket_both_sides() -> None:
     expected = _frozen("favorable_limit_gaps_revalidate_bracket_both_sides")["expected"]
+    projection = {}
     long_fill = limit_fill(
         side="buy",
         limit=Decimal(2000),
@@ -1356,10 +1657,19 @@ def test_favorable_limit_gaps_revalidate_bracket_both_sides() -> None:
         waiting = step_engine(config, entered.state, make_bar(config, 10))
         rejected = step_engine(config, waiting.state, make_bar(config, 11, **gap_prices))
         assert rejected.fills == () and rejected.state.pending_entry is None
-        assert any(
-            event.payload.get("reason") == expected[side]["reason"] for event in rejected.events
+        cancellation = next(
+            event
+            for event in rejected.events
+            if event.event_type == "ORDER_STATE"
+            and event.payload.get("to") == "CANCELLED"
+            and event.payload.get("reason") == "ENTRY_GEOMETRY_GAP"
         )
-        assert rejected.state.fees == Decimal(expected[side]["commission"])
+        projection[side] = {
+            "reason": cancellation.payload["reason"],
+            "fill_count": len(rejected.fills),
+            "commission": str(rejected.state.fees),
+        }
+    assert projection == expected
 
 
 def _fill_interval_config(config, fill: int, execution: int):
