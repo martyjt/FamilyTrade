@@ -94,7 +94,8 @@ base-10 strings. The public records are:
   `ProtectiveOrderState`, `ProtectiveBracketState`, `PositionState`, `RiskState`,
   `EngineState`, and `EngineCheckpoint`.
 - `OrderIntent`, `Decision`, `Fill`, `RunEvent`, `EngineStepResult`, and
-  `EngineRunResult`, plus `FillEvidence` and `MarkEvidence` companions.
+  `EngineRunResult`, plus `EngineStepHash`, `FillEvidence`, and `MarkEvidence`
+  companions.
 - `EngineErrorCode` and `EngineError`. `EngineFailure` is the sole public exception
   wrapper and is not a serialized Pydantic record.
 
@@ -152,6 +153,31 @@ after typed ingress raises `EngineFailure(EngineError(...))`. `run_engine` raise
 the first failing item and returns no prior deltas/checkpoint; immutable caller input
 and `initial_state` remain byte-identical. Unexpected programming defects are not
 misreported as an `EngineError` and propagate as their original exception.
+
+This boundary is exact. Every public model uses `ConfigDict(strict=True,
+frozen=True, extra="forbid", hide_input_in_errors=True)`. Model construction checks
+only representation and record-local invariants: required/extra keys, strict
+primitive type (including bool rejection for integers), constrained string/hash/
+UUID/UTC/Decimal form, intrinsic numeric positivity where specified, tagged-union
+shape, and relationships wholly inside one value record. `EngineConfig` annotates
+`schema_version`, `engine_version`, `base_currency`, `price_basis`, `end_policy`,
+mode, and policy tags/enums as their closed `Literal` values; `random_seed` is
+`Literal[None]`. A wrong value for any of those fields therefore never constructs
+an `EngineConfig` and can never be promised as an `EngineFailure`.
+
+Cross-record, run-resource, and compatibility checks are deliberately callable
+stage checks. In particular, `max_canonical_bars` is `StrictInt` with default
+`500000` and no Pydantic range constraint; `initialize_engine` alone enforces
+`1..2000000`. `FillModel.fill_interval_seconds` is an intrinsically positive
+`StrictInt`, while equality to the strategy interval and supported divisibility are
+initialization checks. `EngineCheckpoint.schema_version`, `.format_version`, and
+`.engine_version` are respectively `StrictStr`, `StrictInt`, and `StrictStr`, not
+`Literal` annotations: `checkpoint_engine` always emits `"v1"`, `1`, and
+`"paper-engine-v1"`, while `restore_engine` gives well-typed unknown values the
+closed `CHECKPOINT_MISMATCH` transport. A wrong primitive type still fails model
+construction. `EngineState` and checkpoint models validate local representation;
+hash content and cross-record/state causal invariants are callable checks. Thus no
+condition is both a promised raw Pydantic failure and a promised engine failure.
 
 These callables perform no I/O, database access, filesystem access, network call,
 environment read, logging, random generation, or implicit clock read. All output is
@@ -615,14 +641,50 @@ rule-driven close returns to `ACTIVE` while the run can continue; liquidation an
 force-close use the terminal transitions in section 8. This includes the exact
 `CLOSING` projection required at the frozen `at_liquidation_start` checkpoint.
 
+`EngineStepHash` is exactly
+`{input_index:nonnegative int,pre_state_sha256:lowercase SHA-256,
+post_state_sha256:lowercase SHA-256,replayed:bool}`.
+
 `EngineStepResult` is exactly
-`{state,decisions:tuple[Decision,...],intents:tuple[OrderIntent,...],
+`{state,pre_state_sha256:lowercase SHA-256,post_state_sha256:lowercase SHA-256,
+decisions:tuple[Decision,...],intents:tuple[OrderIntent,...],
 protective_orders:tuple[ProtectiveOrderState,...],fills:tuple[Fill,...],
 fill_evidence:tuple[FillEvidence,...],mark_evidence:tuple[MarkEvidence,...],
 events:tuple[RunEvent,...],replayed:boolean}`.
 `EngineRunResult` has the same seven aggregate output tuples plus final `state` and
-`checkpoint`; concatenating successful step deltas in order must equal the batch
-tuples byte-for-byte.
+`checkpoint`, overall `pre_state_sha256`/`post_state_sha256`, and
+`step_hashes:tuple[EngineStepHash,...]`; concatenating successful step deltas in
+order must equal the batch tuples byte-for-byte.
+
+For `step_engine`, pre-hash is section 13.1 SHA-256 of the exact supplied state
+before any input mutation and post-hash is SHA-256 of the exact returned state after
+all domain transitions and event-counter reservations. Semantic replay returns
+equal pre/post hashes, unchanged state, empty deltas, and `replayed:true`. An
+accepted quality or Finish input uses the same rule; its pre-hash never begins after
+the quality/terminal transition. A raised `EngineFailure` returns no result and
+therefore no misleading result hashes; its unchanged-state assertion compares the
+caller's independently hashed input state.
+
+For `run_engine`, overall pre-hash is the hash of `initial_state`, or of the newly
+initialized state when it is null, before item zero; overall post-hash equals the
+final returned state and `checkpoint.state_sha256`. `step_hashes` has exactly one
+record per supplied event, including adjacent semantic replays, in zero-based input
+order. Each record is the same pre/post/replayed projection that an incremental
+`step_engine` call at that boundary would return; record `i` post equals record
+`i+1` pre. With no events the tuple is empty and overall pre equals post. Batch
+failure raises and returns no aggregate result or prefix hashes.
+
+The result records use strict hash strings and strict booleans/integers.
+`EngineStepResult` has an after-validator requiring `post_state_sha256` to equal the
+canonical hash of `state`; when `replayed` is true it also requires equal pre/post
+hashes and all seven output tuples empty. `EngineRunResult` has an after-validator
+requiring its post hash to equal both the final state hash and checkpoint state
+hash; indexes to be exactly `0..len(step_hashes)-1`; every replay-marked hash record
+to have equal hashes; the complete adjacency chain; and the empty-batch equality.
+The callable separately requires `len(step_hashes)==len(events)` while it owns the
+input tuple. Pre-hash agreement with an external supplied state and each non-replay
+transition is likewise enforced by the callable while it owns both snapshots and
+by the required incremental-equivalence tests.
 
 `protective_orders` emits strict record snapshots rather than frozen order intents.
 Creation emits stop then target. A protective fill emits the filled leg then the
@@ -856,9 +918,13 @@ accepted. Quality intervals ending at or before `start_at` are allowed to descri
 warm-up continuity but cannot produce strategy or accounting output.
 
 The integrated `CorrectionObservation` is deliberately not an FT-07 input. It has
-no engine-event discriminator and direct submission fails the strict union as
-`VALIDATION_ERROR` with detail `UNSUPPORTED_CORRECTION_OBSERVATION` before semantic
-input hashing, cursor/correlation advancement, or any state/output. The same ingress
+no engine-event discriminator. Passing an already-constructed integrated
+`CorrectionObservation` object directly to `step_engine` is the one typed
+wrong-event boundary: the callable raises `VALIDATION_ERROR` with detail
+`UNSUPPORTED_CORRECTION_OBSERVATION` at root path `""` before semantic input
+hashing, cursor/correlation advancement, or any state/output. Attempting instead to
+parse its raw mapping as `EngineInputEvent` fails raw discriminated-union Pydantic
+construction and never invokes the callable. The same callable preflight
 guard requires every `CompletedBarEvent.selection.correction_observations == ()`
 exactly. Any non-empty nested tuple, regardless of its `applied` or `reason` values,
 raises the same `EngineFailure` at the same pre-hash boundary. FT-09 owns correction
@@ -967,7 +1033,8 @@ errors because no canonical semantic identity exists for them.
 
 Events are processed in increasing logical interval start and nondecreasing
 recorded time. A completed bar's logical interval is its bar interval; a quality
-event's is its declared interval; finish sorts after all intervals ending at its
+event's is its declared interval; Finish uses the zero-width boundary identity
+`[effective_at,effective_at]` and sorts after all non-Finish intervals ending at its
 effective time. The state stores the last logical interval, bar record ID when
 applicable, payload hash, availability/control time, and input hash. A semantic
 replay of the immediately preceding input returns the unchanged state,
@@ -2154,11 +2221,16 @@ then other `POSITION_FLAT` cancellations in ascending order sequence.
   database handle, path, provider payload, clock, lease, fence, outbox, or job state.
 
 Canonical state bytes use frozen section 13.1. `state_sha256` is SHA-256 of the
-state projection excluding any surrounding hash field. Every step returns exact
-pre/post hashes. `EngineCheckpoint` is exactly
-`{schema_version:"v1",format_version:1,engine_version:"paper-engine-v1",
-config_sha256,state, state_sha256}`. Restore recomputes all hashes, validates every
-typed invariant, and returns the identical state. Unknown format/engine version is
+state projection excluding any surrounding hash field. Every successful step
+result carries the exact pre/post hashes specified in section 2.
+`EngineCheckpoint` has exactly the fields
+`{schema_version:strict string,format_version:strict int,engine_version:strict
+string,config_sha256,state,state_sha256}`. `checkpoint_engine` emits exactly
+`schema_version:"v1"`, `format_version:1`, and
+`engine_version:"paper-engine-v1"`; the wider well-typed ingress annotations exist
+only so restore can return a stable domain failure instead of relying on a parser
+failure. Restore recomputes all hashes, validates every typed invariant, and returns
+the identical state. Unknown schema/format/engine version is
 `CHECKPOINT_MISMATCH`; a changed strategy hash, contract ID/version, calendar
 ID/version, dataset binding, policy, owner, mode, or run ID is `CONFIG_MISMATCH`,
 except contract identity/version changes use `UNSUPPORTED_CONTRACT_CHANGE`.
@@ -2190,28 +2262,228 @@ FT-18 own those boundaries.
 - `CONFIG_MISMATCH`, `CHECKPOINT_MISMATCH`, `EVENT_OUT_OF_ORDER`,
   `DUPLICATE_CONFLICT`, and `RUN_FINISHED`.
 
-The code, sole public message, and condition are:
+Every details record is a strict frozen Pydantic model with `extra="forbid"`; every
+field below is required, and the union discriminator is `kind`. `JsonPointer` is an
+empty root string or RFC 6901 absolute pointer. The exact union is:
 
-| Code | Fixed message | Condition |
-| --- | --- | --- |
-| VALIDATION_ERROR | Engine input is invalid. | A typed cross-field invariant not assigned a narrower code fails. |
-| INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. |
-| EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. |
-| BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. |
-| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset identity/coverage, calendar, mode, random seed, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. |
-| UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. |
-| UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. |
-| CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. |
-| CHECKPOINT_MISMATCH | Engine checkpoint is invalid. | Format/engine version, state hash, or typed checkpoint invariant fails. |
-| EVENT_OUT_OF_ORDER | Engine event is out of order. | While nonterminal, a distinct non-overlapping input is older than the consumed cursor or recorded time regresses. |
-| DUPLICATE_CONFLICT | Logical bar has conflicting content. | After the immediate replay check, a consumed logical identity reappears with different retained semantic input bytes or a changed input overlaps the consumed interval; this specific conflict also precedes the terminal guard. |
-| RUN_FINISHED | Engine run is already terminal. | After replay and duplicate/overlap checks, any other semantically distinct input is supplied to a finished/stopped/blocked terminal state. |
+~~~text
+ValidationErrorDetails = {
+  kind:"validation_error", path:JsonPointer,
+  reason:"BACKTEST_TIMING_MISMATCH"|"DATA_QUALITY_COMBINATION"|
+    "FINISH_EVENT"|"UNACCOUNTED_OPEN_INTERVAL"|
+    "UNSUPPORTED_CORRECTION_OBSERVATION"|"INPUT_CROSS_FIELD"
+}
+InvalidBarEventDetails = {
+  kind:"invalid_bar_event", bar_record_id:string,
+  reason:"SELECTION_STATUS"|"IDENTITY"|"OHLCV"|"PRICE_TICK"|
+    "INTERVAL"|"AVAILABILITY"|"CALENDAR"
+}
+EventAfterEndDetails = {
+  kind:"event_after_end", event_end_at:UTC timestamp,
+  config_end_at:UTC timestamp
+}
+BatchLimitExceededDetails = {
+  kind:"batch_limit_exceeded", current_count:nonnegative int,
+  input_delta:positive int, max_canonical_bars:positive int
+}
+UnsupportedConfigurationDetails = {
+  kind:"unsupported_configuration", path:JsonPointer,
+  reason:"FILL_INTERVAL_STRATEGY_MISMATCH"|"OWNER_MISMATCH"|
+    "STRATEGY_NOT_EXECUTABLE"|"STRATEGY_HASH_MISMATCH"|
+    "CATALOGUE_MISMATCH"|"CONTRACT_CALENDAR_MISMATCH"|
+    "CONTRACT_NUMERIC_POLICY"|"CURRENCY_MISMATCH"|"BACKTEST_BINDING"|
+    "FORWARD_BINDING"|"DATASET_BINDING"|"DATASET_COVERAGE"|
+    "RUN_SPAN_EXCEEDED"|"BAR_LIMIT_RANGE"|"MODE_LANE_MISMATCH"|
+    "END_POLICY_MISMATCH"|"POLICY_UNSUPPORTED"
+}
+UnsupportedFillIntervalDetails = {
+  kind:"unsupported_fill_interval", fill_interval_seconds:positive int,
+  execution_interval_seconds:positive int,
+  reason:"SUBMINUTE"|"NON_MINUTE"|"LARGER_THAN_EXECUTION"|"NOT_DIVISOR"
+}
+UnsupportedContractChangeDetails = {
+  kind:"unsupported_contract_change",
+  expected_contract_id:lowercase UUIDv7, actual_contract_id:lowercase UUIDv7,
+  expected_record_version:positive int, actual_record_version:positive int
+}
+ConfigMismatchDetails = {
+  kind:"config_mismatch", path:JsonPointer,
+  expected_config_sha256:lowercase SHA-256,
+  actual_config_sha256:lowercase SHA-256
+}
+CheckpointMismatchDetails = {
+  kind:"checkpoint_mismatch", path:JsonPointer,
+  reason:"SCHEMA_VERSION"|"FORMAT_VERSION"|"ENGINE_VERSION"|
+    "CHECKPOINT_CONFIG_HASH"|"STATE_HASH"|"STATE_INVARIANT"
+}
+EventOutOfOrderDetails = {
+  kind:"event_out_of_order",
+  previous_start_at:UTC timestamp, previous_end_at:UTC timestamp,
+  previous_recorded_at:UTC timestamp,
+  input_start_at:UTC timestamp, input_end_at:UTC timestamp,
+  input_recorded_at:UTC timestamp
+}
+DuplicateConflictDetails = {
+  kind:"duplicate_conflict", logical_start_at:UTC timestamp,
+  logical_end_at:UTC timestamp, previous_input_sha256:lowercase SHA-256,
+  input_sha256:lowercase SHA-256
+}
+RunFinishedDetails = {
+  kind:"run_finished",
+  status:"FINISHED"|"STOPPED"|"BLOCKED_UNCLOSED"|
+    "BLOCKED_EXPIRY_UNRESOLVED",
+  finished_reason:"MARK_OPEN"|"FORCE_CLOSED"|"CONTRACT_CLOSED"|
+    "BLOCKED_UNCLOSED"|"BLOCKED_EXPIRY_UNRESOLVED"
+}
+
+EngineErrorDetails = ValidationErrorDetails|InvalidBarEventDetails|
+  EventAfterEndDetails|BatchLimitExceededDetails|
+  UnsupportedConfigurationDetails|UnsupportedFillIntervalDetails|
+  UnsupportedContractChangeDetails|ConfigMismatchDetails|
+  CheckpointMismatchDetails|EventOutOfOrderDetails|
+  DuplicateConflictDetails|RunFinishedDetails
+
+EngineErrorMessage =
+  "Engine input is invalid."|"Bar event is invalid."|
+  "Bar event is after the run end."|
+  "Engine batch bar limit is exceeded."|
+  "Engine configuration is unsupported."|"Fill interval is unsupported."|
+  "Contract change is unsupported."|
+  "Engine configuration does not match state."|
+  "Engine checkpoint is invalid."|"Engine event is out of order."|
+  "Logical bar has conflicting content."|"Engine run is already terminal."
+
+EngineError = {
+  code:EngineErrorCode, message:EngineErrorMessage, details:EngineErrorDetails
+}
+~~~
+
+In implementation terms, every quoted singleton or choice above is a `Literal`;
+`EngineErrorCode` is the listed `Literal` union; integers use `StrictInt` plus the
+shown `ge`/`gt` constraint; strings use `StrictStr` plus the integrated identifier
+or length pattern; hashes use `^[0-9a-f]{64}$`; UUIDv7 values use the integrated
+lowercase UUIDv7 validator; and timestamps use the integrated aware-UTC validator.
+`JsonPointer` uses `^(?:/(?:[^~/]|~[01])*)*$`. `EngineErrorDetails` is a
+`Field(discriminator="kind")` union. `EngineError` and every details model use the
+same strict/frozen/forbid/hide-input configuration as section 2.
+
+The `EngineError` after-validator requires the one-to-one code/details-kind mapping
+and the fixed message below. Details-model after-validators require
+`event_end_at > config_end_at`; `current_count + input_delta >
+max_canonical_bars`; at least one contract ID/version difference; distinct config
+hashes; the stated ordering regression/overlap; and an exact terminal status/reason
+pair from section 8. Unsupported-fill reason precedence is `SUBMINUTE` when `<60`,
+then `NON_MINUTE` when not divisible by 60, then `LARGER_THAN_EXECUTION`, then
+`NOT_DIVISOR`. No dict, list, arbitrary reason/message, optional field, private
+value, or exception text is accepted in details.
+Reason/path combinations are also model-validated: a fixed pointer must equal the
+mapping below, while a lexical-first pointer must be under the named config/state/
+event subtree. Whether the well-typed external records actually violate that
+cross-record condition is checked by the callable; details validation only prevents
+constructing an internally contradictory error envelope.
+
+The projection is total and deterministic. When several checks fail, the engine
+uses the first reason in that details model's displayed enum order, except for the
+explicit fill precedence above. Within that chosen reason, `path` is the lexically
+first canonical JSON Pointer that fails. The other fields are copied from the exact
+typed operands named in the table; they are never synthesized from exception text.
+For `VALIDATION_ERROR`, reason/path are: backtest timing mismatch and the first
+`/emission_context/...` timing field; invalid quality combination and its first
+field; Finish invariant and its first field; unaccounted interval and
+`/effective_at`; direct typed correction observation and root `""`; nonempty nested
+correction tuple and `/selection/correction_observations`; otherwise
+`INPUT_CROSS_FIELD` and the first
+failing field. For `INVALID_BAR_EVENT`, `bar_record_id` is the selected
+`CompletedBar.bar_record_id`, and reason precedence is exactly `SELECTION_STATUS`,
+`IDENTITY`, `OHLCV`, `PRICE_TICK`, `INTERVAL`, `AVAILABILITY`, `CALENDAR`.
+
+For `UNSUPPORTED_CONFIGURATION`, reason precedence is the displayed enum order and
+`path` is the first failing config pointer within that reason. This includes
+`/fill_model/fill_interval_seconds` for interval/strategy inequality,
+`/owner_user_id` or the first unequal nested owner for owner mismatch,
+`/strategy_version/status` for non-executable strategy,
+`/strategy_version/canonical_definition_sha256` for strategy hash,
+`/strategy_version/catalogue_version` for catalogue mismatch,
+`/contract/calendar_id` or `/contract/calendar_version` for contract/calendar
+mismatch, the first among `/contract/tick_size` and `/contract/multiplier` for
+numeric policy, the first currency field, the first backtest/forward/dataset binding or coverage
+field, `/start_at` or `/end_at` for span, `/max_canonical_bars` for cap range,
+`/lane_id` for mode/lane, `/force_close_at` for end-policy mismatch, and the first
+unsupported policy field. Alternatives separated by `|` here mean lexically first
+failing complete pointer, not a literal pointer containing `|`.
+
+Checkpoint detail reasons map to `/schema_version`, `/format_version`,
+`/engine_version`, `/config_sha256`, `/state_sha256`, or the first failing `/state`
+pointer respectively. Contract-change fields copy the state/checkpoint expected
+contract and supplied-config actual contract. Config-mismatch hashes are the stored
+expected config hash and recomputed supplied-config actual hash, with the first
+non-contract differing config pointer. Out-of-order fields copy the stored cursor
+and supplied logical interval/recorded timestamps. Duplicate-conflict fields copy
+the conflicting logical interval and stored/current semantic input hashes.
+Run-finished fields copy the terminal state status and `finished_reason`.
+
+Cross-code selection is deterministic too. `initialize_engine` evaluates
+`UNSUPPORTED_CONFIGURATION` reasons in their order above, then the fill-interval
+reason order. `step_engine` uses section 4's exact dispatch order; within step 1,
+contract change precedes other config mismatch, correction/outer validation follows,
+and within step 5 event-after-end precedes bar validity, ordering, then resource
+cap. `checkpoint_engine` checks contract change before other config mismatch.
+`restore_engine` checks checkpoint schema, format, engine, state hash, and state
+invariants first; a well-formed `config_sha256` inconsistent with the embedded
+state uses `CHECKPOINT_CONFIG_HASH`; only then do contract change and other supplied
+config mismatch run. These checks construct exactly the first error and never a
+list of errors.
+
+The code, sole public message, condition, and exact detail source are:
+
+| Code | Fixed message | Condition | Details projection |
+| --- | --- | --- | --- |
+| VALIDATION_ERROR | Engine input is invalid. | A typed cross-field invariant not assigned a narrower code fails. | `ValidationErrorDetails` using the reason/path rules above. |
+| INVALID_BAR_EVENT | Bar event is invalid. | Bar quality, identity, OHLCV, tick, interval, or causal time is ineligible. | `InvalidBarEventDetails` from selected record ID and first reason. |
+| EVENT_AFTER_END | Bar event is after the run end. | A completed bar ends after finite `config.end_at`. | `event_end_at=event.selection.bar.end_at`; `config_end_at=config.end_at`. |
+| BATCH_LIMIT_EXCEEDED | Engine batch bar limit is exceeded. | Cumulative accepted canonical bars would exceed `max_canonical_bars`. | Stored pre-input `current_count`, computed positive non-replay `input_delta`, configured cap. |
+| UNSUPPORTED_CONFIGURATION | Engine configuration is unsupported. | Currency, strategy status/hash/catalogue, owner, dataset identity/coverage, calendar, mode, five-year span, absolute bar ceiling, fill-interval equality, or policy is unsupported/inconsistent. | `UnsupportedConfigurationDetails` using the reason/path rules above. |
+| UNSUPPORTED_FILL_INTERVAL | Fill interval is unsupported. | It is sub-minute, not a whole minute, larger than execution, or does not divide execution. | Supplied fill and strategy execution seconds plus first fill reason. |
+| UNSUPPORTED_CONTRACT_CHANGE | Contract change is unsupported. | Contract ID or record version differs from the initialized checkpoint/config. | Stored expected and supplied actual contract ID/version. |
+| CONFIG_MISMATCH | Engine configuration does not match state. | Any non-contract config fingerprint field differs. | First differing pointer plus stored expected/recomputed actual hashes. |
+| CHECKPOINT_MISMATCH | Engine checkpoint is invalid. | Schema/format/engine version, config/state hash, or typed checkpoint invariant fails. | `CheckpointMismatchDetails` using the reason/path mapping above. |
+| EVENT_OUT_OF_ORDER | Engine event is out of order. | While nonterminal, a distinct non-overlapping input is older than the consumed cursor or recorded time regresses. | Stored previous and supplied input start/end/recorded timestamps. |
+| DUPLICATE_CONFLICT | Logical bar has conflicting content. | After the immediate replay check, a consumed logical identity reappears with different retained semantic input bytes or a changed input overlaps the consumed interval; this specific conflict also precedes the terminal guard. | Conflicting interval plus stored previous/current semantic input hashes. |
+| RUN_FINISHED | Engine run is already terminal. | After replay and duplicate/overlap checks, any other semantically distinct input is supplied to a finished/stopped/blocked terminal state. | Exact terminal status and `finished_reason` from state. |
 
 `EngineError` is `{code,message,details}`. Messages are fixed by code and never
 include owner-private values or exception text. Details contain only JSON Pointer
 paths, stable reason names, and public IDs already supplied to this pure call. Every
 error leaves state byte-identical. Domain rejections such as no target, rule UNKNOWN,
 risk gap, or order expiry are Decisions/events and state transitions, not exceptions.
+
+Canonical error bytes use frozen section 13.1: UTF-8, lexically sorted object keys,
+compact separators, canonical scalar formatting, and no trailing line feed. For an
+otherwise valid config with `max_canonical_bars=2000001`, model construction
+succeeds and `initialize_engine` raises an `EngineFailure` whose complete `error`
+bytes are exactly:
+
+~~~json
+{"code":"UNSUPPORTED_CONFIGURATION","details":{"kind":"unsupported_configuration","path":"/max_canonical_bars","reason":"BAR_LIMIT_RANGE"},"message":"Engine configuration is unsupported."}
+~~~
+
+For an otherwise valid checkpoint with `format_version=2`, model construction
+succeeds and `restore_engine` raises an `EngineFailure` whose complete `error`
+bytes are exactly:
+
+~~~json
+{"code":"CHECKPOINT_MISMATCH","details":{"kind":"checkpoint_mismatch","path":"/format_version","reason":"FORMAT_VERSION"},"message":"Engine checkpoint is invalid."}
+~~~
+
+By contrast, an otherwise valid raw config mapping with `random_seed=1` raises raw
+`pydantic.ValidationError` at location `("random_seed",)` before any call, and an
+otherwise valid raw checkpoint mapping with `format_version="2"` raises raw
+`pydantic.ValidationError` at `("format_version",)`. Neither has an `EngineError`,
+engine-error canonical bytes, state hash, or output. Likewise, malformed detail
+kind/code/message combinations fail `EngineError` construction and cannot escape
+as an engine failure. Wrong raw `EngineConfig.schema_version` or `.engine_version`
+values likewise fail at their own field locations; they are not
+`UNSUPPORTED_CONFIGURATION`.
 
 The callable/code surface is exact:
 
@@ -2388,6 +2660,12 @@ The named boundary and replay tests are:
 - `test_engine_failure_code_matrix_and_run_batch_visibility_are_exact`
 - `test_close_order_creation_cause_uuid_tuples_and_restore_are_exact`
 - `test_terminal_finished_reason_payload_booleans_bytes_and_hash_order_are_exact`
+- `test_engine_error_details_union_code_kind_message_and_validator_matrix`
+- `test_raw_random_seed_and_checkpoint_type_errors_are_pydantic_only`
+- `test_callable_bar_limit_and_checkpoint_version_errors_match_canonical_bytes`
+- `test_engine_step_result_pre_post_hashes_cover_normal_quality_finish_and_replay`
+- `test_run_engine_step_hash_chain_matches_incremental_and_empty_batch`
+- `test_failed_step_or_batch_returns_no_result_hashes_and_preserves_input_state`
 
 The full acceptance is: completed-bar causality; both sides; gap and touch symmetry;
 both-hit and entry-bar policies; fees/ticks/money; warm-up/equality/confirmation;
