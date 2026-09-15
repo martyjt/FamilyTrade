@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, getcontext
 from pathlib import Path
 
@@ -50,10 +50,13 @@ from familytrade.strategies.definitions import (
 from familytrade.strategies.indicators import quantize_feature
 from familytrade.strategies.rules import evaluate_rule
 from familytrade.strategies.setups import r_multiple_target, valid_bracket
-from familytrade.strategies.validation import canonical_definition_sha256
+from familytrade.strategies.validation import (
+    canonical_definition_sha256,
+    validate_rule_definition,
+)
 from familytrade.strategies.zones import next_zone_target
 
-from .conftest import BASE, make_backtest_config, make_bar
+from .conftest import BASE, make_backtest_config, make_bar, make_config
 
 _FROZEN_PATH = Path(__file__).parents[2] / "docs" / "contracts-examples-v1.json"
 
@@ -698,11 +701,28 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
             {"close": "12", "volume": "300"},
         ),
     )
-    crossing_definition = make_backtest_config().strategy_version.definition.model_copy(
+    crossing_config = make_config(fill_interval=300)
+    crossing_definition = crossing_config.strategy_version.definition.model_copy(
         update={
             "features": (
-                feature("cross-left", "close", {}),
-                feature("cross-right", "close", {}),
+                FeatureInstance(
+                    feature_id="cross-left",
+                    kind="input",
+                    name="close",
+                    output_type="price",
+                    unit="contract_price",
+                    interval_seconds=300,
+                    parameters={},
+                ),
+                FeatureInstance(
+                    feature_id="cross-right",
+                    kind="input",
+                    name="open",
+                    output_type="price",
+                    unit="contract_price",
+                    interval_seconds=300,
+                    parameters={},
+                ),
             ),
             "nodes": (
                 FeatureNode(kind="feature", node_id="left-node", feature_id="cross-left", offset=0),
@@ -717,52 +737,93 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
                     right_feature="right-node",
                 ),
             ),
+            "entry_rules": crossing_config.strategy_version.definition.entry_rules.model_copy(
+                update={"long_root": "fixture-cross"}
+            ),
         }
     )
-    previous_end = datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
-    current_end = datetime(2026, 1, 2, 3, 5, tzinfo=UTC)
+    validation = validate_rule_definition(
+        crossing_definition.model_dump(mode="json"),
+        owner_user_id=crossing_config.owner_user_id,
+        execution_interval_seconds=300,
+        fill_interval_seconds=300,
+        calendar_versions={},
+    )
+    assert validation.valid is True and validation.definition is not None
+    assert validation.errors == ()
+    assert validation.canonical_definition_sha256 == canonical_definition_sha256(
+        crossing_definition
+    )
+    crossing_strategy = crossing_config.strategy_version.model_copy(
+        update={
+            "definition": validation.definition,
+            "canonical_definition_sha256": validation.canonical_definition_sha256,
+            "required_warmup_bars": validation.required_warmup_bars,
+        }
+    )
+    crossing_config = crossing_config.model_copy(update={"strategy_version": crossing_strategy})
 
-    def crossing_point(feature_id: str, end: datetime, value: str) -> FeatureValue:
-        return FeatureValue(
-            feature_id=feature_id,
-            interval_seconds=300,
-            evaluation_bar_end=end,
-            value_type="price",
-            unit="contract_price",
-            value=Decimal(value),
-            status="KNOWN",
-            reason_code=None,
-            source_bar_record_ids=(),
-            source_dataset_provenance=(),
-            known_at=end,
+    def crossing_bar(index: int, left: str, right: str):
+        # The public event gate takes 60-second bars; five consecutive events
+        # close one actual 300-second execution bar and its input features.
+        return tuple(
+            make_bar(
+                crossing_config,
+                index * 5 + minute,
+                open_price=right,
+                high=str(max(Decimal(left), Decimal(right))),
+                low=str(min(Decimal(left), Decimal(right))),
+                close=left if minute == 4 else right,
+            )
+            for minute in range(5)
         )
 
     def crossing_decision(current_left: str):
-        return evaluate_rule(
-            crossing_definition,
-            "fixture-cross",
-            {
-                "cross-left": (
-                    crossing_point("cross-left", previous_end, crossing["previous_lhs"]),
-                    crossing_point("cross-left", current_end, current_left),
-                ),
-                "cross-right": (
-                    crossing_point("cross-right", previous_end, crossing["previous_rhs"]),
-                    crossing_point("cross-right", current_end, crossing["current_rhs"]),
-                ),
-            },
-            current_end,
+        result = run_engine(
+            crossing_config,
+            (
+                *crossing_bar(0, crossing["previous_lhs"], crossing["previous_rhs"]),
+                *crossing_bar(1, current_left, crossing["current_rhs"]),
+            ),
         )
+        assert result.state.last_execution_slot_index == 1
+        left_values = tuple(
+            item.value
+            for runtime in result.state.feature_runtime
+            if runtime.feature_id == "cross-left"
+            for item in runtime.history
+            if item.status == "KNOWN"
+        )
+        right_values = tuple(
+            item.value
+            for runtime in result.state.feature_runtime
+            if runtime.feature_id == "cross-right"
+            for item in runtime.history
+            if item.status == "KNOWN"
+        )
+        assert left_values == (Decimal(crossing["previous_lhs"]), Decimal(current_left))
+        assert right_values == (
+            Decimal(crossing["previous_rhs"]),
+            Decimal(crossing["current_rhs"]),
+        )
+        return result.decisions[-1]
 
-    crossed_status, crossed_evidence = crossing_decision(crossing["current_lhs"])
-    equality_status, equality_evidence = crossing_decision(crossing["current_rhs"])
-    crossed_root = next(item for item in crossed_evidence if item.node_id == "fixture-cross")
-    equality_root = next(item for item in equality_evidence if item.node_id == "fixture-cross")
-    assert crossed_status == "PASS" and crossed_root.value is True
-    assert equality_status == "FAIL" and equality_root.value is False
+    crossed_decision = crossing_decision(crossing["current_lhs"])
+    equality_decision = crossing_decision(crossing["current_rhs"])
+    crossed_root = next(
+        item for item in crossed_decision.evidence.results if item.node_id == "fixture-cross"
+    )
+    equality_root = next(
+        item for item in equality_decision.evidence.results if item.node_id == "fixture-cross"
+    )
+    assert crossed_decision.decision_type == "ENTRY" and crossed_root.value is True
+    assert equality_decision.decision_type == "HOLD" and equality_root.value is False
+    assert crossed_root.result == "PASS" and equality_root.result == "FAIL"
     assert crossed_root.reason_code == "ENTRY_RULE_PASS"
     assert equality_root.reason_code == "ENTRY_RULE_FAIL"
-    assert tuple(item.node_id for item in crossed_evidence) == ("fixture-cross",)
+    assert crossed_decision.execution_bar_end == BASE + timedelta(minutes=10)
+    assert equality_decision.execution_bar_end == BASE + timedelta(minutes=10)
+    assert tuple(item.node_id for item in crossed_decision.evidence.results) == ("fixture-cross",)
     projection = {
         "sma3_before_bar3": sma[1].status,
         "sma3_bar3": str(sma[2].value),
@@ -775,8 +836,10 @@ def test_indicator_warmup_equality_and_causal_catalogue() -> None:
         "relative_volume3_before_four_bars": relative[2].status,
         "relative_volume3_bar4": str(relative[3].value),
         "session_vwap_bar2": str(vwap[1].value),
-        "crosses_above": crossed_status == "PASS" and crossed_root.value is True,
-        "current_equality_would_cross": (equality_status == "PASS" and equality_root.value is True),
+        "crosses_above": crossed_decision.decision_type == "ENTRY" and crossed_root.value is True,
+        "current_equality_would_cross": (
+            equality_decision.decision_type == "ENTRY" and equality_root.value is True
+        ),
         "gap_breaks_all_consecutive_warmups": all(
             item.continuity_status == "broken_until_reseed"
             for item in step_engine(
