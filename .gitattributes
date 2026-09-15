@@ -39,4 +39,7 @@
 /docs/planning-manifest-v1.json -text
 /docs/ft02-review-v1.md -text
 /docs/ft02-publication-v1.md -text
+/docs/ft06-implementation-contract-v1.md text eol=lf
+/docs/ft06-implementation-contract-v1-amendment-1.md text eol=lf
+/docs/ft07-implementation-contract-v1.md text eol=lf
 .gitattributes text eol=lf
